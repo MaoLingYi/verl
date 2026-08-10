@@ -76,7 +76,7 @@ def test_conversion(megatron_model_provider, tfconfig, output_path, model):
     model_test = get_model(
         model_provider_func=megatron_model_provider,
         model_type=ModelType.encoder_or_decoder,
-        wrap_with_ddp=True,
+        wrap_with_ddp=False,
         transformer_config=tfconfig,
     )
     ref_state_dict = model_test[0].module.sharded_state_dict()
