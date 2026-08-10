@@ -113,9 +113,10 @@ class Qwen2MoEModel(BaseModelInitializer):
         extra_kwargs = {} if not self.has_vp_stage else {"vp_stage": vp_stage}
         transformer_layer_spec = get_gpt_decoder_block_spec(self.tfconfig, use_transformer_engine=True, **extra_kwargs)
 
-        # Patch layer spec for shared experts
-        for i in range(len(transformer_layer_spec.layer_specs)):
-            transformer_layer_spec.layer_specs[i].submodules.mlp.submodules.shared_experts.params["gate"] = True
+        # Older MCore APIs did not pass the shared-expert gate from TransformerConfig.
+        if not hasattr(self.tfconfig, "moe_shared_expert_gate"):
+            for layer_spec in transformer_layer_spec.layer_specs:
+                layer_spec.submodules.mlp.submodules.shared_experts.params["gate"] = True
 
         return transformer_layer_spec
 
