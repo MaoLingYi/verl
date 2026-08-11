@@ -934,13 +934,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
-        self.checkpoint_mananager.load_checkpoint(
-            local_path=checkpoint_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
-        )
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
         if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
+            load_megatron_optimizer(self.actor_optimizer)
+        try:
+            self.checkpoint_mananager.load_checkpoint(
+                local_path=checkpoint_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+            )
+        finally:
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+            if self._is_offload_optimizer:
+                offload_megatron_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
