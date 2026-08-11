@@ -22,12 +22,35 @@ from types import MethodType, SimpleNamespace
 MANAGER = Path(__file__).resolve().parents[3] / "verl" / "utils" / "checkpoint" / "megatron_checkpoint_manager.py"
 
 
+class TensorValue:
+    def __init__(self, value):
+        self.value = value
+        self.data = self
+
+    def copy_(self, other):
+        self.value = other.value
+
+
+class Parameter:
+    pass
+
+
 class HybridDeviceOptimizer:
-    def __init__(self, initialized=True, parameter=None, rng=None):
+    def __init__(self, initialized=True, parameter=None, rng=None, realistic_restore=False):
         self.state = {object(): {"master_param": object()}} if initialized else {}
         self.parameter = parameter
         self.rng = rng
         self.dummy_steps = 0
+        self.param_update_in_fp32 = realistic_restore
+        if realistic_restore:
+            self.native_fp32_param = Parameter()
+            self.low_precision_param = Parameter()
+            self.old_fp32_param = TensorValue("old-master")
+            self.param_groups = [
+                {"params": [self.native_fp32_param, self.low_precision_param], "lr": "initial-lr"}
+            ]
+            self.param_to_fp32_param = {self.low_precision_param: self.old_fp32_param}
+            self.fp32_param_to_orig_param = {self.old_fp32_param: self.low_precision_param}
 
     def dummy_step(self):
         self.dummy_steps += 1
@@ -36,6 +59,37 @@ class HybridDeviceOptimizer:
             self.parameter.value = "dummy-update"
         if self.rng is not None:
             self.rng.value = "dummy-consumed"
+
+    def load_state_dict(self, state_dict):
+        # MCore 0.16 HDO pre-hook: temporarily expose master params to torch.
+        old_reverse_mapping = self.fp32_param_to_orig_param
+        current_params = [
+            self.param_to_fp32_param.get(param, param) for param in self.param_groups[0]["params"]
+        ]
+
+        # torch.optim.Optimizer.load_state_dict: saved integer ids map by group order.
+        saved_params = state_dict["param_groups"][0]["params"]
+        id_map = dict(zip(saved_params, current_params))
+        self.state = {id_map[param_id]: value for param_id, value in state_dict["state"].items()}
+        self.param_groups = [{**state_dict["param_groups"][0], "params": current_params}]
+
+        # MCore 0.16 HDO post-hook: return old master keys to original params.
+        self.state = {old_reverse_mapping.get(param, param): value for param, value in self.state.items()}
+        self.param_groups[0]["params"] = [self.native_fp32_param, self.low_precision_param]
+
+        # _init_sub_optimizers() creates a fresh master object for low-precision params;
+        # native FP32 params intentionally have no param_to_fp32_param entry.
+        new_fp32_param = TensorValue("new-master")
+        self.param_to_fp32_param = {self.low_precision_param: new_fp32_param}
+        self.fp32_param_to_orig_param = {new_fp32_param: self.low_precision_param}
+        self._update_fp32_params_by_new_state()
+
+    def _update_fp32_params_by_new_state(self):
+        if not self.param_update_in_fp32:
+            return
+        for param, value in self.state.items():
+            fp32_param = self.param_to_fp32_param[param]
+            fp32_param.data.copy_(value["master_param"])
 
 
 class DistributedOptimizer:
@@ -70,16 +124,28 @@ class ChainedOptimizer:
             if isinstance(optimizer, DistributedOptimizer) and isinstance(
                 optimizer.optimizer, HybridDeviceOptimizer
             ):
-                optimizer.optimizer.state = state_dict
+                if optimizer.optimizer.param_update_in_fp32:
+                    optimizer.optimizer.load_state_dict(
+                        {
+                            "state": state_dict["param_state"],
+                            "param_groups": state_dict["optimizer"]["param_groups"],
+                        }
+                    )
+                else:
+                    optimizer.optimizer.state = state_dict
 
 
 class OrdinaryOptimizer:
     def __init__(self):
         self.loading_flags = []
+        self.loaded_states = []
 
     def sharded_state_dict(self, state_dict, *, is_loading, metadata):
         self.loading_flags.append(is_loading)
         return {"template": True}
+
+    def load_state_dict(self, state_dict):
+        self.loaded_states.append(state_dict)
 
 
 class Model:
@@ -117,20 +183,18 @@ def _production_methods(*, mcore_016=True):
         for node in cls.body
         if isinstance(node, ast.FunctionDef) and node.name in {"generate_state_dict", "load_checkpoint"}
     ]
-    helper = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name
-            in {
-                "_is_mcore_016_hdo_dp_reshardable_resume",
-                "_prepare_mcore_016_hdo_dp_reshardable_resume",
-            }
-        ),
-        None,
-    )
-    if helper is not None:
+    helpers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "_is_mcore_016_hdo_dp_reshardable_resume",
+            "_prepare_mcore_016_hdo_dp_reshardable_resume",
+            "_load_mcore_016_hdo_checkpoint_state",
+        }
+    ]
+    for helper in helpers:
         helper.body = [node for node in helper.body if not isinstance(node, ast.ImportFrom)]
     namespace = {
         "torch": SimpleNamespace(distributed=SimpleNamespace(barrier=lambda: None)),
@@ -156,7 +220,8 @@ def _production_methods(*, mcore_016=True):
     }
     nodes = [
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-        *(node for node in (helper, *methods) if node is not None),
+        *helpers,
+        *methods,
     ]
     module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
     exec(compile(module, str(MANAGER), "exec"), namespace)
@@ -237,15 +302,40 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertIn("optimizer", state_dict)
         self.assertEqual(state_dict["rng_state"], {"rng": "extra-template"})
 
-    def test_final_optimizer_restore_is_still_in_load_checkpoint(self):
+    def test_final_optimizer_restore_preserves_checkpoint_state(self):
         parameter = SimpleNamespace(value="initial-model")
         rng = SimpleNamespace(value="initial-rng")
         scheduler = SimpleNamespace(step_calls=0, state_dict=lambda: {"scheduler": "initial"})
-        hdo = HybridDeviceOptimizer(initialized=False, parameter=parameter, rng=rng)
+        hdo = HybridDeviceOptimizer(initialized=True, parameter=parameter, rng=rng, realistic_restore=True)
         optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
         manager = _manager(optimizer, Model(parameter))
         methods = _production_methods()
-        checkpoint_optimizer_state = {"checkpoint": "optimizer-state"}
+        checkpoint_optimizer_state = {
+            "optimizer": {
+                "param_groups": [
+                    {
+                        "params": [0, 1],
+                        "lr": 0.125,
+                        "betas": (0.8, 0.95),
+                        "weight_decay": 0.01,
+                    }
+                ]
+            },
+            "param_state": {
+                0: {
+                    "exp_avg": TensorValue("native-exp-avg"),
+                    "exp_avg_sq": TensorValue("native-exp-avg-sq"),
+                    "master_param": TensorValue("native-master"),
+                    "step": TensorValue(11),
+                },
+                1: {
+                    "exp_avg": TensorValue("low-exp-avg"),
+                    "exp_avg_sq": TensorValue("low-exp-avg-sq"),
+                    "master_param": TensorValue("low-master"),
+                    "step": TensorValue(11),
+                },
+            },
+        }
         methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = lambda **kwargs: {
             "model": {"weight": "checkpoint-model"},
             "optimizer": checkpoint_optimizer_state,
@@ -268,38 +358,100 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
 
         manager.load_checkpoint("checkpoint", del_local_after_load=False)
 
-        self.assertEqual(hdo.dummy_steps, 1)
+        self.assertEqual(hdo.dummy_steps, 0)
         self.assertEqual(parameter.value, "checkpoint-model")
         self.assertEqual(optimizer.loaded_states, [checkpoint_optimizer_state])
-        self.assertIs(hdo.state, checkpoint_optimizer_state)
+        self.assertEqual(set(hdo.state), {hdo.native_fp32_param, hdo.low_precision_param})
+        self.assertIn(hdo.low_precision_param, hdo.param_to_fp32_param)
+        self.assertNotIn(hdo.native_fp32_param, hdo.param_to_fp32_param)
+        for param, prefix in (
+            (hdo.native_fp32_param, "native"),
+            (hdo.low_precision_param, "low"),
+        ):
+            self.assertEqual(hdo.state[param]["exp_avg"].value, f"{prefix}-exp-avg")
+            self.assertEqual(hdo.state[param]["exp_avg_sq"].value, f"{prefix}-exp-avg-sq")
+            self.assertEqual(hdo.state[param]["master_param"].value, f"{prefix}-master")
+            self.assertEqual(hdo.state[param]["step"].value, 11)
+        self.assertEqual(hdo.param_groups[0]["lr"], 0.125)
+        self.assertEqual(hdo.param_groups[0]["betas"], (0.8, 0.95))
+        self.assertEqual(hdo.param_groups[0]["weight_decay"], 0.01)
+        self.assertEqual(hdo.param_to_fp32_param[hdo.low_precision_param].value, "low-master")
+        self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
         self.assertEqual(rng.value, "checkpoint-rng")
         self.assertEqual(manager.global_step, 1)
         self.assertEqual(scheduler.step_calls, 0)
 
+    def test_final_restore_compatibility_scope_is_exact(self):
+        checkpoint_state = {"checkpoint": "state"}
+        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
+
+        ordinary = OrdinaryOptimizer()
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        self.assertFalse(helper(ordinary, checkpoint_state, metadata, full_resume=True))
+        self.assertEqual(ordinary.loaded_states, [checkpoint_state])
+
+        for helper_metadata, full_resume in (
+            ({"distrib_optim_sharding_type": "fully_reshardable"}, True),
+            (metadata, False),
+        ):
+            hdo = HybridDeviceOptimizer(initialized=True)
+            optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
+            self.assertFalse(helper(optimizer, checkpoint_state, helper_metadata, full_resume=full_resume))
+            self.assertEqual(optimizer.loaded_states, [checkpoint_state])
+
+        hdo = HybridDeviceOptimizer(initialized=True)
+        optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
+        other_version_helper = _production_methods(mcore_016=False)[
+            "_load_mcore_016_hdo_checkpoint_state"
+        ]
+        self.assertFalse(other_version_helper(optimizer, checkpoint_state, metadata, full_resume=True))
+        self.assertEqual(optimizer.loaded_states, [checkpoint_state])
+
     @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
-    def test_real_mcore_class_identity(self):
+    def test_real_mcore_final_restore_compatibility(self):
+        import megatron.core
         from megatron.core.optimizer import ChainedOptimizer as RealChainedOptimizer
         from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer as RealHybridDeviceOptimizer
         from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer as RealDistributedOptimizer
+        from packaging import version
+
+        if version.parse(megatron.core.__version__).release[:2] != (0, 16):
+            self.skipTest("requires Megatron-Core 0.16.x")
 
         hdo = object.__new__(RealHybridDeviceOptimizer)
-        hdo.state = {object(): {}}
+        native_fp32_param = object()
+        hdo.param_update_in_fp32 = True
+        hdo.state = {native_fp32_param: {"master_param": object()}}
+        hdo.param_to_fp32_param = {}
+        with self.assertRaises(KeyError):
+            hdo._update_fp32_params_by_new_state()
+
         distributed = object.__new__(RealDistributedOptimizer)
         distributed.optimizer = hdo
         chained = object.__new__(RealChainedOptimizer)
         chained.chained_optimizers = [distributed]
+        load_calls = []
+
+        def load_state_dict(optimizer, state_dict):
+            load_calls.append(state_dict)
+            optimizer.chained_optimizers[0].optimizer._update_fp32_params_by_new_state()
+
+        chained.load_state_dict = MethodType(load_state_dict, chained)
         from verl.utils.checkpoint.megatron_checkpoint_manager import (
-            _prepare_mcore_016_hdo_dp_reshardable_resume as helper,
+            _load_mcore_016_hdo_checkpoint_state as helper,
         )
 
         self.assertTrue(
             helper(
                 chained,
-                is_loading=True,
+                {"checkpoint": "optimizer-state"},
                 metadata={"distrib_optim_sharding_type": "dp_reshardable"},
                 full_resume=True,
             )
         )
+        self.assertEqual(load_calls, [{"checkpoint": "optimizer-state"}])
+        with self.assertRaises(KeyError):
+            hdo._update_fp32_params_by_new_state()
 
 
 if __name__ == "__main__":

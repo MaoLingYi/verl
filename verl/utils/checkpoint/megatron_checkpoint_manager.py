@@ -84,6 +84,59 @@ def _prepare_mcore_016_hdo_dp_reshardable_resume(
     return found_hdo
 
 
+def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, full_resume: bool) -> bool:
+    if not (
+        mcore_016
+        and full_resume
+        and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
+    ):
+        optimizer.load_state_dict(state_dict)
+        return False
+
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    hdos = [
+        distributed_optimizer.optimizer
+        for distributed_optimizer in optimizers
+        if isinstance(distributed_optimizer, DistributedOptimizer)
+        and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
+    ]
+    if not hdos:
+        optimizer.load_state_dict(state_dict)
+        return False
+
+    # MCore 0.16's final HDO restore runs after the real DCP payload load. Its post-load
+    # hook assumes every state key has a separate FP32 master mapping, but native FP32
+    # parameters are intentionally absent from that mapping. Backport the later MCore
+    # behavior only on these HDO instances for this restore: retain every optimizer state
+    # entry and copy master weights only where a master mapping actually exists.
+    def update_fp32_params_by_new_state(hdo):
+        if not hdo.param_update_in_fp32:
+            return
+        for param, value in hdo.state.items():
+            fp32_param = hdo.param_to_fp32_param.get(param)
+            if fp32_param is not None:
+                fp32_param.data.copy_(value["master_param"])
+
+    method_name = "_update_fp32_params_by_new_state"
+    missing = object()
+    previous_methods = [(hdo, vars(hdo).get(method_name, missing)) for hdo in hdos]
+    for hdo in hdos:
+        setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+    try:
+        optimizer.load_state_dict(state_dict)
+    finally:
+        for hdo, previous_method in previous_methods:
+            if previous_method is missing:
+                delattr(hdo, method_name)
+            else:
+                setattr(hdo, method_name, previous_method)
+    return True
+
+
 class MegatronCheckpointManager(BaseCheckpointManager):
     """
     Checkpoint manager for Megatron-LM distributed training.
@@ -501,7 +554,17 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
             )
             optimizer_state_dict = state_dict["optimizer"]
-            self.optimizer.load_state_dict(optimizer_state_dict)
+            _load_mcore_016_hdo_checkpoint_state(
+                self.optimizer,
+                optimizer_state_dict,
+                sharded_sd_metadata,
+                full_resume=(
+                    self.should_load_model
+                    and self.use_dist_checkpointing
+                    and self.should_load_optimizer
+                    and self.should_load_extra
+                ),
+            )
             log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
             if self.use_checkpoint_opt_param_scheduler:
                 assert "lr_scheduler" in state_dict, (
