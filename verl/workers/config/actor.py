@@ -28,6 +28,7 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "RouterShiftDiagnosticsConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -36,6 +37,13 @@ __all__ = [
     "QATConfig",
     "TorchTitanActorConfig",
 ]
+
+
+@dataclass
+class RouterShiftDiagnosticsConfig(BaseConfig):
+    """Observer-only old/current training-router diagnostics."""
+
+    enabled: bool = False
 
 
 @dataclass
@@ -175,6 +183,7 @@ class ActorConfig(BaseConfig):
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    router_shift_diagnostics: RouterShiftDiagnosticsConfig = field(default_factory=RouterShiftDiagnosticsConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     # Store global batch info for loss aggregation:

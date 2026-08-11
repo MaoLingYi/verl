@@ -1401,6 +1401,10 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            if self.config.actor_rollout_ref.actor.router_shift_diagnostics.enabled:
+                                batch.batch["router_shift_sample_ids"] = torch.arange(
+                                    len(batch), dtype=torch.int64, device=batch.batch.device
+                                )
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]

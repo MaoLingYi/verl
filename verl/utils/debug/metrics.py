@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import logging
+import math
 
 import torch
 
@@ -60,6 +61,31 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, 
     return torch.masked_select(full_diff, mask)
 
 
+@torch.no_grad()
+def calculate_router_shift_metrics(
+    old_router_log_probs: torch.Tensor,
+    current_router_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> dict:
+    """Calculate RSPO router-shift diagnostics from aligned [batch, response, layer, top-k] tensors."""
+    if old_router_log_probs.shape != current_router_log_probs.shape or old_router_log_probs.ndim != 4:
+        raise ValueError("router log-prob tensors must have identical [batch, response, layer, top-k] shapes")
+    if response_mask.shape != old_router_log_probs.shape[:2]:
+        raise ValueError("router response mask must have [batch, response] shape")
+
+    mask = response_mask.bool()
+    if not mask.any():
+        raise ValueError("router-shift diagnostics require at least one valid response token")
+
+    delta = (current_router_log_probs.float() - old_router_log_probs.float()).abs().mean(dim=-1).mean(dim=-1)
+    gamma = torch.exp(-delta)[mask]
+    return {
+        "diag/router_shift/ratio_mean": gamma.mean().item(),
+        "diag/router_shift/clipfrac_gamma_0_8": (gamma < 0.8).float().mean().item(),
+    }
+
+
+@torch.no_grad()
 def calculate_debug_metrics(data: DataProto) -> dict:
     """
     calculate rollout vs actor logprobs diff, for debugging purpose
@@ -85,6 +111,8 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
         log_prob_mask = data.batch["response_mask"]
+    elif "loss_mask" in data.batch:
+        log_prob_mask = data.batch["loss_mask"]
     elif "attention_mask" in data.batch:
         log_prob_mask = data.batch["attention_mask"]
     else:
@@ -98,6 +126,22 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     actor_probs = torch.exp(actor_old_log_probs)
     rollout_probs = torch.exp(rollout_old_log_probs)
     response_mask_bool = response_mask.bool()
+    if (
+        actor_old_log_probs.shape != rollout_old_log_probs.shape
+        or response_mask_bool.shape != actor_old_log_probs.shape
+    ):
+        raise ValueError("TIM log-prob tensors and response mask must have identical shapes")
+    if not response_mask_bool.any():
+        raise ValueError("TIM diagnostics require at least one valid response token")
+
+    # Samples come from the inference policy. For r = pi_train / pi_infer,
+    # exp(log(r)) - 1 - log(r) is the paper's sampled-token k3 estimator.
+    log_ratio = actor_old_log_probs - rollout_old_log_probs
+    masked_log_ratio = torch.masked_select(log_ratio, response_mask_bool).float()
+    tim_kl_k3 = torch.mean(torch.expm1(masked_log_ratio) - masked_log_ratio)
+    tim_logprob_abs_mean = torch.mean(torch.abs(masked_log_ratio))
+    tim_extreme_frac_tau2 = torch.mean((torch.abs(masked_log_ratio) > math.log(2.0)).float())
+
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
     return {
@@ -106,4 +150,7 @@ def calculate_debug_metrics(data: DataProto) -> dict:
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
+        "diag/tim/kl_k3": tim_kl_k3.item(),
+        "diag/tim/logprob_abs_mean": tim_logprob_abs_mean.item(),
+        "diag/tim/extreme_frac_tau2": tim_extreme_frac_tau2.item(),
     }

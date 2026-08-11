@@ -259,3 +259,8 @@ router_replay:
   # Required when mode is 'replay'
   replay_file: null
 
+# Detached old/current training-router metrics; does not alter routing.
+router_shift_diagnostics:
+  _target_: verl.workers.config.RouterShiftDiagnosticsConfig
+  enabled: false
+

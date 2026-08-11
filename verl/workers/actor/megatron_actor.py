@@ -48,6 +48,7 @@ from verl.utils.megatron.router_replay_utils import (
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
 )
+from verl.utils.debug.router_shift import RouterShiftObserver
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.profiler import GPUMemoryLogger
@@ -183,6 +184,11 @@ class MegatronPPOActor(BasePPOActor):
         self.enable_routing_replay = self.router_replay.mode != "disabled"
         if self.enable_routing_replay:
             self.mini_layer_topk_idx_list = []
+        self.router_shift_observer = None
+        if self.config.router_shift_diagnostics.enabled:
+            self.router_shift_observer = RouterShiftObserver(
+                [unwrap_model(model) for model in self.actor_module], self.tf_config
+            )
 
         config = get_model_config(self.actor_module[0])
         print(config)
@@ -245,6 +251,8 @@ class MegatronPPOActor(BasePPOActor):
         entropys = torch.Tensor()
         if recompute_old_log_prob:
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+            if self.router_shift_observer is not None:
+                select_keys.append("router_shift_sample_ids")
 
             if self.enable_routing_replay and self.config.router_replay.mode == "R3":
                 assert "routed_experts" in data.batch.keys(), "routed_experts must be in data.batch.keys()"
@@ -255,6 +263,8 @@ class MegatronPPOActor(BasePPOActor):
             batch_size = input_ids.size(0)
             response = batch["responses"]
             response_length = response.size(1)
+            if self.router_shift_observer is not None:
+                self.router_shift_observer.start_old_batch()
             with torch.no_grad():
                 output = self.forward_backward_batch(
                     data,
@@ -327,6 +337,8 @@ class MegatronPPOActor(BasePPOActor):
                         revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                         layers_topk_idx = layers_topk_idx[revert_indices]
                     layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
+                if self.router_shift_observer is not None:
+                    self.router_shift_observer.finish_old_batch()
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
@@ -378,6 +390,8 @@ class MegatronPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        if self.router_shift_observer is not None:
+            select_keys.append("router_shift_sample_ids")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
@@ -614,6 +628,16 @@ class MegatronPPOActor(BasePPOActor):
                 multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"], indices)
             responses = batch["responses"]
             response_length = responses.size(1)
+            if self.router_shift_observer is not None:
+                if self.router_shift_observer.mode == "old":
+                    self.router_shift_observer.begin_old_microbatch()
+                elif self.router_shift_observer.mode == "current":
+                    self.router_shift_observer.begin_current_microbatch(
+                        input_ids,
+                        attention_mask,
+                        batch["router_shift_sample_ids"],
+                        response_length,
+                    )
             label = position_ids.clone()
             label[:, -response_length - 1 : -1] = responses
             label_mask = attention_mask.clone()
@@ -684,6 +708,22 @@ class MegatronPPOActor(BasePPOActor):
                     mtp_config=None if forward_only else self.mtp_config,
                 )
 
+            if self.router_shift_observer is not None:
+                if self.router_shift_observer.mode == "old":
+                    self.router_shift_observer.finish_old_microbatch(
+                        input_ids,
+                        attention_mask,
+                        batch["router_shift_sample_ids"],
+                        response_length,
+                    )
+                elif self.router_shift_observer.mode == "current":
+                    self.router_shift_observer.finish_current_microbatch(
+                        input_ids,
+                        attention_mask,
+                        batch["response_mask"],
+                        response_length,
+                    )
+
             if forward_only:
                 meta_info = None
             else:
@@ -753,6 +793,8 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
             self.mini_layer_topk_idx_list = []
+        if self.router_shift_observer is not None and self.router_shift_observer.mode == "current":
+            losses_reduced["router_shift"] = self.router_shift_observer.finish_current_batch()
 
         # Collect and pass MTP metrics to losses_reduced
         if not forward_only and self.mtp_config and self.mtp_config.enable_train:
@@ -777,6 +819,7 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
+        router_shift_totals = {"gamma_sum": 0.0, "clip_sum": 0.0, "token_count": 0}
         for data in dataloader:
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -794,6 +837,8 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+            if self.router_shift_observer is not None:
+                self.router_shift_observer.start_current_batch()
             metric_micro_batch = self.forward_backward_batch(
                 data,
                 calculate_entropy=calculate_entropy,
@@ -802,6 +847,10 @@ class MegatronPPOActor(BasePPOActor):
                 max_token_len=max_token_len,
                 mini_batch_size=self.config.ppo_mini_batch_size,
             )
+            if self.router_shift_observer is not None:
+                partial = metric_micro_batch.pop("router_shift")
+                for key in router_shift_totals:
+                    router_shift_totals[key] += partial[key]
 
             mtp_losses = metric_micro_batch.get("mtp_losses", None)
             if mtp_losses is not None:
@@ -829,5 +878,9 @@ class MegatronPPOActor(BasePPOActor):
                 RouterReplay.clear_global_indices()
 
         self.actor_optimizer.zero_grad()
+        if self.router_shift_observer is not None:
+            count = router_shift_totals["token_count"]
+            metrics["diag/router_shift/ratio_mean"] = [router_shift_totals["gamma_sum"] / count]
+            metrics["diag/router_shift/clipfrac_gamma_0_8"] = [router_shift_totals["clip_sum"] / count]
         get_torch_device().empty_cache()
         return metrics
