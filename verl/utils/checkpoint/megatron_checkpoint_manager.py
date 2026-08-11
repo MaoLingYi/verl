@@ -47,11 +47,41 @@ from .checkpoint_manager import BaseCheckpointManager
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 mcore_ge_014 = version.parse(megatron.core.__version__) >= version.parse("0.14.0")
+mcore_016 = version.parse(megatron.core.__version__).release[:2] == (0, 16)
 if not mcore_ge_014:
     logger.warning(
         "Detected megatron.core %s, recommend upgrading to >= 0.14.0 for better checkpoint compatibility",
         megatron.core.__version__,
     )
+
+
+def _prepare_mcore_016_hdo_dp_reshardable_resume(
+    optimizer, is_loading: bool, metadata: dict, full_resume: bool
+) -> bool:
+    if not (
+        mcore_016
+        and is_loading
+        and full_resume
+        and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
+    ):
+        return False
+
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    found_hdo = False
+    for distributed_optimizer in optimizers:
+        if not (
+            isinstance(distributed_optimizer, DistributedOptimizer)
+            and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
+        ):
+            continue
+        found_hdo = True
+        if not distributed_optimizer.optimizer.state:
+            distributed_optimizer.optimizer.dummy_step()
+    return found_hdo
 
 
 class MegatronCheckpointManager(BaseCheckpointManager):
@@ -280,7 +310,20 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         # Optimizer State Dict
         if generate_optimizer:
             torch.distributed.barrier()
-            sharded_state_dict_kwargs = {"is_loading": is_loading}
+            optimizer_is_loading = is_loading
+            if _prepare_mcore_016_hdo_dp_reshardable_resume(
+                self.optimizer,
+                is_loading,
+                base_metadata,
+                full_resume=generate_model and generate_optimizer and generate_extra,
+            ):
+                # Before the real payload load, MCore 0.16's loading-only self-load can rebuild
+                # CPU-offloaded HDO mappings while state is still keyed by previous parameter
+                # objects. Empty HDOs first use MCore's own dummy initialization; full resume
+                # then restores model, optimizer, and RNG state. dp_reshardable does not otherwise
+                # use is_loading, so the checkpoint payload and final optimizer restore are intact.
+                optimizer_is_loading = False
+            sharded_state_dict_kwargs = {"is_loading": optimizer_is_loading}
             if base_metadata is not None:
                 # https://github.com/NVIDIA/Megatron-LM/blob/core_v0.14.0/megatron/core/optimizer/distrib_optimizer.py#L1109-L1123
                 if mcore_ge_014:
