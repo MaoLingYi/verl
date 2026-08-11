@@ -84,6 +84,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _normalize_mbridge_qwen2moe_config(hf_config, tf_config):
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if "Qwen2MoeForCausalLM" not in architectures:
+        return
+    if not hasattr(tf_config, "moe_shared_expert_gate"):
+        raise RuntimeError("Qwen2MoE requires moe_shared_expert_gate support")
+    tf_config.moe_shared_expert_gate = True
+
+
 def set_random_seed(seed, only_rollout=False):
     import random
 
@@ -185,6 +194,7 @@ class MegatronWorker(Worker):
                 bridge = AutoBridge.from_config(hf_config, dtype=dtype)
                 bridge.set_extra_args(**override_transformer_config)
                 tf_config = bridge.config
+                _normalize_mbridge_qwen2moe_config(hf_config, tf_config)
                 tf_config.fp16 = fp16
                 tf_config.bf16 = bf16
             else:
