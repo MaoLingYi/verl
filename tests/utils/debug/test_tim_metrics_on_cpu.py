@@ -1,11 +1,14 @@
 import importlib.util
 import math
+import random
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 
@@ -166,6 +169,115 @@ class TestTimMetrics(unittest.TestCase):
         metrics = metrics_module.calculate_debug_metrics(data)
 
         self.assertAlmostEqual(metrics["diag/tim/logprob_abs_mean"], math.log(4.0) / 2, places=6)
+
+    def test_scatter_selection_is_deterministic_bounded_and_rng_free(self):
+        with (
+            patch.object(torch, "randperm", side_effect=AssertionError("torch RNG used")),
+            patch.object(np.random, "choice", side_effect=AssertionError("NumPy RNG used")),
+            patch.object(random, "sample", side_effect=AssertionError("Python RNG used")),
+        ):
+            for count, expected in ((17, 17), (4096, 4096), (5000, 4096)):
+                valid = torch.arange(count)
+                first = metrics_module.deterministic_even_indices(valid, 4096)
+                second = metrics_module.deterministic_even_indices(valid, 4096)
+                self.assertTrue(torch.equal(first, second))
+                self.assertEqual(first.numel(), expected)
+                self.assertEqual(torch.unique(first).numel(), expected)
+                self.assertEqual((first[0].item(), first[-1].item()), (0, count - 1))
+
+    def test_scatter_cadence(self):
+        formal = [step for step in range(1, 371) if metrics_module.should_save_tim_scatter(step, 370, 25, True)]
+        self.assertEqual(formal, [*range(25, 351, 25), 370])
+        for final_step in (1, 8, 20):
+            self.assertEqual(
+                [step for step in range(1, final_step + 1) if metrics_module.should_save_tim_scatter(step, final_step, 25, True)],
+                [final_step],
+            )
+
+    def test_scatter_npz_schema_mask_probabilities_and_sequence_ratio(self):
+        rollout = torch.tensor([[-1.0, -2.0, -3.0]])
+        training = torch.tensor([[-0.5, -2.5, -2.0]])
+        mask = torch.tensor([[1, 1, 0]])
+        data = _DataProto(
+            {
+                "rollout_log_probs": rollout,
+                "old_log_probs": training,
+                "response_mask": mask,
+                "responses": torch.zeros((1, 3)),
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_module.calculate_debug_metrics(
+                data,
+                scatter_config={
+                    "enabled": True,
+                    "interval": 25,
+                    "max_token_pairs": 4096,
+                    "save_final": True,
+                    "required": True,
+                    "dir": directory,
+                },
+                global_step=8,
+                total_training_steps=8,
+                precision="bfloat16",
+                r3_enabled=True,
+            )
+            output = Path(directory) / "s000008.npz"
+            self.assertTrue(output.is_file())
+            self.assertFalse((Path(directory) / ".tmp000008.npz").exists())
+            with np.load(output) as snapshot:
+                self.assertEqual(set(snapshot.files), {
+                    "token_inference_logprob", "token_training_logprob",
+                    "token_inference_prob", "token_training_prob",
+                    "token_batch_row", "token_position", "seq_length", "seq_log_ratio",
+                    "seq_mean_log_ratio", "global_step", "precision", "r3_enabled", "schema_version",
+                })
+                np.testing.assert_allclose(snapshot["token_inference_logprob"], [-1.0, -2.0])
+                np.testing.assert_allclose(snapshot["token_training_logprob"], [-0.5, -2.5])
+                np.testing.assert_allclose(snapshot["token_inference_prob"], np.exp([-1.0, -2.0]))
+                np.testing.assert_allclose(snapshot["token_training_prob"], np.exp([-0.5, -2.5]))
+                np.testing.assert_array_equal(snapshot["token_batch_row"], [0, 0])
+                np.testing.assert_array_equal(snapshot["token_position"], [0, 1])
+                np.testing.assert_array_equal(snapshot["seq_length"], [2])
+                np.testing.assert_allclose(snapshot["seq_log_ratio"], [0.0])
+                np.testing.assert_allclose(snapshot["seq_mean_log_ratio"], [0.0])
+                for key in ("token_inference_logprob", "token_training_logprob", "token_inference_prob", "token_training_prob", "seq_log_ratio", "seq_mean_log_ratio"):
+                    self.assertEqual(snapshot[key].dtype, np.float32)
+                for key in ("token_batch_row", "token_position", "seq_length"):
+                    self.assertEqual(snapshot[key].dtype, np.int32)
+                self.assertEqual(snapshot["global_step"].dtype, np.int64)
+                self.assertEqual(snapshot["precision"].item(), "bfloat16")
+                self.assertTrue(snapshot["r3_enabled"].item())
+                self.assertEqual(snapshot["schema_version"].item(), 1)
+
+    def test_scatter_fails_on_invalid_required_data_or_path(self):
+        config = {
+            "enabled": True, "interval": 25, "max_token_pairs": 4096,
+            "save_final": True, "required": True, "dir": "missing-tim-directory",
+        }
+        with self.assertRaises(ValueError):
+            metrics_module.save_tim_scatter_sidecar(
+                torch.zeros((1, 2)), torch.zeros((1, 3)), torch.ones((1, 2)), config,
+                global_step=1, total_training_steps=1, precision="bfloat16", r3_enabled=False,
+            )
+        with self.assertRaises(ValueError):
+            metrics_module.save_tim_scatter_sidecar(
+                torch.zeros((1, 2)), torch.zeros((1, 2)), torch.zeros((1, 2)), config,
+                global_step=1, total_training_steps=1, precision="bfloat16", r3_enabled=False,
+            )
+        with self.assertRaises(FileNotFoundError):
+            metrics_module.save_tim_scatter_sidecar(
+                torch.zeros((1, 2)), torch.zeros((1, 2)), torch.ones((1, 2)), config,
+                global_step=1, total_training_steps=1, precision="bfloat16", r3_enabled=False,
+            )
+
+    def test_scatter_uses_existing_tensors_without_extra_forward_or_full_cpu_copy(self):
+        source = module_path.read_text(encoding="utf-8")
+        trainer = (module_path.parents[2] / "trainer/ppo/ray_trainer.py").read_text(encoding="utf-8")
+        self.assertNotIn("rollout_log_probs.cpu()", source)
+        self.assertNotIn("training_log_probs.cpu()", source)
+        self.assertLess(source.index("index_select(0, selected)"), source.index("rollout_selected.cpu()"))
+        self.assertEqual(trainer.count("old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)"), 1)
 
 
 class TestRouterShiftContract(unittest.TestCase):

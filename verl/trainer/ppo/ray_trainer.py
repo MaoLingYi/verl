@@ -1430,11 +1430,31 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            tim_scatter = self.config.trainer.get("tim_scatter", None)
+                            if tim_scatter and tim_scatter.get("enabled", False):
+                                from verl.utils.debug.metrics import should_save_tim_scatter
+
+                                scatter_due = should_save_tim_scatter(
+                                    self.global_steps,
+                                    self.total_training_steps,
+                                    int(tim_scatter.get("interval", 0)),
+                                    tim_scatter.get("save_final") is True,
+                                )
+                                if scatter_due and "rollout_log_probs" not in batch.batch:
+                                    raise ValueError("required TIM scatter output needs rollout_log_probs")
                             if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics.update(calculate_debug_metrics(batch))
+                                metrics.update(
+                                    calculate_debug_metrics(
+                                        batch,
+                                        scatter_config=tim_scatter,
+                                        global_step=self.global_steps,
+                                        total_training_steps=self.total_training_steps,
+                                        precision=str(self.config.actor_rollout_ref.actor.megatron.dtype),
+                                        r3_enabled=self.config.actor_rollout_ref.actor.router_replay.mode == "R3",
+                                    )
+                                )
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
