@@ -675,6 +675,38 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _init_async_rollout_and_checkpoint_manager(self, actor_rollout_resource_pool):
+        # Support custom AgentLoopManager via config
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            from verl.experimental.agent_loop import AgentLoopManager
+
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        self.async_rollout_manager = AgentLoopManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_rollout_wg,
+            replicas=self.async_rollout_manager.rollout_replicas,
+        )
+
+        # sleep all replicas to load checkpoint
+        self.checkpoint_manager.sleep_replicas()
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -690,6 +722,7 @@ class RayPPOTrainer:
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
             actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            self._actor_rollout_resource_pool = actor_rollout_resource_pool
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
@@ -820,36 +853,14 @@ class RayPPOTrainer:
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
 
-        # Support custom AgentLoopManager via config
-        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
-        if manager_class_fqn:
-            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        defer_rollout_init = (
+            self.config.trainer.resume_mode == "resume_path" and bool(self.config.trainer.resume_from_path)
+        )
+        if defer_rollout_init:
+            self.async_rollout_manager = None
+            self.checkpoint_manager = None
         else:
-            from verl.experimental.agent_loop import AgentLoopManager
-
-        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-        self.async_rollout_manager = AgentLoopManager.create(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-            rollout_resource_pool=actor_rollout_resource_pool,
-            reward_loop_worker_handles=reward_loop_worker_handles,
-        )
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            trainer=self.actor_rollout_wg,
-            replicas=self.async_rollout_manager.rollout_replicas,
-        )
-
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+            self._init_async_rollout_and_checkpoint_manager(actor_rollout_resource_pool)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1249,6 +1260,8 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        if self.checkpoint_manager is None:
+            self._init_async_rollout_and_checkpoint_manager(self._actor_rollout_resource_pool)
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
