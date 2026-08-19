@@ -88,10 +88,6 @@ _RESUME_MAX_HOST_MEMORY_PERCENT = 80.0
 _RESUME_MIN_HOST_AVAILABLE_BYTES = 200 * _GIB
 
 
-class ResumeHostMemoryBudgetExceeded(RuntimeError):
-    """Raised before a staged resume allocation would exceed the host safety budget."""
-
-
 def _is_gpu_adam_distributed_optimizer(optimizer):
     from megatron.core.optimizer import ChainedOptimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -105,7 +101,7 @@ def _is_gpu_adam_distributed_optimizer(optimizer):
     )
 
 
-def _log_resume_memory(stage, enforce_host_budget=False):
+def _log_resume_memory(stage):
     host = psutil.virtual_memory()
     device = get_torch_device()
     gpu_available = device.is_available()
@@ -113,7 +109,8 @@ def _log_resume_memory(stage, enforce_host_budget=False):
     gpu_reserved = device.memory_reserved() if gpu_available else 0
     gpu_peak = device.max_memory_allocated() if gpu_available else 0
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if rank == 0 or os.getenv("VERL_RESUME_MEM_DEBUG_ALL_RANKS") == "1":
+    should_log = rank == 0 or os.getenv("VERL_RESUME_MEM_DEBUG_ALL_RANKS") == "1"
+    if should_log:
         logger.warning(
             "RESUME_MEM %s host_used_gib=%.2f host_available_gib=%.2f host_percent=%.1f "
             "gpu_allocated_gib=%.2f gpu_reserved_gib=%.2f gpu_max_allocated_gib=%.2f",
@@ -125,16 +122,32 @@ def _log_resume_memory(stage, enforce_host_budget=False):
             gpu_reserved / _GIB,
             gpu_peak / _GIB,
         )
-    if enforce_host_budget and (
+    if should_log and (
         host.percent >= _RESUME_MAX_HOST_MEMORY_PERCENT or host.available < _RESUME_MIN_HOST_AVAILABLE_BYTES
     ):
-        raise ResumeHostMemoryBudgetExceeded(
-            f"Resume host memory budget exceeded before {stage}: used={host.percent:.1f}%, "
-            f"available={host.available / _GIB:.2f} GiB; require used<"
-            f"{_RESUME_MAX_HOST_MEMORY_PERCENT:.1f}% and available>="
-            f"{_RESUME_MIN_HOST_AVAILABLE_BYTES / _GIB:.0f} GiB"
+        logger.warning(
+            "RESUME_MEM_WARNING host budget observation threshold crossed at %s: "
+            "host_used_gib=%.2f host_available_gib=%.2f host_percent=%.1f",
+            stage,
+            host.used / _GIB,
+            host.available / _GIB,
+            host.percent,
         )
-    return {"gpu_available": gpu_available, "gpu_allocated": gpu_allocated}
+    return {
+        "host_used": host.used,
+        "host_available": host.available,
+        "host_percent": host.percent,
+        "gpu_available": gpu_available,
+        "gpu_allocated": gpu_allocated,
+        "gpu_reserved": gpu_reserved,
+        "gpu_peak_allocated": gpu_peak,
+    }
+
+
+def _reset_resume_peak_memory():
+    device = get_torch_device()
+    if device.is_available():
+        device.reset_peak_memory_stats()
 
 
 def _normalize_mbridge_qwen2moe_config(hf_config, tf_config):
@@ -1007,7 +1020,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 )
 
             _log_resume_memory("actor_initialized")
-            _log_resume_memory("before_model_load", enforce_host_budget=True)
+            _reset_resume_peak_memory()
+            model_before_memory = _log_resume_memory("before_model_load")
             model_loaded_memory = None
             try:
                 load_megatron_model_to_gpu(self.actor_module)
@@ -1027,9 +1041,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     and model_loaded_memory["gpu_available"]
                     and model_offloaded_memory["gpu_allocated"] >= model_loaded_memory["gpu_allocated"]
                 ):
-                    raise RuntimeError("Staged resume model offload did not reduce allocated GPU memory")
+                    logger.warning(
+                        "RESUME_MEM_WARNING model offload did not reduce allocated GPU memory: "
+                        "baseline_gib=%.2f loaded_gib=%.2f offloaded_gib=%.2f",
+                        model_before_memory["gpu_allocated"] / _GIB,
+                        model_loaded_memory["gpu_allocated"] / _GIB,
+                        model_offloaded_memory["gpu_allocated"] / _GIB,
+                    )
 
-            _log_resume_memory("before_optimizer_load", enforce_host_budget=True)
+            _reset_resume_peak_memory()
+            optimizer_before_memory = _log_resume_memory("before_optimizer_load")
             optimizer_loaded_memory = None
             try:
                 load_megatron_optimizer(self.actor_optimizer)
@@ -1039,7 +1060,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     del_local_after_load=del_local_after_load,
                     load_contents=("optimizer",),
                     sharded_sd_metadata=sharded_sd_metadata,
-                    stage_callback=lambda stage: _log_resume_memory(stage, enforce_host_budget=True),
+                    stage_callback=_log_resume_memory,
                 )
                 optimizer_loaded_memory = _log_resume_memory("after_optimizer_load")
             finally:
@@ -1051,7 +1072,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     and optimizer_loaded_memory["gpu_available"]
                     and optimizer_offloaded_memory["gpu_allocated"] >= optimizer_loaded_memory["gpu_allocated"]
                 ):
-                    raise RuntimeError("Staged resume optimizer offload did not reduce allocated GPU memory")
+                    logger.warning(
+                        "RESUME_MEM_WARNING optimizer offload did not reduce allocated GPU memory: "
+                        "baseline_gib=%.2f loaded_gib=%.2f offloaded_gib=%.2f",
+                        optimizer_before_memory["gpu_allocated"] / _GIB,
+                        optimizer_loaded_memory["gpu_allocated"] / _GIB,
+                        optimizer_offloaded_memory["gpu_allocated"] / _GIB,
+                    )
 
             _log_resume_memory("restore_complete")
             return

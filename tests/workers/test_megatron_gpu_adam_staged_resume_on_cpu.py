@@ -63,7 +63,9 @@ class CheckpointManager:
         self.events.append("optimizer_restore")
 
 
-def _staged_worker(events, *, fail_stage=None, model_offload_reduces_memory=True):
+def _staged_worker(
+    events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True
+):
     residency = {"model": False, "optimizer": False}
 
     def log_memory(stage, **kwargs):
@@ -72,7 +74,7 @@ def _staged_worker(events, *, fail_stage=None, model_offload_reduces_memory=True
             "after_model_load": 100,
             "after_model_offload": 10 if model_offload_reduces_memory else 100,
             "after_optimizer_load": 120,
-            "after_optimizer_offload": 10,
+            "after_optimizer_offload": 10 if optimizer_offload_reduces_memory else 120,
         }.get(stage, 10)
         return {"gpu_available": True, "gpu_allocated": allocated}
 
@@ -102,8 +104,12 @@ def _staged_worker(events, *, fail_stage=None, model_offload_reduces_memory=True
         "aggressive_empty_cache": lambda **kwargs: events.append("empty_cache"),
         "_is_gpu_adam_distributed_optimizer": lambda optimizer: True,
         "_log_resume_memory": log_memory,
+        "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
-        "logger": None,
+        "logger": SimpleNamespace(
+            warning=lambda message, *args: events.append(("warning", message % args))
+        ),
+        "_GIB": 1024**3,
     }
     worker = SimpleNamespace(
         _is_offload_param=True,
@@ -139,6 +145,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertEqual(events.count(("load", ("model", "extra"))), 1)
         self.assertEqual(events.count(("load", ("optimizer",))), 1)
         self.assertIn(("mem", "after_optimizer_template"), events)
+        self.assertEqual(events.count("reset_peak"), 2)
         self.assertEqual(events[-1], ("mem", "restore_complete"))
 
     def test_model_failure_offloads_and_never_onloads_optimizer(self):
@@ -152,15 +159,28 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertIn("model_offload", events)
         self.assertNotIn("optimizer_onload", events)
 
-    def test_model_stage_stops_if_offload_does_not_reduce_gpu_allocation(self):
+    def test_model_offload_delta_warns_and_optimizer_stage_continues(self):
         events = []
         worker, residency = _staged_worker(events, model_offload_reduces_memory=False)
 
-        with self.assertRaisesRegex(RuntimeError, "model offload did not reduce"):
-            worker.load_checkpoint("global_step_100", staged_restore=True)
+        worker.load_checkpoint("global_step_100", staged_restore=True)
 
         self.assertEqual(residency, {"model": False, "optimizer": False})
-        self.assertNotIn("optimizer_onload", events)
+        self.assertIn("optimizer_onload", events)
+        self.assertTrue(any("model offload did not reduce" in event[1] for event in events if event[0] == "warning"))
+        self.assertEqual(events[-1], ("mem", "restore_complete"))
+
+    def test_optimizer_offload_delta_warns_without_failing_restore(self):
+        events = []
+        worker, residency = _staged_worker(events, optimizer_offload_reduces_memory=False)
+
+        worker.load_checkpoint("global_step_100", staged_restore=True)
+
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertTrue(
+            any("optimizer offload did not reduce" in event[1] for event in events if event[0] == "warning")
+        )
+        self.assertEqual(events[-1], ("mem", "restore_complete"))
 
     def test_optimizer_failure_keeps_model_offloaded_and_cleans_optimizer(self):
         events = []
@@ -204,11 +224,9 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertFalse(predicate(DistributedOptimizer(HybridDeviceOptimizer())))
         self.assertFalse(predicate(DistributedOptimizer(object())))
 
-    def test_host_memory_guard_fails_before_large_allocation(self):
-        class ResumeHostMemoryBudgetExceeded(RuntimeError):
-            pass
-
+    def test_host_memory_threshold_warns_and_returns_telemetry(self):
         memory = SimpleNamespace(used=850 * 1024**3, available=150 * 1024**3, percent=85.0)
+        warnings = []
         guard = _module_function(
             "_log_resume_memory",
             {
@@ -216,16 +234,35 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
                 "get_torch_device": lambda: SimpleNamespace(is_available=lambda: False),
                 "torch": SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
                 "os": SimpleNamespace(getenv=lambda *args: None),
-                "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
+                "logger": SimpleNamespace(warning=lambda message, *args: warnings.append(message % args)),
                 "_GIB": 1024**3,
                 "_RESUME_MAX_HOST_MEMORY_PERCENT": 80.0,
                 "_RESUME_MIN_HOST_AVAILABLE_BYTES": 200 * 1024**3,
-                "ResumeHostMemoryBudgetExceeded": ResumeHostMemoryBudgetExceeded,
             },
         )
 
-        with self.assertRaisesRegex(ResumeHostMemoryBudgetExceeded, "used=85.0%"):
-            guard("before_optimizer_load", enforce_host_budget=True)
+        telemetry = guard("before_optimizer_load")
+
+        self.assertEqual(telemetry["host_used"], memory.used)
+        self.assertEqual(telemetry["host_available"], memory.available)
+        self.assertEqual(telemetry["host_percent"], memory.percent)
+        self.assertTrue(any("RESUME_MEM_WARNING host budget" in warning for warning in warnings))
+
+    def test_peak_reset_is_cpu_safe(self):
+        reset_calls = []
+        reset = _module_function(
+            "_reset_resume_peak_memory",
+            {
+                "get_torch_device": lambda: SimpleNamespace(
+                    is_available=lambda: False,
+                    reset_peak_memory_stats=lambda: reset_calls.append(True),
+                )
+            },
+        )
+
+        reset()
+
+        self.assertEqual(reset_calls, [])
 
 
 if __name__ == "__main__":
