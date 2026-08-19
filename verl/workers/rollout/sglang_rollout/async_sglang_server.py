@@ -56,6 +56,15 @@ logger.setLevel(logging.INFO)
 visible_devices_keyword = get_visible_devices_keyword()
 
 
+def _sglang_server_env_vars():
+    # Ray merges child env vars with the parent, so explicitly override inherited expandable segments.
+    return {
+        f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+    }
+
+
 class SGLangHttpServer:
     """SGLang http server in single node, this is equivalent to launch server with command line:
     ```
@@ -521,7 +530,7 @@ class SGLangReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
+                runtime_env={"env_vars": _sglang_server_env_vars()},
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(
