@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import ast
+import os
 import unittest
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -116,6 +117,78 @@ def _mock_trainer(events, *, restored_step=None, restore_error=None, stop_after_
 
 
 class TestResumeRolloutInitOrder(unittest.TestCase):
+    def test_disable_and_auto_without_checkpoint_keep_fresh_path(self):
+        load_checkpoint = _production_method(
+            "_load_checkpoint",
+            {
+                "os": os,
+                "find_latest_ckpt_path": lambda path: None,
+                "Role": SimpleNamespace(Critic="critic"),
+                "torch": SimpleNamespace(load=lambda *args, **kwargs: None),
+            },
+        )
+
+        for resume_mode in ("disable", "auto"):
+            calls = []
+            trainer = SimpleNamespace(
+                config=ConfigNode(
+                    trainer=ConfigNode(
+                        resume_mode=resume_mode,
+                        default_hdfs_dir=None,
+                        default_local_dir="checkpoints",
+                    )
+                ),
+                actor_rollout_wg=SimpleNamespace(load_checkpoint=lambda *args, **kwargs: calls.append(args)),
+            )
+
+            self.assertEqual(load_checkpoint(trainer), 0)
+            self.assertEqual(calls, [])
+
+    def test_only_explicit_resume_path_requests_staged_restore(self):
+        fake_os = SimpleNamespace(
+            getcwd=os.getcwd,
+            path=SimpleNamespace(
+                isabs=lambda path: True,
+                join=os.path.join,
+                exists=lambda path: path.endswith("data.pt"),
+            ),
+        )
+        load_checkpoint = _production_method(
+            "_load_checkpoint",
+            {
+                "os": fake_os,
+                "find_latest_ckpt_path": lambda path: os.path.join(path, "global_step_100"),
+                "Role": SimpleNamespace(Critic="critic"),
+                "torch": SimpleNamespace(load=lambda *args, **kwargs: {"cursor": 100}),
+            },
+        )
+
+        for resume_mode, expected_staged in (("auto", False), ("resume_path", True)):
+            calls = []
+            dataloader_states = []
+            trainer_config = ConfigNode(
+                resume_mode=resume_mode,
+                default_hdfs_dir=None,
+                default_local_dir="checkpoints",
+                resume_from_path="checkpoints/global_step_100",
+                del_local_ckpt_after_load=False,
+            )
+            trainer = SimpleNamespace(
+                config=ConfigNode(trainer=trainer_config),
+                actor_rollout_wg=SimpleNamespace(
+                    load_checkpoint=lambda *args, **kwargs: calls.append((args, kwargs))
+                ),
+                use_critic=False,
+                train_dataloader=SimpleNamespace(load_state_dict=dataloader_states.append),
+            )
+
+            load_checkpoint(trainer)
+
+            self.assertEqual(len(calls), 1)
+            self.assertIs(calls[0][1]["staged_restore"], expected_staged)
+            self.assertEqual(dataloader_states, [{"cursor": 100}])
+            self.assertEqual(trainer.global_steps, 100)
+
     def test_fresh_run_keeps_rollout_initialization_before_checkpoint_load(self):
         events = ["actor_init"]
         trainer = _mock_trainer(events)

@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import ast
+import gc
 import importlib.util
 import unittest
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+
+import torch
 
 
 MANAGER = Path(__file__).resolve().parents[3] / "verl" / "utils" / "checkpoint" / "megatron_checkpoint_manager.py"
@@ -148,6 +151,25 @@ class OrdinaryOptimizer:
         self.loaded_states.append(state_dict)
 
 
+class ExactOptimizer:
+    def __init__(self):
+        self.loading_flags = []
+        self.loaded_state = None
+
+    def sharded_state_dict(self, state_dict, *, is_loading, metadata):
+        self.loading_flags.append(is_loading)
+        return {"optimizer-template": True}
+
+    def load_state_dict(self, state_dict):
+        self.loaded_state = {
+            "optimizer": {"param_groups": [dict(state_dict["optimizer"]["param_groups"][0])]},
+            "param_state": {
+                key: {name: value.clone() for name, value in values.items()}
+                for key, values in state_dict["param_state"].items()
+            },
+        }
+
+
 class Model:
     def __init__(self, parameter=None):
         self.parameter = parameter
@@ -217,6 +239,7 @@ def _production_methods(*, mcore_016=True):
         "get_dist_checkpoint_path": lambda path: f"{path}/dist_ckpt",
         "log_with_rank": lambda *args, **kwargs: None,
         "logger": None,
+        "gc": gc,
     }
     nodes = [
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
@@ -233,6 +256,125 @@ def _generate_state_dict(*, mcore_016=True):
 
 
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_staged_load_clears_template_and_payload_on_failure(self):
+        class TrackedDict(dict):
+            cleared = False
+
+            def clear(self):
+                self.cleared = True
+                super().clear()
+
+        class FailingOptimizer:
+            def load_state_dict(self, state_dict):
+                raise RuntimeError("optimizer restore failed")
+
+        template = TrackedDict({"optimizer": {"template": True}})
+        payload = TrackedDict({"optimizer": {"checkpoint": True}})
+        manager = _manager(FailingOptimizer())
+        methods = _production_methods()
+        manager.generate_state_dict = lambda *args, **kwargs: template
+        manager.load_checkpoint = MethodType(methods["load_checkpoint"], manager)
+        manager.checkpoint_load_contents = {"optimizer"}
+        manager.use_dist_checkpointing = True
+        manager.use_distributed_optimizer = True
+        manager.use_checkpoint_opt_param_scheduler = False
+        manager.rank = 0
+        manager.peft_cls = None
+        methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = lambda **kwargs: payload
+
+        with self.assertRaisesRegex(RuntimeError, "optimizer restore failed"):
+            manager.load_checkpoint("checkpoint", load_contents=("optimizer",))
+
+        self.assertTrue(template.cleared)
+        self.assertTrue(payload.cleared)
+
+    def test_staged_load_reuses_metadata_and_restores_exact_state_once(self):
+        optimizer = ExactOptimizer()
+        model_parameter = SimpleNamespace(value=torch.tensor([-1.0]))
+        scheduler = SimpleNamespace(loaded=[], state_dict=lambda: {"step": -1})
+        scheduler.load_state_dict = lambda state: scheduler.loaded.append(dict(state))
+        manager = _manager(optimizer, Model(model_parameter))
+        methods = _production_methods()
+        manager.generate_state_dict = MethodType(methods["generate_state_dict"], manager)
+        manager.load_checkpoint = MethodType(methods["load_checkpoint"], manager)
+        manager.checkpoint_load_contents = {"model", "optimizer", "extra"}
+        manager.use_dist_checkpointing = True
+        manager.use_distributed_optimizer = True
+        manager.use_hf_checkpoint = False
+        # Formal Qwen3 keeps configured LR/decay values but must still restore scheduler num_steps.
+        manager.use_checkpoint_opt_param_scheduler = False
+        manager.lr_scheduler = scheduler
+        manager.rank = 0
+        manager.peft_cls = None
+        manager.vanilla_bridge = True
+
+        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
+        metadata_loads = []
+        methods["load_checkpoint"].__globals__["dist_checkpointing"].load_content_metadata = (
+            lambda **kwargs: metadata_loads.append(kwargs) or metadata
+        )
+        checkpoint_optimizer = {
+            "optimizer": {
+                "param_groups": [
+                    {
+                        "lr": 1.0e-6,
+                        "betas": (0.9, 0.95),
+                        "eps": 1.0e-15,
+                        "weight_decay": 0.0,
+                        "step": 100,
+                    }
+                ]
+            },
+            "param_state": {
+                0: {
+                    "exp_avg": torch.tensor([1.25, -2.5]),
+                    "exp_avg_sq": torch.tensor([3.5, 4.75]),
+                    "master_param": torch.tensor([5.0, 6.0]),
+                }
+            },
+        }
+        rng_state = {"python": "python-rng", "numpy": "numpy-rng", "torch": "torch-rng"}
+        stage_keys = []
+
+        def load_dist_checkpointing(*, sharded_state_dict, ckpt_dir):
+            stage_keys.append(tuple(sharded_state_dict))
+            if "model" in sharded_state_dict:
+                return {"model": {"weight": torch.tensor([42.0])}, "rng_state": rng_state}
+            return {
+                "optimizer": checkpoint_optimizer,
+                "lr_scheduler": {"step": 100, "last_lr": 1.0e-6},
+            }
+
+        methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = load_dist_checkpointing
+        restored_rng = []
+        manager.load_rng_states = lambda state: restored_rng.append(dict(state))
+
+        loaded_metadata = manager.load_checkpoint(
+            "checkpoint", load_contents=("model", "extra"), del_local_after_load=False
+        )
+        template_events = []
+        manager.load_checkpoint(
+            "checkpoint",
+            load_contents=("optimizer",),
+            sharded_sd_metadata=loaded_metadata,
+            stage_callback=template_events.append,
+            del_local_after_load=False,
+        )
+
+        self.assertIs(loaded_metadata, metadata)
+        self.assertEqual(len(metadata_loads), 1)
+        self.assertEqual(stage_keys, [("model", "rng_state"), ("optimizer", "lr_scheduler")])
+        self.assertEqual(template_events, ["after_optimizer_template"])
+        self.assertTrue(torch.equal(model_parameter.value, torch.tensor([42.0])))
+        self.assertEqual(restored_rng, [rng_state])
+        self.assertEqual(scheduler.loaded, [{"step": 100, "last_lr": 1.0e-6}])
+        self.assertEqual(
+            optimizer.loaded_state["optimizer"]["param_groups"],
+            checkpoint_optimizer["optimizer"]["param_groups"],
+        )
+        for name, expected in checkpoint_optimizer["param_state"][0].items():
+            self.assertTrue(torch.equal(optimizer.loaded_state["param_state"][0][name], expected))
+
     def test_hdo_resume_template_avoids_parameter_identity_reload(self):
         optimizer = ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer(initialized=True)))
 
@@ -346,6 +488,7 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         manager.should_load_model = True
         manager.should_load_optimizer = True
         manager.should_load_extra = True
+        manager.checkpoint_load_contents = {"model", "optimizer", "extra"}
         manager.use_dist_checkpointing = True
         manager.use_distributed_optimizer = True
         manager.use_hf_checkpoint = False

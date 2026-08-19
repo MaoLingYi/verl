@@ -971,7 +971,9 @@ class RayPPOTrainer:
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
         self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            actor_path,
+            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            staged_restore=self.config.trainer.resume_mode == "resume_path",
         )
         # load critic
         if self.use_critic:

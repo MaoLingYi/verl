@@ -83,6 +83,59 @@ from verl.workers.rollout import get_rollout_class
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_GIB = 1024**3
+_RESUME_MAX_HOST_MEMORY_PERCENT = 80.0
+_RESUME_MIN_HOST_AVAILABLE_BYTES = 200 * _GIB
+
+
+class ResumeHostMemoryBudgetExceeded(RuntimeError):
+    """Raised before a staged resume allocation would exceed the host safety budget."""
+
+
+def _is_gpu_adam_distributed_optimizer(optimizer):
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    return bool(optimizers) and all(
+        isinstance(distributed_optimizer, DistributedOptimizer)
+        and isinstance(distributed_optimizer.optimizer, FusedAdam)
+        for distributed_optimizer in optimizers
+    )
+
+
+def _log_resume_memory(stage, enforce_host_budget=False):
+    host = psutil.virtual_memory()
+    device = get_torch_device()
+    gpu_available = device.is_available()
+    gpu_allocated = device.memory_allocated() if gpu_available else 0
+    gpu_reserved = device.memory_reserved() if gpu_available else 0
+    gpu_peak = device.max_memory_allocated() if gpu_available else 0
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0 or os.getenv("VERL_RESUME_MEM_DEBUG_ALL_RANKS") == "1":
+        logger.warning(
+            "RESUME_MEM %s host_used_gib=%.2f host_available_gib=%.2f host_percent=%.1f "
+            "gpu_allocated_gib=%.2f gpu_reserved_gib=%.2f gpu_max_allocated_gib=%.2f",
+            stage,
+            host.used / _GIB,
+            host.available / _GIB,
+            host.percent,
+            gpu_allocated / _GIB,
+            gpu_reserved / _GIB,
+            gpu_peak / _GIB,
+        )
+    if enforce_host_budget and (
+        host.percent >= _RESUME_MAX_HOST_MEMORY_PERCENT or host.available < _RESUME_MIN_HOST_AVAILABLE_BYTES
+    ):
+        raise ResumeHostMemoryBudgetExceeded(
+            f"Resume host memory budget exceeded before {stage}: used={host.percent:.1f}%, "
+            f"available={host.available / _GIB:.2f} GiB; require used<"
+            f"{_RESUME_MAX_HOST_MEMORY_PERCENT:.1f}% and available>="
+            f"{_RESUME_MIN_HOST_AVAILABLE_BYTES / _GIB:.0f} GiB"
+        )
+    return {"gpu_available": gpu_available, "gpu_allocated": gpu_allocated}
+
 
 def _normalize_mbridge_qwen2moe_config(hf_config, tf_config):
     architectures = getattr(hf_config, "architectures", None) or ()
@@ -922,7 +975,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, checkpoint_path, hdfs_path=None, del_local_after_load=True):
+    def load_checkpoint(
+        self,
+        checkpoint_path,
+        hdfs_path=None,
+        del_local_after_load=True,
+        staged_restore=False,
+    ):
         # No checkpoint to load, just offload the model and optimizer to CPU
         if checkpoint_path is None:
             if self._is_offload_param:
@@ -930,6 +989,71 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint", logger=logger)
+            return
+
+        if staged_restore:
+            if not (
+                self._is_offload_param
+                and self._is_offload_optimizer
+                and self.checkpoint_mananager.use_dist_checkpointing
+                and self.checkpoint_mananager.should_load_model
+                and self.checkpoint_mananager.should_load_optimizer
+                and self.checkpoint_mananager.should_load_extra
+                and _is_gpu_adam_distributed_optimizer(self.actor_optimizer)
+            ):
+                raise RuntimeError(
+                    "Staged resume requires full model/optimizer/extra DCP loading with param_offload=true, "
+                    "optimizer_offload=true, and DistributedOptimizer + TransformerEngine FusedAdam"
+                )
+
+            _log_resume_memory("actor_initialized")
+            _log_resume_memory("before_model_load", enforce_host_budget=True)
+            model_loaded_memory = None
+            try:
+                load_megatron_model_to_gpu(self.actor_module)
+                sharded_sd_metadata = self.checkpoint_mananager.load_checkpoint(
+                    local_path=checkpoint_path,
+                    hdfs_path=hdfs_path,
+                    del_local_after_load=False,
+                    load_contents=("model", "extra"),
+                )
+                model_loaded_memory = _log_resume_memory("after_model_load")
+            finally:
+                offload_megatron_model_to_cpu(self.actor_module)
+                aggressive_empty_cache(force_sync=True)
+                model_offloaded_memory = _log_resume_memory("after_model_offload")
+                if (
+                    model_loaded_memory is not None
+                    and model_loaded_memory["gpu_available"]
+                    and model_offloaded_memory["gpu_allocated"] >= model_loaded_memory["gpu_allocated"]
+                ):
+                    raise RuntimeError("Staged resume model offload did not reduce allocated GPU memory")
+
+            _log_resume_memory("before_optimizer_load", enforce_host_budget=True)
+            optimizer_loaded_memory = None
+            try:
+                load_megatron_optimizer(self.actor_optimizer)
+                self.checkpoint_mananager.load_checkpoint(
+                    local_path=checkpoint_path,
+                    hdfs_path=hdfs_path,
+                    del_local_after_load=del_local_after_load,
+                    load_contents=("optimizer",),
+                    sharded_sd_metadata=sharded_sd_metadata,
+                    stage_callback=lambda stage: _log_resume_memory(stage, enforce_host_budget=True),
+                )
+                optimizer_loaded_memory = _log_resume_memory("after_optimizer_load")
+            finally:
+                offload_megatron_optimizer(self.actor_optimizer)
+                aggressive_empty_cache(force_sync=True)
+                optimizer_offloaded_memory = _log_resume_memory("after_optimizer_offload")
+                if (
+                    optimizer_loaded_memory is not None
+                    and optimizer_loaded_memory["gpu_available"]
+                    and optimizer_offloaded_memory["gpu_allocated"] >= optimizer_loaded_memory["gpu_allocated"]
+                ):
+                    raise RuntimeError("Staged resume optimizer offload did not reduce allocated GPU memory")
+
+            _log_resume_memory("restore_complete")
             return
 
         if self._is_offload_param:
