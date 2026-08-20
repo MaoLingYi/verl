@@ -321,13 +321,74 @@ class TestRouterShiftContract(unittest.TestCase):
         torch.testing.assert_close(diff, reference)
         self.assertEqual(set(old_indices[0].tolist()), {0, 1})
 
-    def test_pp3_aggregates_delta_before_exponentiation(self):
-        local = [torch.tensor([0.0]), torch.tensor([math.log(2.0)]), torch.tensor([math.log(4.0)])]
+    def test_qwen3_post_softmax_compares_probabilities_on_old_topk(self):
+        old_logits = torch.tensor([[5.0, 4.0, 0.0, -1.0]])
+        old_map = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
+        old_indices, old_selected = router_module.RouterShiftObserver.selected_old_router_log_probs(
+            old_logits, old_map, topk=2, pre_softmax=False
+        )
+        current_logits = torch.tensor([[0.0, -2.0, 5.0, 4.0]], dtype=torch.bfloat16)
 
-        gamma = router_module.RouterShiftObserver.aggregate_partials(local, [1, 1, 1], topk=1)
+        diff = router_module.RouterShiftObserver.current_abs_diff_sum(
+            current_logits, old_indices, old_selected, pre_softmax=False
+        )
+        reference = (
+            torch.log_softmax(current_logits.float().gather(-1, old_indices), dim=-1) - old_selected
+        ).abs().sum(-1)
 
-        expected = torch.exp(-sum(local) / 3)
-        wrong = sum(torch.exp(-value) for value in local) / 3
+        self.assertTrue(torch.isfinite(diff).all())
+        torch.testing.assert_close(diff, reference)
+        self.assertNotEqual(diff.item(), 0.0)
+
+    def test_qwen3_post_softmax_observer_is_diagnostic_only(self):
+        baseline = TopKRouter()
+        observed = TopKRouter()
+        observed.load_state_dict(baseline.state_dict())
+        observer = router_module.RouterShiftObserver(
+            [observed], _router_config(moe_router_pre_softmax=False)
+        )
+        observer.start_old_batch()
+        observer.begin_old_microbatch()
+        baseline_input = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
+        observed_input = baseline_input.detach().clone().requires_grad_(True)
+
+        baseline_output = baseline(baseline_input)[0]
+        observed_output = observed(observed_input)[0]
+        baseline_output[:, 0].sum().backward()
+        observed_output[:, 0].sum().backward()
+
+        torch.testing.assert_close(observed_output, baseline_output)
+        torch.testing.assert_close(observed_input.grad, baseline_input.grad)
+        torch.testing.assert_close(observed.weight.grad, baseline.weight.grad)
+        self.assertFalse(observer._old_log_probs[0].requires_grad)
+
+    def test_router_data_validation_rejects_invalid_map_range_and_nonfinite_values(self):
+        logits = torch.tensor([[1.0, 0.0]])
+        with self.assertRaisesRegex(RuntimeError, "top-k routing map"):
+            router_module.RouterShiftObserver.selected_old_router_log_probs(
+                logits, torch.tensor([[1, 1]], dtype=torch.bool), topk=1
+            )
+        with self.assertRaisesRegex(RuntimeError, "old expert indices"):
+            router_module.RouterShiftObserver.current_abs_diff_sum(
+                logits, torch.tensor([[2]]), torch.tensor([[0.0]])
+            )
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            router_module.RouterShiftObserver.current_abs_diff_sum(
+                logits, torch.tensor([[1]]), torch.tensor([[float("nan")]])
+            )
+
+    def test_pp4_aggregates_delta_before_exponentiation(self):
+        local = [
+            torch.tensor([0.0]),
+            torch.tensor([math.log(2.0)]),
+            torch.tensor([math.log(4.0)]),
+            torch.tensor([math.log(8.0)]),
+        ]
+
+        gamma = router_module.RouterShiftObserver.aggregate_partials(local, [1, 1, 1, 1], topk=1)
+
+        expected = torch.exp(-sum(local) / 4)
+        wrong = sum(torch.exp(-value) for value in local) / 4
         torch.testing.assert_close(gamma, expected)
         self.assertFalse(torch.allclose(gamma, wrong))
 
@@ -427,9 +488,9 @@ class TestRouterShiftContract(unittest.TestCase):
             router_module.RouterShiftObserver(
                 [TopKRouter()], _router_config(moe_router_score_function="sigmoid")
             )
-        with self.assertRaisesRegex(ValueError, "pre_softmax=True"):
+        with self.assertRaisesRegex(ValueError, "boolean moe_router_pre_softmax"):
             router_module.RouterShiftObserver(
-                [TopKRouter()], _router_config(moe_router_pre_softmax=False)
+                [TopKRouter()], _router_config(moe_router_pre_softmax=None)
             )
 
     def test_real_mcore_016_gating_api_when_available(self):

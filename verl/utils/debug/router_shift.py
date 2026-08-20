@@ -15,8 +15,9 @@ class RouterShiftObserver:
             raise ValueError("router-shift diagnostics require capacity-free top-k routing")
         if getattr(tf_config, "moe_router_score_function", None) != "softmax":
             raise ValueError("router-shift diagnostics require moe_router_score_function='softmax'")
-        if getattr(tf_config, "moe_router_pre_softmax", None) is not True:
-            raise ValueError("router-shift diagnostics require moe_router_pre_softmax=True")
+        self.pre_softmax = getattr(tf_config, "moe_router_pre_softmax", None)
+        if not isinstance(self.pre_softmax, bool):
+            raise ValueError("router-shift diagnostics require boolean moe_router_pre_softmax")
 
         self.tf_config = tf_config
         self.routers = [
@@ -70,17 +71,44 @@ class RouterShiftObserver:
         self._handles.clear()
 
     @staticmethod
-    def selected_old_router_log_probs(logits, routing_map, topk):
+    def selected_old_router_log_probs(logits, routing_map, topk, pre_softmax=True):
         flat_logits = logits.detach().float().reshape(-1, logits.shape[-1])
         flat_map = routing_map.detach().reshape(-1, routing_map.shape[-1]).bool()
+        if flat_logits.shape != flat_map.shape or not torch.all(flat_map.sum(dim=-1) == topk):
+            raise RuntimeError("router-shift diagnostics received invalid top-k routing map")
+        if not torch.isfinite(flat_logits).all():
+            raise RuntimeError("router-shift diagnostics received non-finite router logits")
         indices = torch.topk(flat_map.to(torch.uint8), topk, dim=-1).indices
-        selected = torch.log_softmax(flat_logits, dim=-1).gather(-1, indices)
+        selected_logits = flat_logits.gather(-1, indices)
+        selected = (
+            torch.log_softmax(flat_logits, dim=-1).gather(-1, indices)
+            if pre_softmax
+            else torch.log_softmax(selected_logits, dim=-1)
+        )
         return indices, selected
 
     @staticmethod
-    def current_abs_diff_sum(logits, old_indices, old_selected_log_probs):
-        current = torch.log_softmax(logits.detach().float().reshape(-1, logits.shape[-1]), dim=-1)
-        current_selected = current.gather(-1, old_indices.long())
+    def current_abs_diff_sum(logits, old_indices, old_selected_log_probs, pre_softmax=True):
+        flat_logits = logits.detach().float().reshape(-1, logits.shape[-1])
+        if (
+            old_indices.shape != old_selected_log_probs.shape
+            or old_indices.ndim != 2
+            or old_indices.shape[0] != flat_logits.shape[0]
+            or old_indices.dtype not in (torch.uint8, torch.int32, torch.int64)
+            or torch.any(old_indices < 0)
+            or torch.any(old_indices >= flat_logits.shape[-1])
+        ):
+            raise RuntimeError("router-shift diagnostics received invalid old expert indices")
+        if not torch.isfinite(flat_logits).all():
+            raise RuntimeError("router-shift diagnostics received non-finite router logits")
+        if not torch.isfinite(old_selected_log_probs).all():
+            raise RuntimeError("router-shift diagnostics received non-finite old router log probabilities")
+        current_selected = flat_logits.gather(-1, old_indices.long())
+        current_selected = (
+            torch.log_softmax(flat_logits, dim=-1).gather(-1, old_indices.long())
+            if pre_softmax
+            else torch.log_softmax(current_selected, dim=-1)
+        )
         return (current_selected - old_selected_log_probs.float()).abs().sum(dim=-1)
 
     def _observe_gating(self, index, output):
@@ -88,7 +116,10 @@ class RouterShiftObserver:
             self._pending_old_log_probs[index] = output
         elif self._capturing and self.mode == "current":
             self._current_abs_sums[index] = self.current_abs_diff_sum(
-                output, self._current_indices[index], self._current_old_log_probs[index]
+                output,
+                self._current_indices[index],
+                self._current_old_log_probs[index],
+                self.pre_softmax,
             )
 
     def _make_router_hook(self, index):
@@ -96,7 +127,9 @@ class RouterShiftObserver:
             if not self._capturing or self.mode != "old":
                 return
             logits = self._pending_old_log_probs.pop(index)
-            indices, selected = self.selected_old_router_log_probs(logits, output[1], self.topk)
+            indices, selected = self.selected_old_router_log_probs(
+                logits, output[1], self.topk, self.pre_softmax
+            )
             if logits.shape[-1] > 256:
                 raise RuntimeError("router-shift diagnostics require expert indices representable as uint8")
             self._old_indices[index] = indices.to(torch.uint8)
