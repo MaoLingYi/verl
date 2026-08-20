@@ -319,9 +319,12 @@ class TestRouterShiftContract(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(diff).all())
         torch.testing.assert_close(diff, reference)
+        gamma = torch.exp(-diff / 2)
+        self.assertGreater(gamma.item(), 0.0)
+        self.assertLess(gamma.item(), 1.0)
         self.assertEqual(set(old_indices[0].tolist()), {0, 1})
 
-    def test_qwen3_post_softmax_compares_probabilities_on_old_topk(self):
+    def test_qwen3_post_softmax_uses_full_router_distribution(self):
         old_logits = torch.tensor([[5.0, 4.0, 0.0, -1.0]])
         old_map = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
         old_indices, old_selected = router_module.RouterShiftObserver.selected_old_router_log_probs(
@@ -333,12 +336,33 @@ class TestRouterShiftContract(unittest.TestCase):
             current_logits, old_indices, old_selected, pre_softmax=False
         )
         reference = (
-            torch.log_softmax(current_logits.float().gather(-1, old_indices), dim=-1) - old_selected
+            torch.log_softmax(current_logits.float(), dim=-1).gather(-1, old_indices)
+            - torch.log_softmax(old_logits.float(), dim=-1).gather(-1, old_indices)
         ).abs().sum(-1)
+        gamma = torch.exp(-diff / 2)
 
         self.assertTrue(torch.isfinite(diff).all())
         torch.testing.assert_close(diff, reference)
-        self.assertNotEqual(diff.item(), 0.0)
+        self.assertGreater(gamma.item(), 0.0)
+        self.assertLess(gamma.item(), 1.0)
+
+    def test_qwen3_post_softmax_identical_routers_have_gamma_one(self):
+        old_logits = torch.tensor([[5.0, 4.0, 0.0, -1.0]])
+        routing_map = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
+        old_indices, old_selected = router_module.RouterShiftObserver.selected_old_router_log_probs(
+            old_logits, routing_map, topk=2, pre_softmax=False
+        )
+        current_logits = old_logits.to(torch.bfloat16)
+
+        diff = router_module.RouterShiftObserver.current_abs_diff_sum(
+            current_logits, old_indices, old_selected, pre_softmax=False
+        )
+        reference = (
+            torch.log_softmax(current_logits.float(), dim=-1).gather(-1, old_indices) - old_selected
+        ).abs().sum(-1)
+
+        torch.testing.assert_close(diff, reference)
+        torch.testing.assert_close(torch.exp(-diff / 2), torch.ones_like(diff))
 
     def test_qwen3_post_softmax_observer_is_diagnostic_only(self):
         baseline = TopKRouter()
@@ -446,7 +470,9 @@ class TestRouterShiftContract(unittest.TestCase):
 
         self.assertEqual(old_indices.dtype, torch.uint8)
         self.assertEqual(cached_old_log_probs.dtype, torch.float32)
-        zero_diff = observer.current_abs_diff_sum(old_logits, old_indices, cached_old_log_probs)
+        zero_diff = observer.current_abs_diff_sum(
+            old_logits, old_indices, cached_old_log_probs
+        )
         torch.testing.assert_close(zero_diff, torch.zeros_like(zero_diff), atol=0, rtol=0)
         torch.testing.assert_close(torch.exp(-zero_diff / router.topk), torch.ones_like(zero_diff))
 

@@ -79,12 +79,7 @@ class RouterShiftObserver:
         if not torch.isfinite(flat_logits).all():
             raise RuntimeError("router-shift diagnostics received non-finite router logits")
         indices = torch.topk(flat_map.to(torch.uint8), topk, dim=-1).indices
-        selected_logits = flat_logits.gather(-1, indices)
-        selected = (
-            torch.log_softmax(flat_logits, dim=-1).gather(-1, indices)
-            if pre_softmax
-            else torch.log_softmax(selected_logits, dim=-1)
-        )
+        selected = torch.log_softmax(flat_logits, dim=-1).gather(-1, indices)
         return indices, selected
 
     @staticmethod
@@ -103,12 +98,7 @@ class RouterShiftObserver:
             raise RuntimeError("router-shift diagnostics received non-finite router logits")
         if not torch.isfinite(old_selected_log_probs).all():
             raise RuntimeError("router-shift diagnostics received non-finite old router log probabilities")
-        current_selected = flat_logits.gather(-1, old_indices.long())
-        current_selected = (
-            torch.log_softmax(flat_logits, dim=-1).gather(-1, old_indices.long())
-            if pre_softmax
-            else torch.log_softmax(current_selected, dim=-1)
-        )
+        current_selected = torch.log_softmax(flat_logits, dim=-1).gather(-1, old_indices.long())
         return (current_selected - old_selected_log_probs.float()).abs().sum(dim=-1)
 
     def _observe_gating(self, index, output):
