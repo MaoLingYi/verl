@@ -73,12 +73,23 @@ class RouterShiftObserver:
     @staticmethod
     def selected_old_router_log_probs(logits, routing_map, topk, pre_softmax=True):
         flat_logits = logits.detach().float().reshape(-1, logits.shape[-1])
-        flat_map = routing_map.detach().reshape(-1, routing_map.shape[-1]).bool()
-        if flat_logits.shape != flat_map.shape or not torch.all(flat_map.sum(dim=-1) == topk):
-            raise RuntimeError("router-shift diagnostics received invalid top-k routing map")
+        flat_routing = routing_map.detach().reshape(-1, routing_map.shape[-1])
+        if flat_routing.dtype == torch.bool:
+            if flat_logits.shape != flat_routing.shape or not torch.all(flat_routing.sum(dim=-1) == topk):
+                raise RuntimeError("router-shift diagnostics received invalid top-k routing map")
+            indices = torch.topk(flat_routing.to(torch.uint8), topk, dim=-1).indices
+        elif flat_routing.dtype in (torch.uint8, torch.int32, torch.int64):
+            if (
+                flat_routing.shape != (flat_logits.shape[0], topk)
+                or torch.any(flat_routing < 0)
+                or torch.any(flat_routing >= flat_logits.shape[-1])
+            ):
+                raise RuntimeError("router-shift diagnostics received invalid top-k expert indices")
+            indices = flat_routing.long()
+        else:
+            raise RuntimeError("router-shift diagnostics received unsupported routing data")
         if not torch.isfinite(flat_logits).all():
             raise RuntimeError("router-shift diagnostics received non-finite router logits")
-        indices = torch.topk(flat_map.to(torch.uint8), topk, dim=-1).indices
         selected = torch.log_softmax(flat_logits, dim=-1).gather(-1, indices)
         return indices, selected
 
@@ -113,12 +124,20 @@ class RouterShiftObserver:
             )
 
     def _make_router_hook(self, index):
-        def hook(_module, _inputs, output):
+        def hook(module, _inputs, output):
             if not self._capturing or self.mode != "old":
                 return
             logits = self._pending_old_log_probs.pop(index)
+            routing_data = output[1]
+            replay = getattr(module, "router_replay", None)
+            if (
+                replay is not None
+                and getattr(getattr(replay, "router_replay_action", None), "value", None) == "replay_forward"
+                and replay.target_topk_idx is not None
+            ):
+                routing_data = replay.target_topk_idx
             indices, selected = self.selected_old_router_log_probs(
-                logits, output[1], self.topk, self.pre_softmax
+                logits, routing_data, self.topk, self.pre_softmax
             )
             if logits.shape[-1] > 256:
                 raise RuntimeError("router-shift diagnostics require expert indices representable as uint8")

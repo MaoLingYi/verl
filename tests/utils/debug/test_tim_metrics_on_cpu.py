@@ -32,7 +32,11 @@ class TopKRouter(torch.nn.Module):
 
     def forward(self, inputs):
         logits = self.gating(inputs)
-        indices = torch.topk(logits, self.topk, dim=-1).indices
+        replay = getattr(self, "router_replay", None)
+        if replay is not None and replay.router_replay_action.value == "replay_forward":
+            indices = replay.target_topk_idx
+        else:
+            indices = torch.topk(logits, self.topk, dim=-1).indices
         routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(-1, indices, True)
         return torch.softmax(logits, dim=-1), routing_map
 
@@ -281,6 +285,43 @@ class TestTimMetrics(unittest.TestCase):
 
 
 class TestRouterShiftContract(unittest.TestCase):
+    def test_baseline_ep2_uses_global_expert_mask(self):
+        logits = torch.zeros((1, 128))
+        global_indices = torch.tensor([[0, 63, 64, 127]])
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(-1, global_indices, True)
+
+        indices, _ = router_module.RouterShiftObserver.selected_old_router_log_probs(
+            logits, routing_map, topk=4
+        )
+
+        self.assertEqual(set(indices[0].tolist()), set(global_indices[0].tolist()))
+
+    def test_r3_ep2_hook_uses_exact_global_replay_indices(self):
+        router = TopKRouter()
+        router.topk = 2
+        router.router_replay = types.SimpleNamespace(
+            router_replay_action=types.SimpleNamespace(value="replay_forward"),
+            target_topk_idx=torch.tensor([[3, 3]]),
+        )
+        observer = router_module.RouterShiftObserver([router], _router_config())
+        observer.start_old_batch()
+        observer.begin_old_microbatch()
+
+        _, collapsed_map = router(torch.tensor([[1.0, 2.0, 3.0]]))
+
+        self.assertEqual(collapsed_map.sum().item(), 1)
+        self.assertEqual(observer._old_indices[0].tolist(), [[3, 3]])
+
+    def test_ep2_replay_indices_are_global_not_local(self):
+        logits = torch.zeros((1, 128))
+        global_indices = torch.tensor([[0, 64, 127]], dtype=torch.int64)
+
+        indices, _ = router_module.RouterShiftObserver.selected_old_router_log_probs(
+            logits, global_indices, topk=3
+        )
+
+        self.assertEqual(indices.tolist(), [[0, 64, 127]])
+
     def test_zero_delta_and_masked_padding(self):
         values = torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16)
         metrics = metrics_module.calculate_router_shift_metrics(values, values, torch.tensor([[1, 0]]))
