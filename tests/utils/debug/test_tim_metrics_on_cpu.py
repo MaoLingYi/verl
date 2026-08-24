@@ -322,6 +322,64 @@ class TestRouterShiftContract(unittest.TestCase):
 
         self.assertEqual(indices.tolist(), [[0, 64, 127]])
 
+    def test_streamed_scalar_reduction_matches_batch_formula_and_clears_cache(self):
+        observer = object.__new__(router_module.RouterShiftObserver)
+        observer.mode = "current"
+        observer._capturing = True
+        observer.routers = [TopKRouter()]
+        observer.topk = 2
+        observer.old_cache = {0: (torch.zeros(1), torch.zeros(1))}
+        observer._current_microbatches = [
+            (torch.tensor([[0.0, 2.0]]), torch.tensor([[True, False]])),
+            (torch.tensor([[1.0, 3.0]]), torch.tensor([[True, True]])),
+        ]
+        all_local = torch.cat([item[0] for item in observer._current_microbatches])
+        all_mask = torch.cat([item[1] for item in observer._current_microbatches])
+        gamma = torch.exp(-all_local / (len(observer.routers) * observer.topk))[all_mask]
+
+        parallel_state = types.ModuleType("megatron.core.parallel_state")
+        parallel_state.get_pipeline_model_parallel_world_size = lambda: 1
+        parallel_state.get_data_parallel_world_size = lambda: 1
+        core = types.ModuleType("megatron.core")
+        core.parallel_state = parallel_state
+        with patch.dict(
+            sys.modules,
+            {
+                "megatron": types.ModuleType("megatron"),
+                "megatron.core": core,
+                "megatron.core.parallel_state": parallel_state,
+            },
+        ):
+            totals = observer.finish_current_batch()
+
+        self.assertAlmostEqual(totals["gamma_sum"], gamma.sum().item(), places=6)
+        self.assertEqual(totals["clip_sum"], (gamma < 0.8).float().sum().item())
+        self.assertEqual(totals["token_count"], gamma.numel())
+        self.assertEqual(observer._current_microbatches, [])
+        self.assertEqual(observer.old_cache, {})
+
+    def test_finished_microbatch_releases_gpu_intermediates(self):
+        observer = object.__new__(router_module.RouterShiftObserver)
+        observer._current_microbatches = []
+        observer._current_indices = torch.ones(1)
+        observer._current_old_log_probs = torch.ones(1)
+        observer._current_abs_sums = [torch.ones(1)]
+        observer._capturing = True
+        observer._unpack_sequence_parallel = lambda *_args: torch.arange(3.0).reshape(1, 3, 1, 1)
+
+        observer.finish_current_microbatch(
+            torch.zeros((1, 3)),
+            torch.ones((1, 3), dtype=torch.bool),
+            torch.tensor([[True, True]]),
+            response_length=2,
+        )
+
+        self.assertEqual(observer._current_microbatches[0][0].device.type, "cpu")
+        self.assertEqual(observer._current_microbatches[0][1].device.type, "cpu")
+        self.assertIsNone(observer._current_indices)
+        self.assertIsNone(observer._current_old_log_probs)
+        self.assertIsNone(observer._current_abs_sums)
+
     def test_zero_delta_and_masked_padding(self):
         values = torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16)
         metrics = metrics_module.calculate_router_shift_metrics(values, values, torch.tensor([[1, 0]]))
