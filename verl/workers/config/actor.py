@@ -29,6 +29,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "RouterShiftDiagnosticsConfig",
+    "RouterShiftWeightingConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -44,6 +45,18 @@ class RouterShiftDiagnosticsConfig(BaseConfig):
     """Observer-only old/current training-router diagnostics."""
 
     enabled: bool = False
+
+
+@dataclass
+class RouterShiftWeightingConfig(BaseConfig):
+    """Detached RSPO-style router-shift importance-ratio weighting."""
+
+    enabled: bool = False
+    gamma_min: float = 0.8
+
+    def __post_init__(self):
+        if not 0.0 < self.gamma_min <= 1.0:
+            raise ValueError("router-shift gamma_min must be in (0, 1]")
 
 
 @dataclass
@@ -184,6 +197,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_shift_diagnostics: RouterShiftDiagnosticsConfig = field(default_factory=RouterShiftDiagnosticsConfig)
+    router_shift_weighting: RouterShiftWeightingConfig = field(default_factory=RouterShiftWeightingConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
 
     # Store global batch info for loss aggregation:

@@ -185,7 +185,10 @@ class MegatronPPOActor(BasePPOActor):
         if self.enable_routing_replay:
             self.mini_layer_topk_idx_list = []
         self.router_shift_observer = None
-        if self.config.router_shift_diagnostics.enabled:
+        if (
+            self.config.router_shift_diagnostics.enabled
+            or self.config.router_shift_weighting.enabled
+        ):
             self.router_shift_observer = RouterShiftObserver(
                 [unwrap_model(model) for model in self.actor_module], self.tf_config
             )
@@ -527,10 +530,15 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
+                if self.config.router_shift_weighting.enabled and loss_mode != "vanilla":
+                    raise RuntimeError("router-shift weighting is currently connected only to vanilla GRPO loss")
 
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+                policy_loss_kwargs = {}
+                if self.config.router_shift_weighting.enabled:
+                    policy_loss_kwargs["router_shift_gamma"] = data["router_shift_gamma"]
                 pg_loss, pg_metrics = policy_loss_fn(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
@@ -539,6 +547,7 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    **policy_loss_kwargs,
                 )
                 stats.update(pg_metrics)
 
@@ -820,6 +829,8 @@ class MegatronPPOActor(BasePPOActor):
         """
         metrics = {}
         router_shift_totals = {"gamma_sum": 0.0, "clip_sum": 0.0, "token_count": 0}
+        rs_weight_sum = 0.0
+        rs_token_count = 0
         for data in dataloader:
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -837,7 +848,40 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
-            if self.router_shift_observer is not None:
+            if self.config.router_shift_weighting.enabled:
+                self.router_shift_observer.start_current_batch()
+                with torch.no_grad():
+                    router_shift_prepass = self.forward_backward_batch(
+                        data,
+                        forward_only=True,
+                        calculate_entropy=False,
+                        use_dynamic_bsz=self.config.use_dynamic_bsz,
+                        micro_batch_size=micro_batch_size,
+                        max_token_len=max_token_len,
+                        mini_batch_size=self.config.ppo_mini_batch_size,
+                    )
+                partial = router_shift_prepass["router_shift"]
+                try:
+                    data.batch["router_shift_gamma"] = torch.stack(
+                        [
+                            partial["gamma_by_sample"][sample_id]
+                            for sample_id in data.batch["router_shift_sample_ids"].tolist()
+                        ]
+                    )
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"missing current router-shift gamma for sample id {exc.args[0]}"
+                    ) from exc
+                response_mask = data.batch["response_mask"].bool()
+                valid_weight = data.batch["router_shift_gamma"].clamp_min(
+                    self.config.router_shift_weighting.gamma_min
+                )[response_mask]
+                rs_weight_sum += valid_weight.sum().item()
+                rs_token_count += valid_weight.numel()
+                if self.config.router_shift_diagnostics.enabled:
+                    for key in router_shift_totals:
+                        router_shift_totals[key] += partial[key]
+            elif self.router_shift_observer is not None:
                 self.router_shift_observer.start_current_batch()
             metric_micro_batch = self.forward_backward_batch(
                 data,
@@ -847,7 +891,7 @@ class MegatronPPOActor(BasePPOActor):
                 max_token_len=max_token_len,
                 mini_batch_size=self.config.ppo_mini_batch_size,
             )
-            if self.router_shift_observer is not None:
+            if self.router_shift_observer is not None and not self.config.router_shift_weighting.enabled:
                 partial = metric_micro_batch.pop("router_shift")
                 for key in router_shift_totals:
                     router_shift_totals[key] += partial[key]
@@ -879,8 +923,14 @@ class MegatronPPOActor(BasePPOActor):
 
         self.actor_optimizer.zero_grad()
         if self.router_shift_observer is not None:
+            self.router_shift_observer.clear_old_cache()
+        if self.config.router_shift_diagnostics.enabled:
             count = router_shift_totals["token_count"]
             metrics["diag/router_shift/ratio_mean"] = [router_shift_totals["gamma_sum"] / count]
             metrics["diag/router_shift/clipfrac_gamma_0_8"] = [router_shift_totals["clip_sum"] / count]
+        if self.config.router_shift_weighting.enabled:
+            if rs_token_count == 0:
+                raise RuntimeError("router-shift weighting requires at least one valid response token")
+            metrics["actor/rs/weight_mean"] = [rs_weight_sum / rs_token_count]
         get_torch_device().empty_cache()
         return metrics

@@ -322,7 +322,7 @@ class TestRouterShiftContract(unittest.TestCase):
 
         self.assertEqual(indices.tolist(), [[0, 64, 127]])
 
-    def test_streamed_scalar_reduction_matches_batch_formula_and_clears_cache(self):
+    def test_streamed_reduction_exposes_per_sample_gamma_and_retains_old_cache(self):
         observer = object.__new__(router_module.RouterShiftObserver)
         observer.mode = "current"
         observer._capturing = True
@@ -330,8 +330,8 @@ class TestRouterShiftContract(unittest.TestCase):
         observer.topk = 2
         observer.old_cache = {0: (torch.zeros(1), torch.zeros(1))}
         observer._current_microbatches = [
-            (torch.tensor([[0.0, 2.0]]), torch.tensor([[True, False]])),
-            (torch.tensor([[1.0, 3.0]]), torch.tensor([[True, True]])),
+            (torch.tensor([[0.0, 2.0]]), torch.tensor([[True, False]]), torch.tensor([3])),
+            (torch.tensor([[1.0, 3.0]]), torch.tensor([[True, True]]), torch.tensor([7])),
         ]
         all_local = torch.cat([item[0] for item in observer._current_microbatches])
         all_mask = torch.cat([item[1] for item in observer._current_microbatches])
@@ -355,7 +355,11 @@ class TestRouterShiftContract(unittest.TestCase):
         self.assertAlmostEqual(totals["gamma_sum"], gamma.sum().item(), places=6)
         self.assertEqual(totals["clip_sum"], (gamma < 0.8).float().sum().item())
         self.assertEqual(totals["token_count"], gamma.numel())
+        torch.testing.assert_close(totals["gamma_by_sample"][3], torch.exp(-torch.tensor([0.0, 2.0]) / 2))
+        torch.testing.assert_close(totals["gamma_by_sample"][7], torch.exp(-torch.tensor([1.0, 3.0]) / 2))
         self.assertEqual(observer._current_microbatches, [])
+        self.assertNotEqual(observer.old_cache, {})
+        observer.clear_old_cache()
         self.assertEqual(observer.old_cache, {})
 
     def test_finished_microbatch_releases_gpu_intermediates(self):
@@ -364,6 +368,7 @@ class TestRouterShiftContract(unittest.TestCase):
         observer._current_indices = torch.ones(1)
         observer._current_old_log_probs = torch.ones(1)
         observer._current_abs_sums = [torch.ones(1)]
+        observer._current_sample_ids = torch.tensor([5])
         observer._capturing = True
         observer._unpack_sequence_parallel = lambda *_args: torch.arange(3.0).reshape(1, 3, 1, 1)
 
@@ -376,9 +381,11 @@ class TestRouterShiftContract(unittest.TestCase):
 
         self.assertEqual(observer._current_microbatches[0][0].device.type, "cpu")
         self.assertEqual(observer._current_microbatches[0][1].device.type, "cpu")
+        self.assertEqual(observer._current_microbatches[0][2].tolist(), [5])
         self.assertIsNone(observer._current_indices)
         self.assertIsNone(observer._current_old_log_probs)
         self.assertIsNone(observer._current_abs_sums)
+        self.assertIsNone(observer._current_sample_ids)
 
     def test_zero_delta_and_masked_padding(self):
         values = torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16)

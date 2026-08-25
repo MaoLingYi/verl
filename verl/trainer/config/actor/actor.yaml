@@ -264,3 +264,9 @@ router_shift_diagnostics:
   _target_: verl.workers.config.RouterShiftDiagnosticsConfig
   enabled: false
 
+# Detached RSPO-style weighting of the policy importance ratio; independent of diagnostics and replay.
+router_shift_weighting:
+  _target_: verl.workers.config.RouterShiftWeightingConfig
+  enabled: false
+  gamma_min: 0.8
+

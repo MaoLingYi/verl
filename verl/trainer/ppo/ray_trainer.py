@@ -1416,7 +1416,11 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            if self.config.actor_rollout_ref.actor.router_shift_diagnostics.enabled:
+                            actor_config = self.config.actor_rollout_ref.actor
+                            if (
+                                actor_config.router_shift_diagnostics.enabled
+                                or actor_config.router_shift_weighting.enabled
+                            ):
                                 batch.batch["router_shift_sample_ids"] = torch.arange(
                                     len(batch), dtype=torch.int64, device=batch.batch.device
                                 )

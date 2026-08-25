@@ -41,6 +41,7 @@ class RouterShiftObserver:
         self._current_indices = None
         self._current_old_log_probs = None
         self._current_abs_sums = None
+        self._current_sample_ids = None
         self._current_microbatches = []
         self._handles = []
         for index, router in enumerate(self.routers):
@@ -195,16 +196,20 @@ class RouterShiftObserver:
             old_log_probs, input_ids, attention_mask, response_length
         ).permute(1, 0, 2)
         self._current_abs_sums = [None] * len(self.routers)
+        self._current_sample_ids = sample_ids.detach().cpu()
 
     def finish_current_microbatch(self, input_ids, attention_mask, response_mask, response_length):
         local = self._unpack_sequence_parallel(
             [value.unsqueeze(-1) for value in self._current_abs_sums], input_ids, attention_mask
         )
         local = local[:, -response_length - 1 : -1, :, 0].sum(dim=-1)
-        self._current_microbatches.append((local.cpu(), response_mask.bool().cpu()))
+        self._current_microbatches.append(
+            (local.cpu(), response_mask.bool().cpu(), self._current_sample_ids)
+        )
         self._current_indices = None
         self._current_old_log_probs = None
         self._current_abs_sums = None
+        self._current_sample_ids = None
         self._capturing = False
 
     def finish_current_batch(self):
@@ -220,18 +225,29 @@ class RouterShiftObserver:
             torch.distributed.all_reduce(layer_count, group=group)
 
         totals = torch.zeros(3, dtype=torch.float32, device=device)
-        for local_abs_sum, response_mask in self._current_microbatches:
+        gamma_by_sample = {}
+        for local_abs_sum, response_mask, sample_ids in self._current_microbatches:
             local_abs_sum = local_abs_sum.to(device)
             response_mask = response_mask.to(device)
             if mpu.get_pipeline_model_parallel_world_size() > 1:
                 torch.distributed.all_reduce(local_abs_sum, group=group)
-            gamma = torch.exp(-local_abs_sum.float() / (layer_count * self.topk))[response_mask]
+            gamma = torch.exp(-local_abs_sum.float() / (layer_count * self.topk))
+            if gamma.shape != response_mask.shape:
+                raise RuntimeError("router-shift gamma and response mask shapes differ")
+            for row, sample_id in enumerate(sample_ids.tolist()):
+                if sample_id in gamma_by_sample:
+                    raise RuntimeError(f"duplicate current router-shift sample id: {sample_id}")
+                gamma_by_sample[sample_id] = gamma[row].cpu()
+            valid_gamma = gamma[response_mask]
             totals += torch.stack(
-                [gamma.sum(), (gamma < 0.8).float().sum(), gamma.new_tensor(float(gamma.numel()))]
+                [
+                    valid_gamma.sum(),
+                    (valid_gamma < 0.8).float().sum(),
+                    valid_gamma.new_tensor(float(valid_gamma.numel())),
+                ]
             )
 
         self._current_microbatches.clear()
-        self.old_cache.clear()
         if totals[2].item() == 0:
             raise RuntimeError("router-shift diagnostics require at least one valid response token")
         if mpu.get_data_parallel_world_size() > 1:
@@ -240,7 +256,11 @@ class RouterShiftObserver:
             "gamma_sum": totals[0].item(),
             "clip_sum": totals[1].item(),
             "token_count": int(totals[2].item()),
+            "gamma_by_sample": gamma_by_sample,
         }
+
+    def clear_old_cache(self):
+        self.old_cache.clear()
 
     @staticmethod
     def aggregate_partials(local_abs_diff_sums, local_layer_counts, topk):

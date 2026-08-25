@@ -21,6 +21,7 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    RouterShiftWeightingConfig,
 )
 
 
@@ -62,6 +63,13 @@ class TestActorConfig(unittest.TestCase):
 
         self.assertEqual(megatron_config.ppo_mini_batch_size, fsdp_config.ppo_mini_batch_size)
         self.assertEqual(megatron_config.clip_ratio, fsdp_config.clip_ratio)
+
+    def test_router_shift_weighting_defaults_and_validation(self):
+        config = RouterShiftWeightingConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.gamma_min, 0.8)
+        with self.assertRaises(ValueError):
+            RouterShiftWeightingConfig(gamma_min=0.0)
 
     def test_actor_config_from_yaml(self):
         """Test creating ActorConfig from YAML file."""

@@ -30,6 +30,7 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo.router_shift_weighting import adjust_log_ratio_with_router_shift
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
@@ -1282,6 +1283,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    router_shift_gamma: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1327,8 +1329,14 @@ def compute_policy_loss_vanilla(
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    if router_shift_gamma is not None:
+        negative_approx_kl, _ = adjust_log_ratio_with_router_shift(
+            negative_approx_kl,
+            router_shift_gamma,
+            config.router_shift_weighting.gamma_min,
+        )
+    ratio = torch.exp(negative_approx_kl)
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
