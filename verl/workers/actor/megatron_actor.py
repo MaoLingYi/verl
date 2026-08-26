@@ -48,7 +48,7 @@ from verl.utils.megatron.router_replay_utils import (
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
 )
-from verl.utils.debug.router_shift import RouterShiftObserver
+from verl.utils.debug.router_shift import RouterShiftObserver, clear_router_shift_on_error
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.profiler import GPUMemoryLogger
@@ -208,6 +208,7 @@ class MegatronPPOActor(BasePPOActor):
         self.config = config
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
+    @clear_router_shift_on_error
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
@@ -411,6 +412,7 @@ class MegatronPPOActor(BasePPOActor):
             dataloader_kwargs={"shuffle": self.config.shuffle},
         )
 
+    @clear_router_shift_on_error
     def forward_backward_batch(
         self,
         data: DataProto,
@@ -616,6 +618,11 @@ class MegatronPPOActor(BasePPOActor):
                 from verl.models.mcore.model_forward_1f1b_overlap import gptmodel_forward_1f1b_overlap
 
             batch = next(batch_iter)
+            # Capture CPU row metadata AFTER split/reorder, BEFORE microbatch H2D.
+            # Keep the tensor in the batch contract; do not read its CUDA copy in observer hooks.
+            router_shift_sample_ids = (
+                batch["router_shift_sample_ids"] if self.router_shift_observer is not None else None
+            )
             batch = batch.to(get_device_id())
             batch = batch.contiguous()
 
@@ -644,7 +651,7 @@ class MegatronPPOActor(BasePPOActor):
                     self.router_shift_observer.begin_current_microbatch(
                         input_ids,
                         attention_mask,
-                        batch["router_shift_sample_ids"],
+                        router_shift_sample_ids,
                         response_length,
                     )
             label = position_ids.clone()
@@ -722,7 +729,7 @@ class MegatronPPOActor(BasePPOActor):
                     self.router_shift_observer.finish_old_microbatch(
                         input_ids,
                         attention_mask,
-                        batch["router_shift_sample_ids"],
+                        router_shift_sample_ids,
                         response_length,
                     )
                 elif self.router_shift_observer.mode == "current":
@@ -803,7 +810,9 @@ class MegatronPPOActor(BasePPOActor):
                 losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
             self.mini_layer_topk_idx_list = []
         if self.router_shift_observer is not None and self.router_shift_observer.mode == "current":
-            losses_reduced["router_shift"] = self.router_shift_observer.finish_current_batch()
+            losses_reduced["router_shift"] = self.router_shift_observer.finish_current_batch(
+                need_gamma_by_sample=self.config.router_shift_weighting.enabled
+            )
 
         # Collect and pass MTP metrics to losses_reduced
         if not forward_only and self.mtp_config and self.mtp_config.enable_train:
@@ -813,6 +822,7 @@ class MegatronPPOActor(BasePPOActor):
         return losses_reduced
 
     @GPUMemoryLogger(role="megatron actor", logger=logger)
+    @clear_router_shift_on_error
     def update_policy(self, dataloader: Iterable[DataProto], enable_mtp: bool = False) -> dict:
         """Update the policy with an iterator of DataProto
 

@@ -1,6 +1,23 @@
+from __future__ import annotations
+
+from functools import wraps
 from types import MethodType
 
 import torch
+
+
+def clear_router_shift_on_error(method):
+    """Release diagnostic state if an actor forward/update is aborted; leave training state alone."""
+    @wraps(method)
+    def wrapped(actor, *args, **kwargs):
+        try:
+            return method(actor, *args, **kwargs)
+        except BaseException:
+            if actor.router_shift_observer is not None:
+                actor.router_shift_observer.clear_old_cache()
+            raise
+
+    return wrapped
 
 
 class RouterShiftObserver:
@@ -31,6 +48,9 @@ class RouterShiftObserver:
         self.topk = self.routers[0].topk
         if any(router.topk != self.topk for router in self.routers):
             raise ValueError("router-shift diagnostics require a uniform router top-k")
+        self.num_experts = self.routers[0].weight.shape[0]
+        if any(router.weight.shape[0] != self.num_experts for router in self.routers):
+            raise ValueError("router-shift diagnostics require a uniform expert count")
 
         self.mode = None
         self._capturing = False
@@ -43,6 +63,8 @@ class RouterShiftObserver:
         self._current_abs_sums = None
         self._current_sample_ids = None
         self._current_microbatches = []
+        self._current_invalid_flag = None
+        self._current_seen_sample_ids = set()
         self._handles = []
         for index, router in enumerate(self.routers):
             self._wrap_gating(router, index)
@@ -62,6 +84,7 @@ class RouterShiftObserver:
         router.gating = MethodType(wrapped_gating, router)
 
     def close(self):
+        self.clear_old_cache()
         for router in self.routers:
             original_gating = getattr(router, "_verl_router_shift_original_gating", None)
             if original_gating is not None:
@@ -72,6 +95,7 @@ class RouterShiftObserver:
         self._handles.clear()
 
     @staticmethod
+    @torch.no_grad()
     def selected_old_router_log_probs(logits, routing_map, topk, pre_softmax=True):
         flat_logits = logits.detach().float().reshape(-1, logits.shape[-1])
         flat_routing = routing_map.detach().reshape(-1, routing_map.shape[-1])
@@ -80,13 +104,13 @@ class RouterShiftObserver:
                 raise RuntimeError("router-shift diagnostics received invalid top-k routing map")
             indices = torch.topk(flat_routing.to(torch.uint8), topk, dim=-1).indices
         elif flat_routing.dtype in (torch.uint8, torch.int32, torch.int64):
+            indices = flat_routing.long()
             if (
                 flat_routing.shape != (flat_logits.shape[0], topk)
-                or torch.any(flat_routing < 0)
-                or torch.any(flat_routing >= flat_logits.shape[-1])
+                or torch.any(indices < 0)
+                or torch.any(indices >= flat_logits.shape[-1])
             ):
                 raise RuntimeError("router-shift diagnostics received invalid top-k expert indices")
-            indices = flat_routing.long()
         else:
             raise RuntimeError("router-shift diagnostics received unsupported routing data")
         if not torch.isfinite(flat_logits).all():
@@ -95,33 +119,40 @@ class RouterShiftObserver:
         return indices, selected
 
     @staticmethod
-    def current_abs_diff_sum(logits, old_indices, old_selected_log_probs, pre_softmax=True):
+    @torch.no_grad()
+    def current_abs_diff_sum(
+        logits, old_indices, old_selected_log_probs, pre_softmax=True, *, invalid_flag: torch.Tensor
+    ):
+        """Read trusted old-cache data; defer dynamic CUDA validation until the batch boundary."""
         flat_logits = logits.detach().float().reshape(-1, logits.shape[-1])
         if (
             old_indices.shape != old_selected_log_probs.shape
             or old_indices.ndim != 2
             or old_indices.shape[0] != flat_logits.shape[0]
             or old_indices.dtype not in (torch.uint8, torch.int32, torch.int64)
-            or torch.any(old_indices < 0)
-            or torch.any(old_indices >= flat_logits.shape[-1])
         ):
             raise RuntimeError("router-shift diagnostics received invalid old expert indices")
-        if not torch.isfinite(flat_logits).all():
-            raise RuntimeError("router-shift diagnostics received non-finite router logits")
-        if not torch.isfinite(old_selected_log_probs).all():
-            raise RuntimeError("router-shift diagnostics received non-finite old router log probabilities")
+        # No CUDA bool is consumed by Python in the current-layer hot path.
+        # Old index bounds / finite log-probs were checked before cache insertion.
+        invalid_flag.logical_or_(~torch.isfinite(flat_logits).all())
         current_selected = torch.log_softmax(flat_logits, dim=-1).gather(-1, old_indices.long())
-        return (current_selected - old_selected_log_probs.float()).abs().sum(dim=-1)
+        delta = (current_selected - old_selected_log_probs.float()).abs().sum(dim=-1)
+        invalid_flag.logical_or_(~torch.isfinite(delta).all())
+        return delta
 
+    @torch.no_grad()
     def _observe_gating(self, index, output):
         if self._capturing and self.mode == "old":
             self._pending_old_log_probs[index] = output
         elif self._capturing and self.mode == "current":
+            if output.shape[-1] != self.num_experts or self._current_indices.shape[-1] != self.topk:
+                raise RuntimeError("router-shift current router dimensions do not match the old cache")
             self._current_abs_sums[index] = self.current_abs_diff_sum(
                 output,
                 self._current_indices[index],
                 self._current_old_log_probs[index],
                 self.pre_softmax,
+                invalid_flag=self._current_invalid_flag,
             )
 
     def _make_router_hook(self, index):
@@ -148,7 +179,7 @@ class RouterShiftObserver:
         return hook
 
     def start_old_batch(self):
-        self.old_cache.clear()
+        self.clear_old_cache()
         self.mode = "old"
         self._capturing = False
 
@@ -158,12 +189,33 @@ class RouterShiftObserver:
         self._old_indices = [None] * len(self.routers)
         self._old_log_probs = [None] * len(self.routers)
 
+    @staticmethod
+    def _sample_ids(sample_ids: torch.Tensor, batch_size: int) -> list[int]:
+        if sample_ids.device.type != "cpu" or sample_ids.dtype != torch.int64 or sample_ids.shape != (batch_size,):
+            raise RuntimeError("router-shift sample ids must be CPU int64 row metadata")
+        return sample_ids.tolist()
+
+    @torch.no_grad()
     def finish_old_microbatch(self, input_ids, attention_mask, sample_ids, response_length):
         indices = self._unpack_sequence_parallel(self._old_indices, input_ids, attention_mask)
         log_probs = self._unpack_sequence_parallel(self._old_log_probs, input_ids, attention_mask)
         indices = indices[:, -response_length - 1 : -1].cpu()
         log_probs = log_probs[:, -response_length - 1 : -1].cpu()
-        for row, sample_id in enumerate(sample_ids.tolist()):
+        # Cache owns detached CPU records, treated as immutable by the current pass.
+        # Validate once here (after TP layout restoration), not 12 times per current microbatch.
+        expected_shape = (input_ids.shape[0], response_length, len(self.routers), self.topk)
+        if (
+            indices.shape != expected_shape
+            or log_probs.shape != expected_shape
+            or indices.dtype != torch.uint8
+            or log_probs.dtype != torch.float32
+        ):
+            raise RuntimeError("router-shift old cache has invalid shape or dtype")
+        if torch.any(indices.int() >= self.num_experts):
+            raise RuntimeError("router-shift old cache has invalid expert indices")
+        if not torch.isfinite(log_probs).all():
+            raise RuntimeError("router-shift old cache has non-finite log probabilities")
+        for row, sample_id in enumerate(self._sample_ids(sample_ids, input_ids.shape[0])):
             if sample_id in self.old_cache:
                 raise RuntimeError(f"duplicate router-shift sample id: {sample_id}")
             self.old_cache[sample_id] = (indices[row], log_probs[row])
@@ -177,14 +229,19 @@ class RouterShiftObserver:
         self._capturing = False
 
     def start_current_batch(self):
+        self._reset_current_batch()
         self.mode = "current"
-        self._capturing = False
-        self._current_microbatches = []
+        self._current_invalid_flag = torch.zeros((), dtype=torch.bool, device=self.routers[0].weight.device)
 
+    @torch.no_grad()
     def begin_current_microbatch(self, input_ids, attention_mask, sample_ids, response_length):
+        ids = self._sample_ids(sample_ids, input_ids.shape[0])
+        if len(set(ids)) != len(ids) or self._current_seen_sample_ids.intersection(ids):
+            raise RuntimeError("duplicate current router-shift sample id")
+        self._current_seen_sample_ids.update(ids)
         self._capturing = True
         try:
-            records = [self.old_cache[sample_id] for sample_id in sample_ids.tolist()]
+            records = [self.old_cache[sample_id] for sample_id in ids]
         except KeyError as exc:
             raise RuntimeError(f"missing old router record for sample id {exc.args[0]}") from exc
         old_indices = torch.stack([record[0] for record in records])
@@ -196,15 +253,20 @@ class RouterShiftObserver:
             old_log_probs, input_ids, attention_mask, response_length
         ).permute(1, 0, 2)
         self._current_abs_sums = [None] * len(self.routers)
-        self._current_sample_ids = sample_ids.detach().cpu()
+        self._current_sample_ids = sample_ids.detach()
 
+    @torch.no_grad()
     def finish_current_microbatch(self, input_ids, attention_mask, response_mask, response_length):
         local = self._unpack_sequence_parallel(
             [value.unsqueeze(-1) for value in self._current_abs_sums], input_ids, attention_mask
         )
         local = local[:, -response_length - 1 : -1, :, 0].sum(dim=-1)
+        if local.shape != response_mask.shape or local.device != response_mask.device:
+            raise RuntimeError("router-shift delta and response mask shapes/devices differ")
+        # local is a fresh reduction; the actor never mutates response_mask in-place.
+        # Keep only detached token statistics, not logits or model activations.
         self._current_microbatches.append(
-            (local.cpu(), response_mask.bool().cpu(), self._current_sample_ids)
+            (local.detach(), response_mask.detach().bool(), self._current_sample_ids)
         )
         self._current_indices = None
         self._current_old_log_probs = None
@@ -212,55 +274,105 @@ class RouterShiftObserver:
         self._current_sample_ids = None
         self._capturing = False
 
-    def finish_current_batch(self):
+    @torch.no_grad()
+    def finish_current_batch(self, need_gamma_by_sample: bool = False):
+        try:
+            return self._finish_current_batch(need_gamma_by_sample)
+        except BaseException:
+            self.clear_old_cache()
+            raise
+        finally:
+            self._reset_current_batch()
+
+    def _finish_current_batch(self, need_gamma_by_sample: bool):
         self.mode = None
         self._capturing = False
-        device = next(self.routers[0].parameters()).device
-        layer_count = torch.tensor(float(len(self.routers)), device=device)
+        if not self._current_microbatches:
+            raise RuntimeError("router-shift diagnostics require at least one current microbatch")
+        device = self.routers[0].weight.device
+        rows = [] if need_gamma_by_sample else None
+        for local, mask, sample_ids in self._current_microbatches:
+            if (
+                local.ndim != 2
+                or local.shape != mask.shape
+                or local.dtype != torch.float32
+                or mask.dtype != torch.bool
+                or local.device != device
+                or mask.device != device
+            ):
+                raise RuntimeError("router-shift delta and response mask shapes/dtypes/devices differ")
+            # Execution already validates sample identity in begin_current_microbatch.
+            # Only weighting needs a second traversal to build the CPU gamma mapping.
+            if rows is not None:
+                rows.extend((sample_id, local.shape[1]) for sample_id in self._sample_ids(sample_ids, local.shape[0]))
+        if rows is not None and len({sample_id for sample_id, _ in rows}) != len(rows):
+            raise RuntimeError("duplicate current router-shift sample id")
+
+        # Flattening also handles different response widths without padding/reordering rows.
+        # Layer count and the 0/1 error flag are exactly representable in FP32 at this scale.
+        payload = torch.cat([
+            torch.tensor([float(len(self.routers))], dtype=torch.float32, device=device),
+            self._current_invalid_flag.reshape(1).float(),
+            *[local.reshape(-1) for local, _, _ in self._current_microbatches],
+        ])
+        mask = torch.cat([mask.reshape(-1) for _, mask, _ in self._current_microbatches])
+        self._current_microbatches.clear()
 
         from megatron.core import parallel_state as mpu
 
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             group = mpu.get_pipeline_model_parallel_group()
-            torch.distributed.all_reduce(layer_count, group=group)
+            torch.distributed.all_reduce(payload, group=group)
 
-        totals = torch.zeros(3, dtype=torch.float32, device=device)
-        gamma_by_sample = {}
-        for local_abs_sum, response_mask, sample_ids in self._current_microbatches:
-            local_abs_sum = local_abs_sum.to(device)
-            response_mask = response_mask.to(device)
-            if mpu.get_pipeline_model_parallel_world_size() > 1:
-                torch.distributed.all_reduce(local_abs_sum, group=group)
-            gamma = torch.exp(-local_abs_sum.float() / (layer_count * self.topk))
-            if gamma.shape != response_mask.shape:
-                raise RuntimeError("router-shift gamma and response mask shapes differ")
-            for row, sample_id in enumerate(sample_ids.tolist()):
-                if sample_id in gamma_by_sample:
-                    raise RuntimeError(f"duplicate current router-shift sample id: {sample_id}")
-                gamma_by_sample[sample_id] = gamma[row].cpu()
-            valid_gamma = gamma[response_mask]
-            totals += torch.stack(
-                [
-                    valid_gamma.sum(),
-                    (valid_gamma < 0.8).float().sum(),
-                    valid_gamma.new_tensor(float(valid_gamma.numel())),
-                ]
-            )
-
-        self._current_microbatches.clear()
-        if totals[2].item() == 0:
-            raise RuntimeError("router-shift diagnostics require at least one valid response token")
+        # Aggregate delta across ALL PP layers BEFORE exponentiating, never average stage gammas.
+        gamma = torch.exp(-payload[2:] / (payload[0] * self.topk))
+        invalid = (payload[1] != 0) | ~torch.isfinite(payload[2:]).all()
+        totals = torch.stack([
+            torch.where(mask, gamma, 0.0).sum(),
+            ((gamma < 0.8) & mask).sum(dtype=torch.float32),
+            mask.sum(dtype=torch.float32),
+            invalid.float(),
+        ])
+        # Propagate invalid status before any host-side raise so peers follow the same collectives.
         if mpu.get_data_parallel_world_size() > 1:
             torch.distributed.all_reduce(totals, group=mpu.get_data_parallel_group())
-        return {
-            "gamma_sum": totals[0].item(),
-            "clip_sum": totals[1].item(),
-            "token_count": int(totals[2].item()),
-            "gamma_by_sample": gamma_by_sample,
+        gamma_sum, clip_sum, token_count, invalid = totals.tolist()
+        if invalid != 0:
+            raise RuntimeError("router-shift diagnostics received non-finite current router data")
+        if token_count == 0:
+            raise RuntimeError("router-shift diagnostics require at least one valid response token")
+        result = {
+            "gamma_sum": gamma_sum,
+            "clip_sum": clip_sum,
+            "token_count": int(token_count),
         }
+        if need_gamma_by_sample:
+            gamma_cpu = gamma.detach().cpu()  # One bulk copy, only for RS weighting.
+            gamma_by_sample = {}
+            offset = 0
+            for sample_id, width in rows:
+                gamma_by_sample[sample_id] = gamma_cpu[offset : offset + width]
+                offset += width
+            result["gamma_by_sample"] = gamma_by_sample
+        return result
+
+    def _reset_current_batch(self):
+        self.mode = None
+        self._capturing = False
+        self._current_microbatches.clear()
+        self._current_seen_sample_ids.clear()
+        self._current_invalid_flag = None
+        self._current_indices = None
+        self._current_old_log_probs = None
+        self._current_abs_sums = None
+        self._current_sample_ids = None
 
     def clear_old_cache(self):
+        self._reset_current_batch()
         self.old_cache.clear()
+        self._pending_old_log_probs.clear()
+        self._old_indices = None
+        self._old_log_probs = None
 
     @staticmethod
     def aggregate_partials(local_abs_diff_sums, local_layer_counts, topk):
