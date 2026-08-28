@@ -532,8 +532,8 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
-                if self.config.router_shift_weighting.enabled and loss_mode != "vanilla":
-                    raise RuntimeError("router-shift weighting is currently connected only to vanilla GRPO loss")
+                if self.config.router_shift_weighting.enabled and loss_mode not in {"vanilla", "gspo"}:
+                    raise RuntimeError("router-shift weighting is currently connected only to vanilla and GSPO losses")
 
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
