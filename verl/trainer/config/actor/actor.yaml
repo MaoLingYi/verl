@@ -251,6 +251,10 @@ router_replay:
   # - R3: Use R3 routing strategy (record mode)
   mode: disabled
 
+  # Keep historical Full R3/R2 behavior by default. Set false only for R3
+  # rollout-to-old alignment with a naturally routed current policy.
+  replay_current_update: true
+
   # File path to save recorded routing decisions
   # Required when mode is 'record', 'R2', or 'R3'
   record_file: null

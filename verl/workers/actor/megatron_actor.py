@@ -398,7 +398,8 @@ class MegatronPPOActor(BasePPOActor):
             select_keys.append("router_shift_sample_ids")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
-        if self.enable_routing_replay:
+        replay_current_update = self.router_replay.should_replay_current_update
+        if replay_current_update:
             select_keys.append("routed_experts")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -842,8 +843,11 @@ class MegatronPPOActor(BasePPOActor):
         rs_weight_sum = 0.0
         rs_token_count = 0
         for data in dataloader:
-            if self.config.router_replay.mode in ["R2", "R3"]:
+            replay_current_update = self.config.router_replay.should_replay_current_update
+            if replay_current_update:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            elif self.enable_routing_replay:
+                RouterReplay.clear_global_router_replay_action()
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
@@ -927,7 +931,7 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 raise NotImplementedError
 
-            if self.config.router_replay.mode in ["R2", "R3"]:
+            if replay_current_update:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
 

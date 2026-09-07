@@ -36,7 +36,7 @@ class TopKRouter(torch.nn.Module):
     def forward(self, inputs):
         logits = self.gating(inputs)
         replay = getattr(self, "router_replay", None)
-        if replay is not None and replay.router_replay_action.value == "replay_forward":
+        if getattr(getattr(replay, "router_replay_action", None), "value", None) == "replay_forward":
             indices = replay.target_topk_idx
         else:
             indices = torch.topk(logits, self.topk, dim=-1).indices
@@ -313,6 +313,56 @@ class TestTimMetrics(unittest.TestCase):
 
 
 class TestRouterShiftContract(unittest.TestCase):
+    def test_current_none_action_uses_natural_routes_through_deep_hidden_states(self):
+        routers = torch.nn.ModuleList([TopKRouter(), TopKRouter()])
+        old_indices = torch.tensor([[0, 1], [0, 1]])
+        for router, target in zip(routers, old_indices):
+            router.router_replay = types.SimpleNamespace(
+                router_replay_action=None,
+                target_topk_idx=target.expand(2, -1),
+            )
+        observer = router_module.RouterShiftObserver([routers], _router_config())
+        self.addCleanup(observer.close)
+        inputs = torch.tensor([[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]], requires_grad=True)
+        observer.start_current_batch()
+        observer._capturing = True
+        observer._current_indices = old_indices[:, None, :].expand(-1, inputs.shape[0], -1)
+        observer._current_old_log_probs = torch.zeros_like(observer._current_indices, dtype=torch.float32)
+        observer._current_abs_sums = [None, None]
+
+        first_probs, first_routes = routers[0](inputs)
+        deep_hidden = inputs + first_probs[:, : inputs.shape[-1]]
+        second_probs, second_routes = routers[1](deep_hidden)
+        (first_probs[:, 0].sum() + second_probs[:, 0].sum()).backward()
+
+        for routes in (first_routes, second_routes):
+            natural = routes.nonzero()[:, -1].reshape(inputs.shape[0], -1)
+            self.assertFalse(torch.equal(natural, old_indices[0].expand_as(natural)))
+        self.assertIsNotNone(inputs.grad)
+        self.assertTrue(all(router.weight.grad is not None for router in routers))
+        self.assertTrue(all(value is not None and not value.requires_grad for value in observer._current_abs_sums))
+
+    def test_error_cleanup_restores_replay_action_and_indices(self):
+        calls = []
+
+        class Replay:
+            clear_global_router_replay_action = staticmethod(lambda: calls.append("action"))
+            clear_global_indices = staticmethod(lambda: calls.append("indices"))
+
+        replay_module = types.ModuleType("verl.utils.megatron.router_replay_patch")
+        replay_module.RouterReplay = Replay
+        observer = types.SimpleNamespace(clear_old_cache=lambda: calls.append("observer"))
+        actor = types.SimpleNamespace(router_shift_observer=observer, enable_routing_replay=True)
+
+        @router_module.clear_router_shift_on_error
+        def fail(_actor):
+            raise RuntimeError("expected")
+
+        with patch.dict(sys.modules, {"verl.utils.megatron.router_replay_patch": replay_module}):
+            with self.assertRaisesRegex(RuntimeError, "expected"):
+                fail(actor)
+        self.assertEqual(calls, ["observer", "action", "indices"])
+
     def test_baseline_ep2_uses_global_expert_mask(self):
         logits = torch.zeros((1, 128))
         global_indices = torch.tensor([[0, 63, 64, 127]])

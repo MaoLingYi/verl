@@ -21,6 +21,7 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    RouterReplayConfig,
     RouterShiftWeightingConfig,
 )
 
@@ -70,6 +71,13 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.gamma_min, 0.8)
         with self.assertRaises(ValueError):
             RouterShiftWeightingConfig(gamma_min=0.0)
+
+    def test_router_replay_keeps_current_update_replay_enabled_by_default(self):
+        self.assertTrue(RouterReplayConfig().replay_current_update)
+        self.assertFalse(RouterReplayConfig().should_replay_current_update)
+        self.assertTrue(RouterReplayConfig(mode="R2", replay_current_update=False).should_replay_current_update)
+        self.assertTrue(RouterReplayConfig(mode="R3").should_replay_current_update)
+        self.assertFalse(RouterReplayConfig(mode="R3", replay_current_update=False).should_replay_current_update)
 
     def test_actor_config_from_yaml(self):
         """Test creating ActorConfig from YAML file."""

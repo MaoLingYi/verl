@@ -130,6 +130,19 @@ def test_actor_uses_detached_prepass_only_when_weighting_is_enabled():
     assert 'loss_mode not in {"vanilla", "gspo"}' in actor_source
 
 
+def test_alignment_scope_clears_replay_before_current_prepass_and_update():
+    actor_source = (
+        module_path.parents[2] / "workers" / "actor" / "megatron_actor.py"
+    ).read_text(encoding="utf-8")
+    update = actor_source.index("def update_policy")
+    scope = actor_source.index("replay_current_update = self.config.router_replay.should_replay_current_update", update)
+    replay = actor_source.index("RouterReplay.set_global_router_replay_action", scope)
+    natural = actor_source.index("RouterReplay.clear_global_router_replay_action()", replay)
+    prepass = actor_source.index("forward_only=True", natural)
+    training = actor_source.index("metric_micro_batch = self.forward_backward_batch", prepass)
+    assert scope < replay < natural < prepass < training
+
+
 def test_gspo_rs_disabled_and_gamma_one_match_loss_metrics_and_gradient():
     old = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
     advantages = torch.tensor([[1.0, 1.0, 1.0], [-1.0, -1.0, -1.0]])

@@ -7,7 +7,7 @@ import torch
 
 
 def clear_router_shift_on_error(method):
-    """Release diagnostic state if an actor forward/update is aborted; leave training state alone."""
+    """Release observer and router-replay state if an actor forward/update is aborted."""
     @wraps(method)
     def wrapped(actor, *args, **kwargs):
         try:
@@ -15,6 +15,11 @@ def clear_router_shift_on_error(method):
         except BaseException:
             if actor.router_shift_observer is not None:
                 actor.router_shift_observer.clear_old_cache()
+            if getattr(actor, "enable_routing_replay", False):
+                from verl.utils.megatron.router_replay_patch import RouterReplay
+
+                RouterReplay.clear_global_router_replay_action()
+                RouterReplay.clear_global_indices()
             raise
 
     return wrapped

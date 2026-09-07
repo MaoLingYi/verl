@@ -78,6 +78,7 @@ class RouterReplayConfig(BaseConfig):
     """
 
     mode: str = "disabled"
+    replay_current_update: bool = True
     record_file: Optional[str] = None
     replay_file: Optional[str] = None
 
@@ -86,6 +87,10 @@ class RouterReplayConfig(BaseConfig):
         valid_modes = ["disabled", "R2", "R3"]
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
+
+    @property
+    def should_replay_current_update(self) -> bool:
+        return self.mode == "R2" or (self.mode == "R3" and self.replay_current_update)
 
 
 @dataclass
