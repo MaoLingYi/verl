@@ -197,7 +197,7 @@ def calculate_debug_metrics(
         data: DataProto
             the data batch to calculate
             rollout_log_probs: log_probs record when rollout forward tokens
-            old_log_probs(actor log probs): log_probs record when actor forward tokens
+            old_log_probs or current_log_probs: sampled-token logprobs from the actor prepass
             loss_mask or attention_mask: to mask unrelated token
             responses: the response tokens, for calculating size
     Returns:
@@ -210,7 +210,9 @@ def calculate_debug_metrics(
     """
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
-    actor_old_log_probs = data.batch["old_log_probs"]
+    actor_old_log_probs = (
+        data.batch["current_log_probs"] if "current_log_probs" in data.batch else data.batch["old_log_probs"]
+    )
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
         log_prob_mask = data.batch["response_mask"]

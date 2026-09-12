@@ -28,6 +28,10 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "BehaviorExpertISConfig",
+    "ExpertClusterDPPOConfig",
+    "RoutingUtilityConfig",
+    "EUDERPOConfig",
     "RouterShiftDiagnosticsConfig",
     "RouterShiftWeightingConfig",
     "RouterReplayConfig",
@@ -38,6 +42,65 @@ __all__ = [
     "QATConfig",
     "TorchTitanActorConfig",
 ]
+
+
+@dataclass
+class BehaviorExpertISConfig(BaseConfig):
+    enabled: bool = False
+    behavior_source: str = "rollout"
+    require_rollout_logprob: bool = True
+
+
+@dataclass
+class ExpertClusterDPPOConfig(BaseConfig):
+    enabled: bool = False
+    divergence_type: str = "binary_tv"
+    delta_e: Optional[float] = None
+    diagnostics_only: bool = False
+    log_quantiles: tuple[float, ...] = (0.5, 0.75, 0.9, 0.95, 0.99)
+
+
+@dataclass
+class RoutingUtilityConfig(BaseConfig):
+    enabled: bool = False
+    lambda_u: Optional[float] = None
+    eps_u: float = 1.0e-6
+    min_group_size: int = 2
+    min_std: float = 1.0e-6
+    diagnostics: bool = False
+
+
+@dataclass
+class EUDERPOConfig(BaseConfig):
+    enabled: bool = False
+    version: str = "1.2"
+    behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
+    expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
+    routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)
+
+    def __post_init__(self):
+        if not self.enabled:
+            return
+        if self.version != "1.2":
+            raise ValueError("EU-DERPO production implementation requires version 1.2")
+        if not self.behavior_expert_is.enabled or not self.expert_cluster_dppo.enabled or not self.routing_utility.enabled:
+            raise ValueError("EU-DERPO requires behavior ExpertIS, Expert-cluster DPPO, and Routing Utility")
+        if self.behavior_expert_is.behavior_source != "rollout" or not self.behavior_expert_is.require_rollout_logprob:
+            raise ValueError("EU-DERPO requires true rollout sampled-token log probabilities")
+        dppo = self.expert_cluster_dppo
+        if dppo.divergence_type != "binary_tv":
+            raise ValueError("EU-DERPO V1.2 requires binary_tv")
+        if not dppo.diagnostics_only and dppo.delta_e is None:
+            raise ValueError("EU-DERPO requires explicit delta_e outside diagnostics-only mode")
+        if dppo.delta_e is not None and not 0 < dppo.delta_e < 1:
+            raise ValueError("EU-DERPO delta_e must be in (0, 1)")
+        if any(not 0 <= quantile <= 1 for quantile in dppo.log_quantiles):
+            raise ValueError("EU-DERPO diagnostic quantiles must be in [0, 1]")
+        utility = self.routing_utility
+        if utility.lambda_u is None or utility.lambda_u <= 0:
+            raise ValueError("EU-DERPO requires explicit positive lambda_u")
+        if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
+            raise ValueError("invalid Routing Utility normalization configuration")
 
 
 @dataclass
@@ -199,6 +262,7 @@ class ActorConfig(BaseConfig):
     router_shift_diagnostics: RouterShiftDiagnosticsConfig = field(default_factory=RouterShiftDiagnosticsConfig)
     router_shift_weighting: RouterShiftWeightingConfig = field(default_factory=RouterShiftWeightingConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    eu_derpo: EUDERPOConfig = field(default_factory=EUDERPOConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

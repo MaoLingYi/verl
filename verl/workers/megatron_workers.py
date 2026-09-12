@@ -950,7 +950,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
-        # we should always recompute old_log_probs when it is HybridEngine
+        # HybridEngine recomputes actor sampled-token logprobs; EU-DERPO exposes them as current_log_probs.
         config_source = self.config.ref if is_lora else self.config.rollout
         data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
@@ -965,9 +965,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         with adapter_ctx:
             output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
-        tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
-        if not is_lora:
-            tensors["entropys"] = entropys
+        if is_lora:
+            tensors = {"ref_log_prob": output}
+        elif self.config.actor.eu_derpo.enabled:
+            # Explicit theta_k no-grad prepass paired with EUDERPOObserver's natural routes.
+            # Do not expose this field as old_log_probs: V1.2 has no old-policy fallback.
+            tensors = {"current_log_probs": output, "entropys": entropys}
+        else:
+            tensors = {"old_log_probs": output, "entropys": entropys}
         output = DataProto.from_dict(
             tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},

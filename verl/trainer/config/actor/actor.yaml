@@ -270,3 +270,34 @@ router_shift_weighting:
   enabled: false
   gamma_min: 0.8
 
+# Frozen EU-DERPO V1.2. Public default is fully disabled.
+eu_derpo:
+
+  _target_: verl.workers.config.EUDERPOConfig
+
+  enabled: false
+  version: "1.2"
+
+  behavior_expert_is:
+    _target_: verl.workers.config.BehaviorExpertISConfig
+    enabled: false
+    behavior_source: rollout
+    require_rollout_logprob: true
+
+  expert_cluster_dppo:
+    _target_: verl.workers.config.ExpertClusterDPPOConfig
+    enabled: false
+    divergence_type: binary_tv
+    delta_e: null
+    diagnostics_only: false
+    log_quantiles: [0.5, 0.75, 0.9, 0.95, 0.99]
+
+  routing_utility:
+    _target_: verl.workers.config.RoutingUtilityConfig
+    enabled: false
+    lambda_u: null
+    eps_u: 1.0e-6
+    min_group_size: 2
+    min_std: 1.0e-6
+    diagnostics: false
+

@@ -23,6 +23,7 @@ import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
+from datetime import datetime, timezone
 from pprint import pprint
 from typing import Any, Optional
 
@@ -49,6 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.eu_derpo import aime_accuracy_values, append_aime_history
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
@@ -622,7 +624,37 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        history = self.config.trainer.get("aime24_validation_history", None)
+        if history and history.get("enabled", False):
+            accuracy_values = aime_accuracy_values(reward_extra_infos_dict, sample_scores)
+            total = len(accuracy_values)
+            correct = int(sum(accuracy_values))
+            accuracy = correct / total if total else 0.0
+            sampling = self.config.actor_rollout_ref.rollout.val_kwargs
+            record = {
+                "global_step": self.global_steps,
+                "checkpoint": os.path.join(
+                    self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+                ),
+                "aime24_correct": correct,
+                "aime24_total": total,
+                "accuracy": accuracy,
+                "sampling_n": sampling.n,
+                "max_response_length": self.config.data.max_response_length,
+                "temperature": sampling.temperature,
+                "top_p": sampling.top_p,
+                "top_k": sampling.top_k,
+                "seed": self.config.data.get("seed", None),
+                "evaluation_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            append_aime_history(history.path, record)
+            metrics.update({
+                "val-aime24/correct": correct,
+                "val-aime24/total": total,
+                "val-aime24/accuracy": accuracy,
+            })
+        return metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -1406,6 +1438,23 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    actor_config = self.config.actor_rollout_ref.actor
+                    if actor_config.eu_derpo.enabled:
+                        if self.config.algorithm.use_kl_in_reward:
+                            raise ValueError("EU-DERPO V1.2 forbids KL in task reward")
+                        if bypass_recomputing_logprobs:
+                            raise ValueError("EU-DERPO requires an explicit current-policy prepass")
+                        uid_to_group = {}
+                        groups = []
+                        for uid in batch.non_tensor_batch["uid"]:
+                            groups.append(uid_to_group.setdefault(uid, len(uid_to_group)))
+                        batch.batch["eu_derpo_sample_ids"] = torch.arange(
+                            len(batch), dtype=torch.int64, device=batch.batch.device
+                        )
+                        batch.batch["eu_derpo_prompt_group"] = torch.tensor(
+                            groups, dtype=torch.int64, device=batch.batch.device
+                        )
+                        batch.meta_info["eu_derpo_rollout_n"] = self.config.actor_rollout_ref.rollout.n
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -1414,9 +1463,8 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                    else:  # Recompute old_log_probs
+                    else:  # Recompute actor logprobs; EU-DERPO names the explicit theta_k result current_log_probs.
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            actor_config = self.config.actor_rollout_ref.actor
                             if (
                                 actor_config.router_shift_diagnostics.enabled
                                 or actor_config.router_shift_weighting.enabled
@@ -1449,6 +1497,8 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            if actor_config.eu_derpo.enabled and "current_log_probs" not in batch.batch:
+                                raise RuntimeError("EU-DERPO V1.2 current theta_k prepass did not return current_log_probs")
                             tim_scatter = self.config.trainer.get("tim_scatter", None)
                             if tim_scatter and tim_scatter.get("enabled", False):
                                 from verl.utils.debug.metrics import should_save_tim_scatter
@@ -1475,7 +1525,8 @@ class RayPPOTrainer:
                                     )
                                 )
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    required_policy_logp = "current_log_probs" if actor_config.eu_derpo.enabled else "old_log_probs"
+                    assert required_policy_logp in batch.batch, f'"{required_policy_logp}" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
                         # compute reference log_prob

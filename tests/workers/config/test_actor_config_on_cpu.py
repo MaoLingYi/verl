@@ -18,6 +18,10 @@ import unittest
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import (
     ActorConfig,
+    BehaviorExpertISConfig,
+    EUDERPOConfig,
+    ExpertClusterDPPOConfig,
+    RoutingUtilityConfig,
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
@@ -70,6 +74,31 @@ class TestActorConfig(unittest.TestCase):
         self.assertEqual(config.gamma_min, 0.8)
         with self.assertRaises(ValueError):
             RouterShiftWeightingConfig(gamma_min=0.0)
+
+    def test_eu_derpo_is_disabled_by_default_and_requires_explicit_hyperparameters(self):
+        self.assertFalse(EUDERPOConfig().enabled)
+        with self.assertRaisesRegex(ValueError, "delta_e"):
+            EUDERPOConfig(
+                enabled=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.1),
+            )
+        config = EUDERPOConfig(
+            enabled=True,
+            behavior_expert_is=BehaviorExpertISConfig(enabled=True),
+            expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.07),
+            routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.02),
+        )
+        self.assertEqual(config.expert_cluster_dppo.delta_e, 0.07)
+        self.assertEqual(config.routing_utility.lambda_u, 0.02)
+        with self.assertRaisesRegex(ValueError, "positive lambda_u"):
+            EUDERPOConfig(
+                enabled=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.07),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.0),
+            )
 
     def test_actor_config_from_yaml(self):
         """Test creating ActorConfig from YAML file."""
