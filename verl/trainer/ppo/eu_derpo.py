@@ -98,17 +98,15 @@ def cluster_statistics(
     divergence_sum = torch.zeros_like(count)
     log_ratio = current - behavior
     binary_tv = (behavior.exp() - current.exp()).abs()
-    batch_offset = torch.arange(batch, device=current.device)[:, None, None] * num_experts
-    valid = mask[:, :, None].expand(batch, tokens, topk)
+    valid = mask[:, :, None].expand(batch, tokens, topk).reshape(batch, -1).float()
     for layer in range(layers):
         edge = routes[:, :, layer, :].long()
-        flat_index = (edge + batch_offset).reshape(-1)
-        valid_flat = valid.reshape(-1).float()
-        count[:, layer].view(-1).scatter_add_(0, flat_index, valid_flat)
-        log_values = log_ratio[:, :, None].expand_as(edge).reshape(-1) * valid_flat
-        div_values = binary_tv[:, :, None].expand_as(edge).reshape(-1) * valid_flat
-        log_sum[:, layer].view(-1).scatter_add_(0, flat_index, log_values)
-        divergence_sum[:, layer].view(-1).scatter_add_(0, flat_index, div_values)
+        index = edge.reshape(batch, -1)
+        count[:, layer].scatter_add_(1, index, valid)
+        log_values = log_ratio[:, :, None].expand_as(edge).reshape(batch, -1) * valid
+        div_values = binary_tv[:, :, None].expand_as(edge).reshape(batch, -1) * valid
+        log_sum[:, layer].scatter_add_(1, index, log_values)
+        divergence_sum[:, layer].scatter_add_(1, index, div_values)
 
     active = count > 0
     safe_count = count.masked_fill(~active, 1.0)
@@ -262,12 +260,11 @@ def aggregate_edge_utility(
     batch, tokens, layers, topk = routes.shape
     sums = torch.zeros((batch, layers, num_experts), dtype=torch.float32, device=utility.device)
     counts = torch.zeros_like(sums)
-    offset = torch.arange(batch, device=utility.device)[:, None, None] * num_experts
-    valid = response_mask.bool()[:, :, None].expand(batch, tokens, topk).reshape(-1).float()
+    valid = response_mask.bool()[:, :, None].expand(batch, tokens, topk).reshape(batch, -1).float()
     for layer in range(layers):
-        index = (routes[:, :, layer].long() + offset).reshape(-1)
-        counts[:, layer].view(-1).scatter_add_(0, index, valid)
-        sums[:, layer].view(-1).scatter_add_(0, index, utility[:, :, layer].reshape(-1) * valid)
+        index = routes[:, :, layer].long().reshape(batch, -1)
+        counts[:, layer].scatter_add_(1, index, valid)
+        sums[:, layer].scatter_add_(1, index, utility[:, :, layer].reshape(batch, -1) * valid)
     return sums, counts
 
 
