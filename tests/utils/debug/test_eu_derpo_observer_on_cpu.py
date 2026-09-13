@@ -6,6 +6,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -112,9 +113,9 @@ class TestEUDERPOObserver(unittest.TestCase):
         parallel_state.get_tensor_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_rank = lambda: 0
-        parallel_state.get_tensor_model_parallel_group = lambda: None
-        parallel_state.get_pipeline_model_parallel_group = lambda: None
-        parallel_state.get_data_parallel_group = lambda: None
+        parallel_state.get_tensor_model_parallel_group = lambda: "tp"
+        parallel_state.get_pipeline_model_parallel_group = lambda: "pp"
+        parallel_state.get_data_parallel_group = lambda: "dp"
 
         modules = {
             "verl": types.ModuleType("verl"),
@@ -137,6 +138,12 @@ class TestEUDERPOObserver(unittest.TestCase):
         observer_module = importlib.util.module_from_spec(observer_spec)
         assert observer_spec.loader is not None
         observer_spec.loader.exec_module(observer_module)
+        self.observer_module = observer_module
+        self.parallel_state = parallel_state
+        self.all_reduce_patcher = mock.patch(
+            "torch.distributed.all_reduce", side_effect=self._simulate_identical_dp_gradients
+        )
+        self.all_reduce_patcher.start()
         self.observer_class = observer_module.EUDERPOObserver
         self.model = FakeModel()
         self.observer = self.observer_class([self.model], observer_config(), diagnostics=True)
@@ -153,11 +160,17 @@ class TestEUDERPOObserver(unittest.TestCase):
 
     def tearDown(self):
         self.observer.close()
+        self.all_reduce_patcher.stop()
         for name, module in self.saved_modules.items():
             if module is MISSING:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+    @staticmethod
+    def _simulate_identical_dp_gradients(tensor, op=None, group=None):
+        if group == "dp":
+            tensor.mul_(4)
 
     def run_prepass(self, training=True):
         self.observer.start_prepass_batch()
@@ -335,6 +348,57 @@ class TestEUDERPOObserver(unittest.TestCase):
     def test_saved_tensor_and_routing_map_must_match_within_invocation(self):
         with self.assertRaisesRegex(RuntimeError, "saved-tensor Top-K differs from routing-map Top-K"):
             self.run_main_backward(recompute_map_shift=1)
+
+    def test_dp4_auxiliary_gradient_is_sum_divided_by_four_after_tp(self):
+        local_gradients = [torch.tensor([value, value + 1.0]) for value in range(4)]
+        global_sum = torch.stack(local_gradients).sum(0)
+        calls = []
+
+        def all_reduce(tensor, op=None, group=None):
+            calls.append((group, op))
+            if group == "dp":
+                tensor.copy_(global_sum)
+
+        self.parallel_state.get_tensor_model_parallel_world_size = lambda: 2
+        with mock.patch("torch.distributed.all_reduce", side_effect=all_reduce):
+            reduced = []
+            for gradient in local_gradients:
+                value = gradient.clone()
+                self.observer_module._reduce_router_auxiliary_grad(value)
+                reduced.append(value)
+
+        for value in reduced:
+            torch.testing.assert_close(value, global_sum / 4)
+        self.assertEqual(calls, [("tp", None), ("dp", torch.distributed.ReduceOp.SUM)] * 4)
+
+    def test_dp1_auxiliary_gradient_has_no_collective(self):
+        self.parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+        self.parallel_state.get_data_parallel_world_size = lambda: 1
+        gradient = torch.tensor([1.0, 2.0])
+        with mock.patch("torch.distributed.all_reduce") as all_reduce:
+            self.observer_module._reduce_router_auxiliary_grad(gradient)
+        all_reduce.assert_not_called()
+        torch.testing.assert_close(gradient, torch.tensor([1.0, 2.0]))
+
+    def test_main_grad_adds_each_averaged_auxiliary_gradient_once(self):
+        self.run_main_backward()
+        _, utility_count, _ = self.finish_main()
+        before = self.model.routers[0].weight.main_grad.clone()
+        reduced = []
+        original = self.observer_module._reduce_router_auxiliary_grad
+
+        def capture(gradient):
+            original(gradient)
+            reduced.append(gradient.clone())
+
+        with mock.patch.object(self.observer_module, "_reduce_router_auxiliary_grad", side_effect=capture):
+            self.run_auxiliary(utility_count)
+
+        self.assertEqual(len(reduced), 96)
+        torch.testing.assert_close(
+            self.model.routers[0].weight.main_grad - before,
+            reduced[0] + reduced[48],
+        )
 
 
 if __name__ == "__main__":

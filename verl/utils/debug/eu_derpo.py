@@ -29,6 +29,19 @@ def clear_eu_derpo_on_error(method):
     return wrapped
 
 
+def _reduce_router_auxiliary_grad(auxiliary_grad):
+    from megatron.core import parallel_state as mpu
+
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        torch.distributed.all_reduce(auxiliary_grad, group=mpu.get_tensor_model_parallel_group())
+    dense_dp_size = mpu.get_data_parallel_world_size()
+    if dense_dp_size > 1:
+        torch.distributed.all_reduce(
+            auxiliary_grad, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
+        )
+        auxiliary_grad.div_(dense_dp_size)
+
+
 class EUDERPOObserver:
     """Capture natural routes and stream actual-alpha routing credit during main backward."""
 
@@ -636,10 +649,7 @@ class EUDERPOObserver:
         self._invalid_flag.bitwise_or_(
             (~torch.isfinite(loss).all() | ~torch.isfinite(auxiliary_grad).all()).to(torch.int32)
         )
-        from megatron.core import parallel_state as mpu
-
-        if mpu.get_tensor_model_parallel_world_size() > 1:
-            torch.distributed.all_reduce(auxiliary_grad, group=mpu.get_tensor_model_parallel_group())
+        _reduce_router_auxiliary_grad(auxiliary_grad)
         main_grad = getattr(module.weight, "main_grad", None)
         if main_grad is None:
             raise RuntimeError("EU-DERPO requires Megatron main_grad for Router-only auxiliary update")

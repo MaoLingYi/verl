@@ -10,6 +10,7 @@ import torch
 ROOT = Path(__file__).parents[3]
 MATH_MODULE = ROOT / "verl" / "trainer" / "ppo" / "eu_derpo.py"
 ACTOR_MODULE = ROOT / "verl" / "workers" / "actor" / "megatron_actor.py"
+OBSERVER_MODULE = ROOT / "verl" / "utils" / "debug" / "eu_derpo.py"
 SPEC = importlib.util.spec_from_file_location("eu_derpo_f_source_math_under_test", MATH_MODULE)
 eu = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -63,13 +64,27 @@ class TestEUDERPOFSingleSource(unittest.TestCase):
         self.assertNotIn('data["current_log_probs"]', loss_source)
         self.assertNotIn('data["eu_derpo_token_coeff"]', source)
 
-    def test_dense_dp_collectives_only_reduce_logging_metrics(self):
+    def test_dense_dp_does_not_reduce_utility_or_normalization(self):
         source = ACTOR_MODULE.read_text(encoding="utf-8")
         update = source[source.index("def update_policy(") :]
         normalize = update.index("normalize_group_utility(")
         first_dp_collective = update.index("mpu.get_data_parallel_world_size()")
         self.assertGreater(first_dp_collective, normalize)
         self.assertNotIn("get_data_parallel", update[:normalize])
+
+        observer = OBSERVER_MODULE.read_text(encoding="utf-8")
+        reducer = observer[observer.index("def _reduce_router_auxiliary_grad(") : observer.index("class EUDERPOObserver:")]
+        self.assertIn("get_data_parallel_group", reducer)
+        self.assertNotIn("utility_sum", reducer)
+        self.assertNotIn("utility_count", reducer)
+        self.assertNotIn("normalized", reducer)
+
+    def test_auxiliary_reduction_preserves_f_source_and_exact_recompute_contract(self):
+        actor = ACTOR_MODULE.read_text(encoding="utf-8")
+        observer = OBSERVER_MODULE.read_text(encoding="utf-8")
+        self.assertIn("eu_derpo_f_routes=eu_derpo_f_routes", actor)
+        self.assertNotIn('data["eu_derpo_token_coeff"]', actor)
+        self.assertIn("actual-F/recompute natural route mismatch", observer)
 
 
 if __name__ == "__main__":
