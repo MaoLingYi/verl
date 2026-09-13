@@ -72,15 +72,26 @@ def cluster_statistics(
     if routes.ndim != 4 or routes.shape[:2] != current.shape:
         raise ValueError("routes must have shape [batch, response, local_layers, topk]")
     routes = routes.detach()
+    mask = response_mask.bool()
     if routes.numel() and (routes.min() < 0 or routes.max() >= num_experts):
         raise ValueError("route expert id is out of range")
-    if routes.shape[-1] > 1 and (routes.sort(-1).values.diff(dim=-1) == 0).any():
-        raise ValueError("EU-DERPO requires unique selected token-expert edges")
+    if routes.shape[-1] > 1:
+        duplicate = routes.sort(-1).values.diff(dim=-1).eq(0).any(dim=-1) & mask[:, :, None]
+        if duplicate.any():
+            duplicate_count = int(duplicate.sum().item())
+            first = int(duplicate.flatten().max(dim=0).indices.item())
+            sample, remainder = divmod(first, duplicate.shape[1] * duplicate.shape[2])
+            token, layer = divmod(remainder, duplicate.shape[2])
+            raise ValueError(
+                "EU-DERPO requires unique selected token-expert edges: "
+                f"duplicate_valid_positions={duplicate_count}, "
+                f"first=(sample={sample}, token={token}, layer={layer}), "
+                f"routes={routes[sample, token, layer].tolist()}"
+            )
     if not diagnostics_only and delta_e is None:
         raise ValueError("EU-DERPO requires explicit delta_e")
 
     batch, tokens, layers, topk = routes.shape
-    mask = response_mask.bool()
     advantage = response_advantage(advantages, mask)
     count = torch.zeros((batch, layers, num_experts), dtype=torch.float32, device=current.device)
     log_sum = torch.zeros_like(count)
