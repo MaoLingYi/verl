@@ -188,7 +188,7 @@ class EUDERPOObserver:
             | (fp32_alpha <= 0).any()
             | ~torch.isclose(fp32_alpha, router_alpha.float(), rtol=rtol, atol=2.0e-6).all()
         )
-        self._invalid_flag.maximum_(invalid.to(torch.int32))
+        self._invalid_flag.bitwise_or_(invalid.to(torch.int32))
 
     @staticmethod
     def _ids(sample_ids: torch.Tensor, batch_size: int) -> list[int]:
@@ -283,7 +283,7 @@ class EUDERPOObserver:
             self._mark_invalid_alpha(alpha, actual_alpha)
             selected = alpha[valid]
             if selected.numel():
-                self._alpha_min.minimum_(selected.detach().min())
+                self._alpha_min.copy_(torch.minimum(self._alpha_min, selected.detach().min()))
                 if self.diagnostics:
                     self._alpha_summary.append(selected.reshape(-1, self.topk)[:32].detach().clone())
             record.update(layer=index, rows=rows, valid=valid, ready=True)
@@ -306,16 +306,19 @@ class EUDERPOObserver:
         sensitivity = -grad.float()
         utility = centered_routing_utility(record["alpha"], sensitivity)
         center_residual = (record["alpha"].float() * utility).sum(-1).abs().max()
-        self._center_residual_max.maximum_(center_residual)
-        self._invalid_flag.maximum_((center_residual > 2.0e-5).to(torch.int32))
-        self._invalid_flag.maximum_((~torch.isfinite(utility).all()).to(torch.int32))
+        self._center_residual_max.copy_(torch.maximum(self._center_residual_max, center_residual))
+        self._invalid_flag.bitwise_or_((center_residual > 2.0e-5).to(torch.int32))
+        self._invalid_flag.bitwise_or_((~torch.isfinite(utility).all()).to(torch.int32))
         edge_valid = valid[:, None].expand_as(routes).reshape(-1)
-        flat_index = (rows[:, None] * self.num_experts + routes).reshape(-1)[edge_valid]
+        flat_rows = rows[:, None].expand_as(routes).reshape(-1)[edge_valid]
+        flat_routes = routes.reshape(-1)[edge_valid]
+        flat_layers = torch.full_like(flat_rows, layer)
+        indices = (flat_rows, flat_layers, flat_routes)
         selected_utility = utility.reshape(-1)[edge_valid]
-        self._utility_sum[:, layer].view(-1).scatter_add_(0, flat_index, selected_utility)
+        self._utility_sum.index_put_(indices, selected_utility, accumulate=True)
         if self._utility_sum_sq is not None:
-            self._utility_sum_sq[:, layer].view(-1).scatter_add_(0, flat_index, selected_utility.square())
-        self._utility_count[:, layer].view(-1).scatter_add_(0, flat_index, torch.ones_like(selected_utility))
+            self._utility_sum_sq.index_put_(indices, selected_utility.square(), accumulate=True)
+        self._utility_count.index_put_(indices, torch.ones_like(selected_utility), accumulate=True)
         self._edge_count_by_layer[layer] += edge_valid.sum()
         self._main_hook_count += 1
         self._main_hook_count_by_layer[layer] += 1
@@ -484,7 +487,7 @@ class EUDERPOObserver:
             self._mark_invalid_alpha(log_alpha.detach().exp(), actual_alpha)
             loss = -lambda_u * (weights[index].to(log_alpha.device) * log_alpha).sum()
             auxiliary_grad = torch.autograd.grad(loss, module.weight, create_graph=False)[0]
-        self._invalid_flag.maximum_(
+        self._invalid_flag.bitwise_or_(
             (~torch.isfinite(loss).all() | ~torch.isfinite(auxiliary_grad).all()).to(torch.int32)
         )
         from megatron.core import parallel_state as mpu
