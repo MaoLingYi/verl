@@ -10,6 +10,16 @@ import torch
 import torch.nn.functional as F
 
 
+def policy_prepass_tensors(
+    log_probs: torch.Tensor, entropys: torch.Tensor, eu_derpo_enabled: bool
+) -> dict[str, torch.Tensor]:
+    """Preserve legacy old-policy plumbing and add a non-aliased EU current-policy snapshot."""
+    tensors = {"old_log_probs": log_probs, "entropys": entropys}
+    if eu_derpo_enabled:
+        tensors["current_log_probs"] = log_probs.clone()
+    return tensors
+
+
 @dataclass
 class ClusterStatistics:
     count: torch.Tensor

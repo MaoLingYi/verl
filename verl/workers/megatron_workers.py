@@ -39,6 +39,7 @@ from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.trainer.ppo.eu_derpo import policy_prepass_tensors
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -950,7 +951,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
-        # HybridEngine recomputes actor sampled-token logprobs; EU-DERPO exposes them as current_log_probs.
+        # HybridEngine recomputes the stable old-policy snapshot before the actor update.
         config_source = self.config.ref if is_lora else self.config.rollout
         data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
@@ -967,12 +968,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
         if is_lora:
             tensors = {"ref_log_prob": output}
-        elif self.config.actor.eu_derpo.enabled:
-            # Explicit theta_k no-grad prepass paired with EUDERPOObserver's natural routes.
-            # Do not expose this field as old_log_probs: V1.2 has no old-policy fallback.
-            tensors = {"current_log_probs": output, "entropys": entropys}
         else:
-            tensors = {"old_log_probs": output, "entropys": entropys}
+            # EU's one optimizer mini-step starts at this same theta_k prepass; keep its snapshot separate.
+            tensors = policy_prepass_tensors(output, entropys, self.config.actor.eu_derpo.enabled)
         output = DataProto.from_dict(
             tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
