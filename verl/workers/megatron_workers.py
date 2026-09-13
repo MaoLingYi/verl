@@ -969,7 +969,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if is_lora:
             tensors = {"ref_log_prob": output}
         else:
-            # EU's one optimizer mini-step starts at this same theta_k prepass; keep its snapshot separate.
+            # Preserve the three-logprob plumbing; EU current-policy authority is captured by actual F.
             tensors = policy_prepass_tensors(output, entropys, self.config.actor.eu_derpo.enabled)
         output = DataProto.from_dict(
             tensors=tensors,

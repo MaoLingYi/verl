@@ -44,8 +44,8 @@ class EUDERPOObserver:
             "moe_expert_capacity_factor": None,
             "moe_apply_probs_on_input": False,
             "tensor_model_parallel_size": 2,
-            "pipeline_model_parallel_size": 4,
-            "expert_model_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 8,
             "expert_tensor_parallel_size": 1,
             "context_parallel_size": 1,
             "num_layers": 48,
@@ -61,11 +61,11 @@ class EUDERPOObserver:
         if tf_config.tensor_model_parallel_size > 1 and not tf_config.sequence_parallel:
             raise ValueError("EU-DERPO requires sequence parallelism when TP > 1")
         if getattr(tf_config, "hidden_dropout", 0.0) != 0 or getattr(tf_config, "attention_dropout", 0.0) != 0:
-            raise ValueError("EU-DERPO prepass/main route identity requires zero model dropout")
+            raise ValueError("EU-DERPO F/recompute route identity requires zero model dropout")
         from megatron.core import parallel_state as mpu
 
-        if mpu.get_data_parallel_world_size() != 1 or mpu.get_expert_data_parallel_world_size() != 1:
-            raise ValueError("EU-DERPO V1.2 first integration requires dense DP=1 and Expert DP=1")
+        if mpu.get_data_parallel_world_size() != 4 or mpu.get_expert_data_parallel_world_size() != 1:
+            raise ValueError("EU-DERPO PP1 integration requires dense DP=4 and Expert DP=1")
 
         self.tf_config = tf_config
         self.diagnostics = bool(diagnostics)
@@ -83,15 +83,18 @@ class EUDERPOObserver:
             raise ValueError("EU-DERPO V1.2 Qwen3 recipe requires 128 Experts and Top-K=8")
         if any(router.topk != self.topk or router.weight.shape[0] != self.num_experts for router in self.routers):
             raise ValueError("EU-DERPO requires uniform local Router shapes")
-        if len(self.routers) != 12:
-            raise ValueError("EU-DERPO PP4 requires exactly 12 local MoE layers per stage")
+        if len(self.routers) != 48:
+            raise ValueError("EU-DERPO PP1 requires exactly 48 local MoE layers")
 
         self.mode = None
         self.route_cache = {}
+        self.current_logprob_cache = {}
+        self._prepass_route_cache = {}
         self._handles = []
         self._pending_alpha = {}
         self._pending_recompute = [deque() for _ in self.routers]
         self._active = None
+        self._forward_routes = None
         self._prepass_routes = None
         self._prepass_ids = None
         self._sample_row = {}
@@ -104,7 +107,6 @@ class EUDERPOObserver:
         self._expected_main_hook_count = 0
         self._edge_count_by_layer = None
         self._route_mismatch_by_layer = None
-        self._prepass_forward_mismatch_by_layer = None
         self._forward_recompute_mismatch_by_layer = None
         self._route_compare_by_layer = None
         self._first_route_mismatch = {}
@@ -216,7 +218,7 @@ class EUDERPOObserver:
         return sample_ids.tolist()
 
     def start_prepass_batch(self):
-        self.clear()
+        self._prepass_route_cache.clear()
         self.mode = "prepass"
 
     def begin_prepass_microbatch(self):
@@ -230,13 +232,13 @@ class EUDERPOObserver:
         if routes.shape != expected or routes.dtype != torch.uint8:
             raise RuntimeError(f"EU-DERPO prepass route shape/dtype mismatch: {routes.shape}, {routes.dtype}")
         for row, sample_id in enumerate(self._ids(sample_ids, input_ids.shape[0])):
-            if sample_id in self.route_cache:
+            if sample_id in self._prepass_route_cache:
                 raise RuntimeError(f"duplicate EU-DERPO sample id: {sample_id}")
-            self.route_cache[sample_id] = routes[row]
+            self._prepass_route_cache[sample_id] = routes[row]
         self._prepass_routes = None
 
     def finish_prepass_batch(self):
-        if not self.route_cache:
+        if not self._prepass_route_cache:
             raise RuntimeError("EU-DERPO prepass captured no routes")
         self.mode = None
 
@@ -244,12 +246,20 @@ class EUDERPOObserver:
         try:
             return torch.stack([self.route_cache[int(sample_id)] for sample_id in sample_ids.tolist()])
         except KeyError as exc:
-            raise RuntimeError(f"missing EU-DERPO prepass route for sample {exc.args[0]}") from exc
+            raise RuntimeError(f"missing EU-DERPO actual-F route for sample {exc.args[0]}") from exc
+
+    def current_logprobs_for(self, sample_ids: torch.Tensor) -> torch.Tensor:
+        try:
+            return torch.stack([self.current_logprob_cache[int(sample_id)] for sample_id in sample_ids.tolist()])
+        except KeyError as exc:
+            raise RuntimeError(f"missing EU-DERPO actual-F current logprob for sample {exc.args[0]}") from exc
 
     def start_main_batch(self, sample_ids: torch.Tensor):
         ids = self._ids(sample_ids, sample_ids.numel())
         if len(set(ids)) != len(ids):
             raise RuntimeError("duplicate EU-DERPO main sample id")
+        self.route_cache.clear()
+        self.current_logprob_cache.clear()
         self.mode = "main"
         self._sample_row = {sample_id: row for row, sample_id in enumerate(ids)}
         device = self.routers[0].weight.device
@@ -263,7 +273,6 @@ class EUDERPOObserver:
         self._expected_main_hook_count = len(ids) * len(self.routers)
         self._edge_count_by_layer = torch.zeros(len(self.routers), dtype=torch.int64, device=device)
         self._route_mismatch_by_layer = torch.zeros(len(self.routers), dtype=torch.int64, device=device)
-        self._prepass_forward_mismatch_by_layer = torch.zeros_like(self._route_mismatch_by_layer)
         self._forward_recompute_mismatch_by_layer = torch.zeros_like(self._route_mismatch_by_layer)
         self._route_compare_by_layer = torch.zeros_like(self._route_mismatch_by_layer)
         self._first_route_mismatch = {
@@ -277,7 +286,7 @@ class EUDERPOObserver:
                 "actual": torch.full((self.topk,), -1, dtype=torch.int64, device=device),
                 "topk_intersection": torch.full((), -1, dtype=torch.int64, device=device),
             }
-            for phase in ("prepass_forward", "forward_recompute", "prepass_recompute")
+            for phase in ("forward_recompute",)
         }
         self._alpha_summary.clear()
         self._alpha_min = torch.tensor(float("inf"), dtype=torch.float32, device=device)
@@ -289,8 +298,6 @@ class EUDERPOObserver:
     @torch.no_grad()
     def begin_main_microbatch(self, input_ids, attention_mask, sample_ids, response_mask, response_length):
         ids = self._ids(sample_ids, input_ids.shape[0])
-        records = torch.stack([self.route_cache[sample_id] for sample_id in ids])
-        packed_routes = RouterShiftObserver._pack_sequence_parallel(records, input_ids, attention_mask, response_length).permute(1, 0, 2)
         rows = torch.tensor([self._sample_row[sample_id] for sample_id in ids], dtype=torch.int64)[:, None]
         rows = rows.expand(-1, response_length)
         packed_rows = RouterShiftObserver._pack_sequence_parallel(rows[..., None], input_ids, attention_mask, response_length).squeeze(-1)
@@ -299,10 +306,37 @@ class EUDERPOObserver:
         packed_tokens = RouterShiftObserver._pack_sequence_parallel(
             tokens[..., None], input_ids, attention_mask, response_length
         ).squeeze(-1)
-        self._active = (packed_routes, packed_rows.long(), packed_valid, packed_tokens.long())
+        self._active = (packed_rows.long(), packed_valid, packed_tokens.long())
+        self._forward_routes = [None] * len(self.routers)
 
-    def finish_main_microbatch(self):
+    @torch.no_grad()
+    def finish_main_microbatch(self, input_ids, attention_mask, sample_ids, response_length):
+        routes = RouterShiftObserver._unpack_sequence_parallel(
+            self._forward_routes, input_ids, attention_mask
+        )[:, -response_length - 1 : -1]
+        expected = (input_ids.shape[0], response_length, len(self.routers), self.topk)
+        if routes.shape != expected or routes.dtype != torch.uint8:
+            raise RuntimeError(f"EU-DERPO actual-F route shape/dtype mismatch: {routes.shape}, {routes.dtype}")
+        for row, sample_id in enumerate(self._ids(sample_ids, input_ids.shape[0])):
+            if sample_id in self.route_cache:
+                raise RuntimeError(f"duplicate EU-DERPO actual-F sample id: {sample_id}")
+            self.route_cache[sample_id] = routes[row].cpu()
         self._active = None
+        self._forward_routes = None
+        return routes
+
+    @torch.no_grad()
+    def record_main_logprobs(self, sample_ids, routes, current_logprobs):
+        ids = self._ids(sample_ids, current_logprobs.shape[0])
+        cached = self.routes_for(sample_ids)
+        if not torch.equal(cached.long().sort(-1).values, routes.detach().cpu().long().sort(-1).values):
+            raise RuntimeError("EU-DERPO loss closure did not receive its same-F route snapshot")
+        if current_logprobs.ndim != 2 or not torch.isfinite(current_logprobs).all():
+            raise RuntimeError("EU-DERPO actual-F current logprob is missing or non-finite")
+        for row, sample_id in enumerate(ids):
+            if sample_id in self.current_logprob_cache:
+                raise RuntimeError(f"duplicate EU-DERPO actual-F current logprob: {sample_id}")
+            self.current_logprob_cache[sample_id] = current_logprobs[row].detach().float().cpu()
 
     def _observe_main(self, index, module, output):
         actual_set = self._selected(output[1], self.topk)
@@ -313,9 +347,8 @@ class EUDERPOObserver:
             context, forward_routes = self._pending_recompute[index].popleft()
             record = self._pending_alpha.pop(index)
             actual = record["routes"]
-            expected, rows, valid, tokens = context[0][index], context[1], context[2], context[3]
+            rows, valid, tokens = context
             self._check_same_invocation(index, actual, actual_set, rows, tokens, valid)
-            self._check_route("prepass_recompute", index, expected, actual_set, rows, tokens, valid)
             self._check_route("forward_recompute", index, forward_routes, actual_set, rows, tokens, valid)
             alpha = record["alpha"]
             actual_alpha = output[0].gather(-1, actual)
@@ -330,22 +363,19 @@ class EUDERPOObserver:
             self._record_execution("F", module)
             if self._active is None:
                 raise RuntimeError("EU-DERPO original forward has no microbatch context")
-            expected, rows, valid, tokens = self._active[0][index], self._active[1], self._active[2], self._active[3]
-            self._check_route("prepass_forward", index, expected, actual_set, rows, tokens, valid)
+            rows, valid, tokens = self._active
+            self._forward_routes[index] = actual_set.detach().to(torch.uint8)
             self._pending_recompute[index].append((self._active, actual_set.detach()))
 
     @torch.no_grad()
     def _check_route(self, phase, index, expected, actual, rows, tokens, valid):
         differences = ~expected.long().sort(-1).values.eq(actual.long().sort(-1).values)
         mismatch = differences[valid].sum()
-        mismatch_by_phase = {
-            "prepass_forward": self._prepass_forward_mismatch_by_layer,
-            "forward_recompute": self._forward_recompute_mismatch_by_layer,
-            "prepass_recompute": self._route_mismatch_by_layer,
-        }
-        mismatch_by_phase[phase][index] += mismatch
-        if phase == "prepass_recompute":
-            self._route_compare_by_layer[index] += valid.sum() * self.topk
+        if phase != "forward_recompute":
+            raise RuntimeError(f"unsupported EU-DERPO route comparison phase: {phase}")
+        self._forward_recompute_mismatch_by_layer[index] += mismatch
+        self._route_mismatch_by_layer[index] += mismatch
+        self._route_compare_by_layer[index] += valid.sum() * self.topk
         self._remember_first_route_mismatch(phase, index, expected, actual, rows, tokens, differences.any(-1) & valid)
 
     @torch.no_grad()
@@ -451,10 +481,8 @@ class EUDERPOObserver:
         if any(self._pending_recompute):
             raise RuntimeError("EU-DERPO backward missed a checkpoint recompute")
         layer_mismatch = self._global_layer_mismatch()
-        prepass_forward_layer_mismatch = self._global_layer_values(self._prepass_forward_mismatch_by_layer)
         forward_recompute_layer_mismatch = self._global_layer_values(self._forward_recompute_mismatch_by_layer)
         mismatch = int(layer_mismatch.sum().item())
-        prepass_forward_mismatch = int(prepass_forward_layer_mismatch.sum().item())
         forward_recompute_mismatch = int(forward_recompute_layer_mismatch.sum().item())
         compared = int(self._global_layer_values(self._route_compare_by_layer).sum().item())
         invalid = self._global_invalid()
@@ -462,11 +490,6 @@ class EUDERPOObserver:
             "route_mismatch_count": mismatch,
             "route_equal_fraction": (compared - mismatch) / compared if compared else 0.0,
             "layer_mismatch_count": layer_mismatch.cpu().tolist(),
-            "prepass_forward_mismatch_count": prepass_forward_mismatch,
-            "prepass_forward_equal_fraction": (
-                (compared - prepass_forward_mismatch) / compared if compared else 0.0
-            ),
-            "prepass_forward_layer_mismatch_count": prepass_forward_layer_mismatch.cpu().tolist(),
             "forward_recompute_mismatch_count": forward_recompute_mismatch,
             "forward_recompute_equal_fraction": (
                 (compared - forward_recompute_mismatch) / compared if compared else 0.0
@@ -480,8 +503,8 @@ class EUDERPOObserver:
             "utility_edge_count_by_layer": self._edge_count_by_layer.cpu().tolist(),
             "weighted_center_max_abs": self._center_residual_max.item(),
         }
-        if mismatch or prepass_forward_mismatch or forward_recompute_mismatch:
-            raise RuntimeError(f"EU-DERPO prepass/main natural route mismatch: {metrics}")
+        if mismatch or forward_recompute_mismatch:
+            raise RuntimeError(f"EU-DERPO actual-F/recompute natural route mismatch: {metrics}")
         if invalid:
             raise FloatingPointError("EU-DERPO actual alpha or relative routing utility is invalid")
         hook_invalid = torch.tensor(
@@ -659,6 +682,8 @@ class EUDERPOObserver:
         self.mode = None
         self._aux_stats = None
         self.route_cache.clear()
+        self.current_logprob_cache.clear()
+        self._prepass_route_cache.clear()
         self._sample_row.clear()
         self._sample_ids_by_row = None
         self._utility_sum = None
@@ -667,7 +692,6 @@ class EUDERPOObserver:
         self._edge_count_by_layer = None
         self._main_hook_count_by_layer = None
         self._route_mismatch_by_layer = None
-        self._prepass_forward_mismatch_by_layer = None
         self._forward_recompute_mismatch_by_layer = None
         self._route_compare_by_layer = None
         self._first_route_mismatch.clear()
@@ -681,10 +705,13 @@ class EUDERPOObserver:
     def clear(self):
         self.mode = None
         self.route_cache.clear()
+        self.current_logprob_cache.clear()
+        self._prepass_route_cache.clear()
         self._pending_alpha.clear()
         for queue in self._pending_recompute:
             queue.clear()
         self._active = None
+        self._forward_routes = None
         self._prepass_routes = None
         self._prepass_ids = None
         self._sample_row.clear()
@@ -694,7 +721,6 @@ class EUDERPOObserver:
         self._edge_count_by_layer = None
         self._main_hook_count_by_layer = None
         self._route_mismatch_by_layer = None
-        self._prepass_forward_mismatch_by_layer = None
         self._forward_recompute_mismatch_by_layer = None
         self._route_compare_by_layer = None
         self._sample_ids_by_row = None

@@ -26,7 +26,11 @@ class FakeRouterShiftObserver:
 
     @staticmethod
     def _pack_sequence_parallel(records, input_ids, attention_mask, response_length):
-        return records.reshape(input_ids.shape[0] * response_length, *records.shape[2:])
+        full = torch.zeros(
+            (input_ids.shape[0], input_ids.shape[1], *records.shape[2:]), dtype=records.dtype
+        )
+        full[:, -response_length - 1 : -1] = records
+        return full.reshape(input_ids.numel(), *records.shape[2:])
 
 
 class TopKRouter(torch.nn.Module):
@@ -62,7 +66,7 @@ class TopKRouter(torch.nn.Module):
 class FakeModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.routers = torch.nn.ModuleList([TopKRouter(index) for index in range(12)])
+        self.routers = torch.nn.ModuleList([TopKRouter(index) for index in range(48)])
 
     def forward(self, hidden):
         return [router(hidden) for router in self.routers]
@@ -80,8 +84,8 @@ def observer_config():
         moe_expert_capacity_factor=None,
         moe_apply_probs_on_input=False,
         tensor_model_parallel_size=2,
-        pipeline_model_parallel_size=4,
-        expert_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=8,
         expert_tensor_parallel_size=1,
         context_parallel_size=1,
         num_layers=48,
@@ -103,13 +107,14 @@ class TestEUDERPOObserver(unittest.TestCase):
         math_spec.loader.exec_module(math_module)
 
         parallel_state = types.ModuleType("megatron.core.parallel_state")
-        parallel_state.get_data_parallel_world_size = lambda: 1
+        parallel_state.get_data_parallel_world_size = lambda: 4
         parallel_state.get_expert_data_parallel_world_size = lambda: 1
         parallel_state.get_tensor_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_rank = lambda: 0
         parallel_state.get_tensor_model_parallel_group = lambda: None
         parallel_state.get_pipeline_model_parallel_group = lambda: None
+        parallel_state.get_data_parallel_group = lambda: None
 
         modules = {
             "verl": types.ModuleType("verl"),
@@ -181,11 +186,6 @@ class TestEUDERPOObserver(unittest.TestCase):
         prepass_training=True,
     ):
         self.run_prepass(training=prepass_training)
-        if swap_cache:
-            self.observer.route_cache[17], self.observer.route_cache[23] = (
-                self.observer.route_cache[23],
-                self.observer.route_cache[17],
-            )
         self.observer.start_main_batch(self.sample_ids)
         self.assertFalse(self.observer._utility_sum[:, 0].is_contiguous())
         expert_weight = torch.arange(128, dtype=torch.float32)
@@ -194,12 +194,17 @@ class TestEUDERPOObserver(unittest.TestCase):
             input_ids = self.input_ids[row : row + 1]
             attention_mask = self.attention_mask[row : row + 1]
             response_mask = self.response_mask[row : row + 1]
-            hidden = self.hidden[row, :2]
+            hidden = self.hidden[row]
             self.observer.begin_main_microbatch(input_ids, attention_mask, ids, response_mask, 2)
             self.set_route_behavior(route_shift=forward_shift)
             with torch.no_grad():
                 self.model(hidden)
-            self.observer.finish_main_microbatch()
+            f_routes = self.observer.finish_main_microbatch(input_ids, attention_mask, ids, 2)
+            if swap_cache:
+                self.observer.route_cache[int(sample_id)] = (
+                    self.observer.route_cache[int(sample_id)].long() + 1
+                ).remainder(128).to(torch.uint8)
+            self.observer.record_main_logprobs(ids, f_routes, torch.zeros((1, 2)))
             self.set_route_behavior(route_shift=recompute_shift, routing_map_shift=recompute_map_shift)
             outputs = self.model(hidden)
             sum((probabilities * expert_weight).sum() for probabilities, _ in outputs).backward()
@@ -209,13 +214,12 @@ class TestEUDERPOObserver(unittest.TestCase):
 
     def finish_main(self):
         utility_sum, utility_sum_sq, utility_count, metrics = self.observer.finish_main_batch()
-        self.assertEqual(metrics["gradient_hook_count"], 24)
-        self.assertEqual(metrics["expected_gradient_hook_count"], 24)
-        self.assertEqual(metrics["prepass_forward_mismatch_count"], 0)
+        self.assertEqual(metrics["gradient_hook_count"], 96)
+        self.assertEqual(metrics["expected_gradient_hook_count"], 96)
         self.assertEqual(metrics["forward_recompute_mismatch_count"], 0)
         self.assertEqual(metrics["route_mismatch_count"], 0)
         self.assertEqual(metrics["first_route_mismatch"], {})
-        self.assertEqual(utility_count.sum((0, 2)).tolist(), [24.0] * 12)
+        self.assertEqual(utility_count.sum((0, 2)).tolist(), [24.0] * 48)
         self.assertTrue(torch.isfinite(utility_sum).all())
         self.assertTrue(torch.isfinite(utility_sum_sq).all())
         return utility_sum, utility_count, metrics
@@ -235,7 +239,7 @@ class TestEUDERPOObserver(unittest.TestCase):
                 2,
             )
             with torch.no_grad():
-                self.model(self.hidden[row, :2])
+                self.model(self.hidden[row])
             self.observer.finish_aux_microbatch()
         return self.observer.finish_aux_batch()
 
@@ -296,40 +300,37 @@ class TestEUDERPOObserver(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "routing-utility edges"):
             self.observer.finish_main_batch()
 
-    def test_prepass_forward_divergence_is_attributed_separately(self):
+    def test_prepass_divergence_is_not_an_eu_semantic_failure(self):
         self.run_main_backward(forward_shift=1, recompute_shift=1)
-        with self.assertRaises(RuntimeError) as caught:
-            self.observer.finish_main_batch()
-        message = str(caught.exception)
-        self.assertIn("'forward_recompute_mismatch_count': 0", message)
-        self.assertNotIn("'prepass_forward_mismatch_count': 0", message)
-        self.assertIn("'sample_id': 17", message)
-        self.assertIn("'response_token': 0", message)
-        self.assertIn("'global_layer': 0", message)
+        _, _, metrics = self.finish_main()
+        self.assertEqual(metrics["forward_recompute_mismatch_count"], 0)
 
-    def test_eval_mode_prepass_divergence_still_fails_fast(self):
+    def test_eval_mode_prepass_divergence_is_not_an_eu_semantic_failure(self):
         for router in self.model.routers:
             router.eval_route_shift = 1
         self.run_main_backward(prepass_training=False)
-        with self.assertRaises(RuntimeError) as caught:
-            self.observer.finish_main_batch()
-        message = str(caught.exception)
-        self.assertNotIn("'prepass_forward_mismatch_count': 0", message)
-        self.assertIn("'forward_recompute_mismatch_count': 0", message)
+        _, _, metrics = self.finish_main()
+        self.assertEqual(metrics["forward_recompute_mismatch_count"], 0)
 
     def test_forward_recompute_divergence_is_attributed_separately(self):
         self.run_main_backward(recompute_shift=1)
         with self.assertRaises(RuntimeError) as caught:
             self.observer.finish_main_batch()
         message = str(caught.exception)
-        self.assertIn("'prepass_forward_mismatch_count': 0", message)
         self.assertNotIn("'forward_recompute_mismatch_count': 0", message)
         self.assertNotIn("'route_mismatch_count': 0", message)
 
     def test_sample_mapping_corruption_still_fails_fast(self):
-        self.run_main_backward(swap_cache=True)
-        with self.assertRaisesRegex(RuntimeError, "natural route mismatch"):
-            self.observer.finish_main_batch()
+        with self.assertRaisesRegex(RuntimeError, "same-F route snapshot"):
+            self.run_main_backward(swap_cache=True)
+
+    def test_actual_f_cache_has_all_global_layers_and_expert_ids(self):
+        self.run_main_backward()
+        routes = self.observer.routes_for(self.sample_ids)
+        self.assertEqual(routes.shape, (2, 2, 48, 8))
+        self.assertGreaterEqual(routes.min().item(), 0)
+        self.assertLessEqual(routes.max().item(), 127)
+        self.assertEqual(self.observer.current_logprobs_for(self.sample_ids).shape, (2, 2))
 
     def test_saved_tensor_and_routing_map_must_match_within_invocation(self):
         with self.assertRaisesRegex(RuntimeError, "saved-tensor Top-K differs from routing-map Top-K"):

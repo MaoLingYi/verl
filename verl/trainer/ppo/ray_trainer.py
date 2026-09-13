@@ -1443,7 +1443,9 @@ class RayPPOTrainer:
                         if self.config.algorithm.use_kl_in_reward:
                             raise ValueError("EU-DERPO V1.2 forbids KL in task reward")
                         if bypass_recomputing_logprobs:
-                            raise ValueError("EU-DERPO requires an explicit current-policy prepass")
+                            raise ValueError("EU-DERPO requires legacy old-policy logprob plumbing")
+                        if self.config.trainer.balance_batch or actor_config.shuffle:
+                            raise ValueError("EU-DERPO DP4 requires trainer.balance_batch=false and actor.shuffle=false")
                         uid_to_group = {}
                         groups = []
                         for uid in batch.non_tensor_batch["uid"]:
@@ -1463,7 +1465,7 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                    else:  # Recompute actor logprobs; EU-DERPO names the explicit theta_k result current_log_probs.
+                    else:  # Recompute legacy old-policy logprobs; EU current-policy values come from actual F.
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             if (
                                 actor_config.router_shift_diagnostics.enabled
@@ -1498,7 +1500,7 @@ class RayPPOTrainer:
                                 )
                             batch = batch.union(old_log_prob)
                             if actor_config.eu_derpo.enabled and "current_log_probs" not in batch.batch:
-                                raise RuntimeError("EU-DERPO V1.2 current theta_k prepass did not return current_log_probs")
+                                raise RuntimeError("EU-DERPO three-logprob compatibility snapshot is missing")
                             tim_scatter = self.config.trainer.get("tim_scatter", None)
                             if tim_scatter and tim_scatter.get("enabled", False):
                                 from verl.utils.debug.metrics import should_save_tim_scatter
@@ -1525,7 +1527,7 @@ class RayPPOTrainer:
                                     )
                                 )
 
-                    required_policy_logp = "current_log_probs" if actor_config.eu_derpo.enabled else "old_log_probs"
+                    required_policy_logp = "old_log_probs"
                     assert required_policy_logp in batch.batch, f'"{required_policy_logp}" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:

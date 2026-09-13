@@ -75,21 +75,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _pipeline_gather_values(values: torch.Tensor) -> torch.Tensor:
-    """Gather variable-length detached diagnostics across PP stages, without averaging quantiles."""
+def _gather_diagnostic_values(values: torch.Tensor) -> torch.Tensor:
+    """Gather detached diagnostics across PP and dense-DP groups for logging only."""
     values = values.detach().float().flatten().to(get_device_id())
-    if mpu.get_pipeline_model_parallel_world_size() == 1:
-        return values.cpu()
-    group = mpu.get_pipeline_model_parallel_group()
-    size = torch.tensor([values.numel()], dtype=torch.int64, device=values.device)
-    sizes = [torch.zeros_like(size) for _ in range(mpu.get_pipeline_model_parallel_world_size())]
-    torch.distributed.all_gather(sizes, size, group=group)
-    maximum = max(item.item() for item in sizes)
-    padded = torch.zeros(maximum, dtype=torch.float32, device=values.device)
-    padded[: values.numel()] = values
-    gathered = [torch.empty_like(padded) for _ in sizes]
-    torch.distributed.all_gather(gathered, padded, group=group)
-    return torch.cat([item[: length.item()] for item, length in zip(gathered, sizes, strict=True)]).cpu()
+    for world_size, group in (
+        (mpu.get_pipeline_model_parallel_world_size(), mpu.get_pipeline_model_parallel_group()),
+        (mpu.get_data_parallel_world_size(), mpu.get_data_parallel_group()),
+    ):
+        if world_size == 1:
+            continue
+        size = torch.tensor([values.numel()], dtype=torch.int64, device=values.device)
+        sizes = [torch.zeros_like(size) for _ in range(world_size)]
+        torch.distributed.all_gather(sizes, size, group=group)
+        maximum = max(item.item() for item in sizes)
+        padded = torch.zeros(maximum, dtype=torch.float32, device=values.device)
+        padded[: values.numel()] = values
+        gathered = [torch.empty_like(padded) for _ in sizes]
+        torch.distributed.all_gather(gathered, padded, group=group)
+        values = torch.cat([item[: length.item()] for item, length in zip(gathered, sizes, strict=True)])
+    return values.cpu()
 
 
 class MegatronPPOActor(BasePPOActor):
@@ -292,11 +296,7 @@ class MegatronPPOActor(BasePPOActor):
         """
         prev_modes = [m.training for m in self.actor_module]
         for module in self.actor_module:
-            if self.eu_derpo_observer is not None:
-                # Current-route prepass must match the actor-update execution path.
-                module.train()
-            else:
-                module.eval()
+            module.eval()
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
@@ -322,8 +322,6 @@ class MegatronPPOActor(BasePPOActor):
         entropys = torch.Tensor()
         if recompute_old_log_prob:
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-            if self.eu_derpo_observer is not None:
-                select_keys.extend(["response_mask", "eu_derpo_sample_ids"])
             if self.router_shift_observer is not None:
                 select_keys.append("router_shift_sample_ids")
 
@@ -338,8 +336,6 @@ class MegatronPPOActor(BasePPOActor):
             response_length = response.size(1)
             if self.router_shift_observer is not None:
                 self.router_shift_observer.start_old_batch()
-            if self.eu_derpo_observer is not None:
-                self.eu_derpo_observer.start_prepass_batch()
             with torch.no_grad():
                 output = self.forward_backward_batch(
                     data,
@@ -414,8 +410,6 @@ class MegatronPPOActor(BasePPOActor):
                     layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
                 if self.router_shift_observer is not None:
                     self.router_shift_observer.finish_old_batch()
-                if self.eu_derpo_observer is not None:
-                    self.eu_derpo_observer.finish_prepass_batch()
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
@@ -471,7 +465,7 @@ class MegatronPPOActor(BasePPOActor):
         if self.router_shift_observer is not None:
             select_keys.append("router_shift_sample_ids")
         if self.eu_derpo_observer is not None:
-            select_keys.extend(["current_log_probs", "eu_derpo_sample_ids", "eu_derpo_prompt_group"])
+            select_keys.extend(["eu_derpo_sample_ids", "eu_derpo_prompt_group"])
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
@@ -489,7 +483,7 @@ class MegatronPPOActor(BasePPOActor):
             validate_prompt_groups(data.batch["eu_derpo_prompt_group"], rollout_n)
             if yielded != 1:
                 raise RuntimeError(
-                    "EU-DERPO V1.2 current-prepass implementation requires one actual optimizer mini-step; "
+                    "EU-DERPO V1.2 F-single-source implementation requires one actual optimizer mini-step; "
                     f"expanded_batch={len(data)}, normalized_mini_batch={self.config.ppo_mini_batch_size}, "
                     f"ppo_epochs={self.config.ppo_epochs}, yielded={yielded}"
                 )
@@ -581,7 +575,7 @@ class MegatronPPOActor(BasePPOActor):
 
         forward_backward_func = get_forward_backward_func()
 
-        def loss_func(output, data, meta_info):
+        def loss_func(output, data, meta_info, eu_derpo_sample_ids=None, eu_derpo_f_routes=None):
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
             log_probs = None
@@ -622,9 +616,29 @@ class MegatronPPOActor(BasePPOActor):
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                 if self.config.eu_derpo.enabled:
-                    coefficient = data["eu_derpo_token_coeff"].float()
+                    if eu_derpo_f_routes is None or eu_derpo_sample_ids is None:
+                        raise RuntimeError("EU-DERPO loss closure is missing its actual-F route snapshot")
+                    routes = eu_derpo_f_routes.to(device)
+                    dppo = self.config.eu_derpo.expert_cluster_dppo
+                    eu_stats = cluster_statistics(
+                        log_prob.detach(),
+                        data.get("rollout_log_probs"),
+                        advantages,
+                        response_mask,
+                        routes,
+                        self.eu_derpo_observer.num_experts,
+                        dppo.delta_e,
+                        dppo.diagnostics_only,
+                    )
+                    active_total = eu_stats.active.sum((1, 2)).float()
+                    coefficient, _ = edppo_token_coefficients(
+                        eu_stats, routes, response_mask, active_total
+                    )
                     if coefficient.shape != log_prob.shape or not torch.isfinite(coefficient).all():
-                        raise RuntimeError("EU-DERPO token coefficient is missing, non-finite, or misaligned")
+                        raise RuntimeError("EU-DERPO actual-F token coefficient is non-finite or misaligned")
+                    self.eu_derpo_observer.record_main_logprobs(
+                        eu_derpo_sample_ids, eu_derpo_f_routes, log_prob.detach()
+                    )
                     # The schedule averages these per-microbatch surrogates. Its scalar value
                     # differs from J_E-DPPO; its pure-math test checks the first-order gradient.
                     pg_loss = -(coefficient * log_prob.float()).sum()
@@ -761,6 +775,7 @@ class MegatronPPOActor(BasePPOActor):
                         router_shift_sample_ids,
                         response_length,
                     )
+            eu_derpo_f_routes = None
             if eu_derpo_observer is not None:
                 if eu_derpo_observer.mode == "prepass":
                     eu_derpo_observer.begin_prepass_microbatch()
@@ -866,7 +881,9 @@ class MegatronPPOActor(BasePPOActor):
                         input_ids, attention_mask, eu_derpo_sample_ids, response_length
                     )
                 elif eu_derpo_observer.mode == "main":
-                    eu_derpo_observer.finish_main_microbatch()
+                    eu_derpo_f_routes = eu_derpo_observer.finish_main_microbatch(
+                        input_ids, attention_mask, eu_derpo_sample_ids, response_length
+                    )
                 elif eu_derpo_observer.mode == "aux":
                     eu_derpo_observer.finish_aux_microbatch()
 
@@ -890,7 +907,13 @@ class MegatronPPOActor(BasePPOActor):
                 for router in router_instance_list:
                     router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
-            return output, partial(loss_func, data=batch, meta_info=meta_info)
+            return output, partial(
+                loss_func,
+                data=batch,
+                meta_info=meta_info,
+                eu_derpo_sample_ids=eu_derpo_sample_ids,
+                eu_derpo_f_routes=eu_derpo_f_routes,
+            )
 
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
@@ -1002,46 +1025,19 @@ class MegatronPPOActor(BasePPOActor):
             eu_state = None
             original_finalize = self.tf_config.finalize_model_grads_func
             if self.eu_derpo_observer is not None:
-                aggregation_started = time.perf_counter()
-                required = {"rollout_log_probs", "current_log_probs", "advantages", "response_mask", "eu_derpo_sample_ids", "eu_derpo_prompt_group"}
+                required = {
+                    "rollout_log_probs",
+                    "advantages",
+                    "response_mask",
+                    "eu_derpo_sample_ids",
+                    "eu_derpo_prompt_group",
+                }
                 missing = required.difference(data.batch.keys())
                 if missing:
                     raise RuntimeError(f"EU-DERPO missing required DataProto fields: {sorted(missing)}")
                 sample_ids = data.batch["eu_derpo_sample_ids"].cpu()
-                routes = self.eu_derpo_observer.routes_for(sample_ids)
-                dppo = self.config.eu_derpo.expert_cluster_dppo
-                stats_eu = cluster_statistics(
-                    data.batch["current_log_probs"].cpu(),
-                    data.batch["rollout_log_probs"].cpu(),
-                    data.batch["advantages"].cpu(),
-                    data.batch["response_mask"].cpu(),
-                    routes,
-                    self.eu_derpo_observer.num_experts,
-                    dppo.delta_e,
-                    dppo.diagnostics_only,
-                )
-                active_total = stats_eu.active.sum((1, 2)).float().to(get_device_id())
-                if mpu.get_pipeline_model_parallel_world_size() > 1:
-                    torch.distributed.all_reduce(active_total, group=mpu.get_pipeline_model_parallel_group())
-                coefficient, objective = edppo_token_coefficients(
-                    stats_eu, routes, data.batch["response_mask"].cpu(), active_total.cpu()
-                )
-                coefficient = coefficient.to(get_device_id())
-                if mpu.get_pipeline_model_parallel_world_size() > 1:
-                    torch.distributed.all_reduce(coefficient, group=mpu.get_pipeline_model_parallel_group())
-                    objective_device = objective.to(get_device_id())
-                    torch.distributed.all_reduce(objective_device, group=mpu.get_pipeline_model_parallel_group())
-                    objective = objective_device.cpu()
-                data.batch["eu_derpo_token_coeff"] = coefficient.cpu()
                 self.eu_derpo_observer.start_main_batch(sample_ids)
-                eu_state = (
-                    sample_ids,
-                    routes,
-                    stats_eu,
-                    active_total.cpu(),
-                    objective,
-                    time.perf_counter() - aggregation_started,
-                )
+                eu_state = sample_ids
             if self.config.router_shift_weighting.enabled:
                 self.router_shift_observer.start_current_batch()
                 with torch.no_grad():
@@ -1088,8 +1084,27 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 if self.eu_derpo_observer is not None:
                     main_finished = time.perf_counter()
-                    sample_ids, routes, stats_eu, active_total, objective, aggregation_seconds = eu_state
                     utility_sum, utility_sum_sq, utility_count, eu_metrics = self.eu_derpo_observer.finish_main_batch()
+                    aggregation_started = time.perf_counter()
+                    sample_ids = eu_state
+                    routes = self.eu_derpo_observer.routes_for(sample_ids)
+                    current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
+                    dppo = self.config.eu_derpo.expert_cluster_dppo
+                    stats_eu = cluster_statistics(
+                        current_log_probs,
+                        data.batch["rollout_log_probs"].cpu(),
+                        data.batch["advantages"].cpu(),
+                        data.batch["response_mask"].cpu(),
+                        routes,
+                        self.eu_derpo_observer.num_experts,
+                        dppo.delta_e,
+                        dppo.diagnostics_only,
+                    )
+                    active_total = stats_eu.active.sum((1, 2)).float()
+                    _, objective = edppo_token_coefficients(
+                        stats_eu, routes, data.batch["response_mask"].cpu(), active_total
+                    )
+                    aggregation_seconds = time.perf_counter() - aggregation_started
                     if "alpha_min" in eu_metrics:
                         alpha_min = torch.tensor(eu_metrics["alpha_min"], device=get_device_id())
                         if mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -1134,10 +1149,18 @@ class MegatronPPOActor(BasePPOActor):
                             auxiliary_objective, group=mpu.get_pipeline_model_parallel_group()
                         )
                     auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
-                    metrics["actor/eu_derpo/objective_edppo"] = [objective.item()]
+                    objective_device = objective.to(get_device_id())
+                    if mpu.get_data_parallel_world_size() > 1:
+                        torch.distributed.all_reduce(objective_device, group=mpu.get_data_parallel_group())
+                        objective_device /= mpu.get_data_parallel_world_size()
+                        torch.distributed.all_reduce(auxiliary_objective, group=mpu.get_data_parallel_group())
+                        auxiliary_objective /= mpu.get_data_parallel_world_size()
+                    objective_log = objective_device.item()
+                    auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
+                    metrics["actor/eu_derpo/objective_edppo"] = [objective_log]
                     metrics["actor/eu_derpo/objective_utility"] = [auxiliary_metrics["utility_objective"]]
                     metrics["actor/eu_derpo/objective_total"] = [
-                        objective.item() + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
+                        objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
                     ]
                     for key, value in (eu_metrics | auxiliary_metrics).items():
                         if key in {"layer_mismatch_count", "gradient_hook_count_by_layer", "utility_edge_count_by_layer"}:
@@ -1155,7 +1178,7 @@ class MegatronPPOActor(BasePPOActor):
                             ("u_hat", normalized[utility_count > 0]),
                             ("cluster_size", utility_count[utility_count > 0]),
                         ):
-                            values = _pipeline_gather_values(values)
+                            values = _gather_diagnostic_values(values)
                             for key, value in distribution_stats(values, tuple(dppo.log_quantiles)).items():
                                 metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
                         outward = active & ~stats_eu.mask
@@ -1174,6 +1197,9 @@ class MegatronPPOActor(BasePPOActor):
                         if mpu.get_pipeline_model_parallel_world_size() > 1:
                             torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
                             torch.distributed.all_reduce(edge_moments, group=mpu.get_pipeline_model_parallel_group())
+                        if mpu.get_data_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
+                            torch.distributed.all_reduce(edge_moments, group=mpu.get_data_parallel_group())
                         global_edge_mean = edge_moments[0] / edge_moments[2]
                         global_edge_variance = (edge_moments[1] / edge_moments[2] - global_edge_mean.square()).clamp_min(0)
                         metrics["actor/eu_derpo/mask_fraction"] = [(counts[0] / counts[1]).item()]
@@ -1187,23 +1213,33 @@ class MegatronPPOActor(BasePPOActor):
                         metrics["actor/eu_derpo/u_hat_positive_fraction"] = [(counts[8] / counts[10].clamp_min(1)).item()]
                         metrics["actor/eu_derpo/u_hat_negative_fraction"] = [(counts[9] / counts[10].clamp_min(1)).item()]
                         metrics["actor/eu_derpo/skipped_group_fraction"] = [(counts[6] / counts[7]).item()]
-                        local_layer_variance = torch.zeros(
+                        local_layer_moments = torch.zeros(
                             len(self.eu_derpo_observer.routers) * mpu.get_pipeline_model_parallel_world_size(),
-                            dtype=torch.float32,
+                            3,
+                            dtype=torch.float64,
                             device=get_device_id(),
                         )
                         offset = mpu.get_pipeline_model_parallel_rank() * len(self.eu_derpo_observer.routers)
                         for layer in range(len(self.eu_derpo_observer.routers)):
-                            values = cluster_utility[:, layer][utility_count[:, layer] > 0]
-                            local_layer_variance[offset + layer] = values.var(unbiased=False)
+                            values = cluster_utility[:, layer][utility_count[:, layer] > 0].double().to(get_device_id())
+                            local_layer_moments[offset + layer] = torch.stack(
+                                (
+                                    values.sum(),
+                                    values.square().sum(),
+                                    torch.as_tensor(values.numel(), dtype=torch.float64, device=values.device),
+                                )
+                            )
                         if mpu.get_pipeline_model_parallel_world_size() > 1:
                             torch.distributed.all_reduce(
-                                local_layer_variance, group=mpu.get_pipeline_model_parallel_group()
+                                local_layer_moments, group=mpu.get_pipeline_model_parallel_group()
                             )
-                        for layer, variance in enumerate(local_layer_variance.tolist()):
-                            metrics[f"actor/eu_derpo/U_layer_{layer}_variance"] = [variance]
+                        if mpu.get_data_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(local_layer_moments, group=mpu.get_data_parallel_group())
+                        for layer, (value_sum, square_sum, count) in enumerate(local_layer_moments.tolist()):
+                            variance = square_sum / count - (value_sum / count) ** 2 if count else 0.0
+                            metrics[f"actor/eu_derpo/U_layer_{layer}_variance"] = [max(0.0, variance)]
                         metrics["actor/eu_derpo/timing_utility_aggregation_s"] = [aggregation_seconds]
-                        main_total_seconds = main_finished - step_started - aggregation_seconds
+                        main_total_seconds = main_finished - step_started
                         main_forward_seconds = metric_micro_batch["model_forward_seconds"]
                         metrics["actor/eu_derpo/timing_main_forward_s"] = [main_forward_seconds]
                         metrics["actor/eu_derpo/timing_main_backward_and_pipeline_s"] = [
@@ -1212,8 +1248,17 @@ class MegatronPPOActor(BasePPOActor):
                         metrics["actor/eu_derpo/timing_main_forward_backward_s"] = [main_total_seconds]
                         metrics["actor/eu_derpo/timing_aux_forward_s"] = [auxiliary_output["model_forward_seconds"]]
                         metrics["actor/eu_derpo/timing_aux_router_s"] = [time.perf_counter() - auxiliary_started]
-                        metrics["actor/eu_derpo/memory_allocated_bytes"] = [get_torch_device().memory_allocated()]
-                        metrics["actor/eu_derpo/memory_reserved_bytes"] = [get_torch_device().memory_reserved()]
+                        memory = torch.tensor(
+                            [get_torch_device().max_memory_allocated(), get_torch_device().max_memory_reserved()],
+                            dtype=torch.float64,
+                            device=get_device_id(),
+                        )
+                        if mpu.get_data_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(
+                                memory, op=torch.distributed.ReduceOp.MAX, group=mpu.get_data_parallel_group()
+                            )
+                        metrics["actor/eu_derpo/max_memory_allocated_bytes"] = [memory[0].item()]
+                        metrics["actor/eu_derpo/max_memory_reserved_bytes"] = [memory[1].item()]
             finally:
                 self.tf_config.finalize_model_grads_func = original_finalize
             if self.router_shift_observer is not None and not self.config.router_shift_weighting.enabled:

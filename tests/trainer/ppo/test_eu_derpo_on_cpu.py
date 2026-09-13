@@ -57,6 +57,21 @@ class TestEUDERPOMath(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
             eu.validate_prompt_groups(torch.tensor([0, 0, 1]), 2)
 
+    def test_dp4_nonzero_rank_prompt_groups_use_local_remap(self):
+        groups = torch.arange(24, 36).repeat_interleave(8)
+        counts = eu.validate_prompt_groups(groups, 8)
+        self.assertEqual(groups.numel(), 96)
+        self.assertTrue(torch.equal(counts, torch.full((12,), 8)))
+
+    def test_dp4_reordered_or_incomplete_prompt_groups_fail_fast(self):
+        reordered = torch.arange(12).repeat_interleave(8)
+        reordered[[7, 8]] = reordered[[8, 7]]
+        with self.assertRaisesRegex(RuntimeError, "contiguous and ordered"):
+            eu.validate_prompt_groups(reordered, 8)
+        incomplete = torch.arange(12).repeat_interleave(8)[:-1]
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            eu.validate_prompt_groups(incomplete, 8)
+
     def test_expert_is_and_binary_tv_use_the_same_current_cluster(self):
         stats = eu.cluster_statistics(
             self.current, self.behavior, self.advantages, self.mask, self.routes, 3, 0.1

@@ -13,7 +13,7 @@ import torch.nn.functional as F
 def policy_prepass_tensors(
     log_probs: torch.Tensor, entropys: torch.Tensor, eu_derpo_enabled: bool
 ) -> dict[str, torch.Tensor]:
-    """Preserve legacy old-policy plumbing and add a non-aliased EU current-policy snapshot."""
+    """Preserve legacy three-logprob plumbing; actual F remains EU's current-policy authority."""
     tensors = {"old_log_probs": log_probs, "entropys": entropys}
     if eu_derpo_enabled:
         tensors["current_log_probs"] = log_probs.clone()
@@ -195,7 +195,12 @@ def validate_prompt_groups(prompt_group: torch.Tensor, rollout_n: int) -> torch.
     groups = prompt_group.detach().cpu().long()
     if groups.ndim != 1 or groups.numel() == 0 or rollout_n <= 0 or (groups < 0).any():
         raise RuntimeError("EU-DERPO prompt-group metadata is invalid")
-    counts = torch.bincount(groups)
+    local_groups = groups - groups[0]
+    unique = torch.unique_consecutive(local_groups)
+    expected = torch.arange(unique.numel(), dtype=torch.long)
+    if not torch.equal(unique, expected) or not torch.equal(local_groups, local_groups.sort().values):
+        raise RuntimeError("EU-DERPO prompt groups must be contiguous and ordered on each dense-DP rank")
+    counts = torch.bincount(local_groups)
     if (counts == 0).any() or not torch.all(counts == rollout_n):
         raise RuntimeError(f"EU-DERPO prompt groups are incomplete: counts={counts.tolist()}, rollout_n={rollout_n}")
     return counts
