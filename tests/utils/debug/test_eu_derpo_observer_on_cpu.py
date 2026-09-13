@@ -37,11 +37,14 @@ class TopKRouter(torch.nn.Module):
         self.topk = 8
         self.route_shift = 0
         self.routing_map_shift = 0
+        self.eval_route_shift = 0
 
     def gating(self, hidden):
         return torch.nn.functional.linear(hidden, self.weight)
 
     def routing(self, logits):
+        if not self.training and self.eval_route_shift:
+            logits = logits.roll(self.eval_route_shift, dims=-1)
         if self.route_shift:
             logits = logits.roll(self.route_shift, dims=-1)
         routes = logits.topk(self.topk, dim=-1).indices
@@ -151,11 +154,11 @@ class TestEUDERPOObserver(unittest.TestCase):
             else:
                 sys.modules[name] = module
 
-    def run_prepass(self):
+    def run_prepass(self, training=True):
         self.observer.start_prepass_batch()
         self.observer.begin_prepass_microbatch()
         previous_mode = self.model.training
-        self.model.eval()
+        self.model.train(training)
         with torch.no_grad():
             self.model(self.hidden.reshape(-1, 4))
         self.model.train(previous_mode)
@@ -169,8 +172,15 @@ class TestEUDERPOObserver(unittest.TestCase):
             router.route_shift = route_shift
             router.routing_map_shift = routing_map_shift
 
-    def run_main_backward(self, forward_shift=0, recompute_shift=0, recompute_map_shift=0, swap_cache=False):
-        self.run_prepass()
+    def run_main_backward(
+        self,
+        forward_shift=0,
+        recompute_shift=0,
+        recompute_map_shift=0,
+        swap_cache=False,
+        prepass_training=True,
+    ):
+        self.run_prepass(training=prepass_training)
         if swap_cache:
             self.observer.route_cache[17], self.observer.route_cache[23] = (
                 self.observer.route_cache[23],
@@ -257,7 +267,7 @@ class TestEUDERPOObserver(unittest.TestCase):
         self.assertTrue(all(not queue for queue in self.observer._pending_recompute))
         _, utility_count, metrics = self.finish_main()
         self.assertEqual(metrics["route_mismatch_count"], 0)
-        self.assertFalse(metrics["route_phase_execution"]["P"]["model_training"])
+        self.assertTrue(metrics["route_phase_execution"]["P"]["model_training"])
         self.assertFalse(metrics["route_phase_execution"]["P"]["grad_enabled"])
         self.assertTrue(metrics["route_phase_execution"]["F"]["model_training"])
         self.assertFalse(metrics["route_phase_execution"]["F"]["grad_enabled"])
@@ -296,6 +306,16 @@ class TestEUDERPOObserver(unittest.TestCase):
         self.assertIn("'sample_id': 17", message)
         self.assertIn("'response_token': 0", message)
         self.assertIn("'global_layer': 0", message)
+
+    def test_eval_mode_prepass_divergence_still_fails_fast(self):
+        for router in self.model.routers:
+            router.eval_route_shift = 1
+        self.run_main_backward(prepass_training=False)
+        with self.assertRaises(RuntimeError) as caught:
+            self.observer.finish_main_batch()
+        message = str(caught.exception)
+        self.assertNotIn("'prepass_forward_mismatch_count': 0", message)
+        self.assertIn("'forward_recompute_mismatch_count': 0", message)
 
     def test_forward_recompute_divergence_is_attributed_separately(self):
         self.run_main_backward(recompute_shift=1)

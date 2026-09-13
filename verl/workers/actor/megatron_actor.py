@@ -292,7 +292,11 @@ class MegatronPPOActor(BasePPOActor):
         """
         prev_modes = [m.training for m in self.actor_module]
         for module in self.actor_module:
-            module.eval()
+            if self.eu_derpo_observer is not None:
+                # Current-route prepass must match the actor-update execution path.
+                module.train()
+            else:
+                module.eval()
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
