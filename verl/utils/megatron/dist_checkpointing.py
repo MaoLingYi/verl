@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import queue
+import warnings
 
 import megatron.core
 import torch
@@ -34,21 +35,34 @@ _SYNC_DCP_COPY_AHEAD_BYTES = 64 * 1024**2
 _SYNC_DCP_BUCKET_BYTES = 256 * 1024**2
 
 
-def _planned_item_bytes(item):
+def _shape_bytes(shape, dtype):
+    size = 1
+    for dim in shape:
+        size *= dim
+    return size * torch._utils._element_size(dtype)
+
+
+def _global_logical_tensor_bytes(item):
     tensor_data = getattr(item, "tensor_data", None)
     if tensor_data is None:
         return 0
-    size = 1
-    for dim in tensor_data.size:
-        size *= dim
-    return size * torch._utils._element_size(tensor_data.properties.dtype)
+    return _shape_bytes(tensor_data.size, tensor_data.properties.dtype)
 
 
-def _planned_tensor_bytes(items):
+def _local_write_item_bytes(item):
+    tensor_data = getattr(item, "tensor_data", None)
+    if tensor_data is None:
+        return 0
+    chunk = getattr(tensor_data, "chunk", None)
+    local_shape = chunk.sizes if chunk is not None else tensor_data.size
+    return _shape_bytes(local_shape, tensor_data.properties.dtype)
+
+
+def _bucket_local_bytes(items):
     total = 0
     largest = 0
     for item in items:
-        size = _planned_item_bytes(item)
+        size = _local_write_item_bytes(item)
         total += size
         largest = max(largest, size)
     return total, largest
@@ -59,7 +73,7 @@ def _bounded_file_buckets(items, cap_bytes):
     bucket = []
     bucket_bytes = 0
     for item in items:
-        item_bytes = _planned_item_bytes(item)
+        item_bytes = _local_write_item_bytes(item)
         if bucket and bucket_bytes + item_bytes > cap_bytes:
             buckets.append(bucket)
             bucket = []
@@ -73,6 +87,41 @@ def _bounded_file_buckets(items, cap_bytes):
     if bucket:
         buckets.append(bucket)
     return buckets
+
+
+def _validate_bucket_accounting(bucket, bucket_index, cap_bytes, rank):
+    planned, largest = _bucket_local_bytes(bucket)
+    if planned <= cap_bytes or (len(bucket) == 1 and planned == largest):
+        return planned, largest
+    details = ";".join(
+        f"type={getattr(item, 'type', None)},"
+        f"global_logical_bytes={_global_logical_tensor_bytes(item)},"
+        f"local_chunk_bytes={_local_write_item_bytes(item)}"
+        for item in bucket
+    )
+    raise RuntimeError(
+        "CHECKPOINT_DCP_BUCKET_ACCOUNTING_INVALID "
+        f"rank={rank} bucket_index={bucket_index} bucket_cap_bytes={cap_bytes} "
+        f"bucket_local_planned_bytes={planned} largest_local_item_bytes={largest} "
+        f"item_count={len(bucket)} items=[{details}]"
+    )
+
+
+def _bucket_summary(items, buckets, cap_bytes):
+    local_sizes = [_local_write_item_bytes(item) for item in items]
+    total = sum(local_sizes)
+    oversize = sum(size > cap_bytes for size in local_sizes)
+    packable = sum(size for size in local_sizes if size <= cap_bytes)
+    estimated_min = oversize + (packable + cap_bytes - 1) // cap_bytes
+    bucket_sizes = [_bucket_local_bytes(bucket)[0] for bucket in buckets]
+    return {
+        "checkpoint_dcp_total_local_planned_bytes": total,
+        "checkpoint_dcp_bucket_count": len(buckets),
+        "checkpoint_dcp_avg_bucket_local_bytes": total // len(buckets) if buckets else 0,
+        "checkpoint_dcp_max_bucket_local_bytes": max(bucket_sizes, default=0),
+        "checkpoint_dcp_oversize_local_item_count": oversize,
+        "checkpoint_dcp_estimated_min_bucket_count": estimated_min,
+    }
 
 
 class _TelemetryFileSystemWriter(FileSystemWriter):
@@ -91,10 +140,13 @@ class _TelemetryFileSystemWriter(FileSystemWriter):
             return
         extra = {"checkpoint_copy_ahead_bytes": _SYNC_DCP_COPY_AHEAD_BYTES}
         if plan is not None:
-            total, largest = _planned_tensor_bytes(plan.items)
+            total, largest = _bucket_local_bytes(plan.items)
             extra.update(
-                checkpoint_planned_tensor_bytes=total,
-                checkpoint_largest_tensor_bytes=largest,
+                checkpoint_dcp_total_local_planned_bytes=total,
+                checkpoint_dcp_largest_local_item_bytes=largest,
+                checkpoint_dcp_item_global_logical_bytes=max(
+                    (_global_logical_tensor_bytes(item) for item in plan.items), default=0
+                ),
                 checkpoint_bucket_cap_bytes=_SYNC_DCP_BUCKET_BYTES,
                 checkpoint_streaming_tensor_target_bytes=(
                     _SYNC_DCP_BUCKET_BYTES + _SYNC_DCP_COPY_AHEAD_BYTES + largest
@@ -115,14 +167,30 @@ class _TelemetryFileSystemWriter(FileSystemWriter):
     def write_data(self, plan, planner):
         self._report("checkpoint_dcp_before_staging", plan)
         buckets = _bounded_file_buckets(plan.items, _SYNC_DCP_BUCKET_BYTES)
+        summary = _bucket_summary(plan.items, buckets, _SYNC_DCP_BUCKET_BYTES)
+        if self._stage_callback is not None:
+            self._stage_callback("checkpoint_dcp_bucket_summary", summary)
+        estimated_min = summary["checkpoint_dcp_estimated_min_bucket_count"]
+        rank = getattr(self, "rank", None)
+        if len(buckets) > max(estimated_min * 4, 128):
+            warnings.warn(
+                "CHECKPOINT_DCP_EXCESSIVE_BUCKET_COUNT "
+                f"rank={rank} bucket_count={len(buckets)} estimated_min_bucket_count={estimated_min}",
+                RuntimeWarning,
+            )
         results = []
         for index, bucket in enumerate(buckets):
-            planned, largest = _planned_tensor_bytes(bucket)
+            planned, largest = _validate_bucket_accounting(
+                bucket, index, _SYNC_DCP_BUCKET_BYTES, rank
+            )
             extra = {
                 "checkpoint_dcp_bucket_count": len(buckets),
                 "checkpoint_dcp_bucket_index": index,
-                "checkpoint_dcp_bucket_planned_bytes": planned,
-                "checkpoint_dcp_bucket_largest_tensor_bytes": largest,
+                "checkpoint_dcp_bucket_planned_local_bytes": planned,
+                "checkpoint_dcp_bucket_largest_local_item_bytes": largest,
+                "checkpoint_dcp_item_global_logical_bytes": max(
+                    (_global_logical_tensor_bytes(item) for item in bucket), default=0
+                ),
             }
             if self._stage_callback is not None:
                 self._stage_callback("checkpoint_dcp_before_bucket_write", extra)

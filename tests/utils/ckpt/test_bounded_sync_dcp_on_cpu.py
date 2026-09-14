@@ -7,6 +7,7 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.distributed.checkpoint import FileSystemWriter, load as torch_dist_load, save as torch_dist_save
 
@@ -14,51 +15,105 @@ from torch.distributed.checkpoint import FileSystemWriter, load as torch_dist_lo
 SOURCE = Path(__file__).resolve().parents[3] / "verl" / "utils" / "megatron" / "dist_checkpointing.py"
 
 
-def test_planned_tensor_bytes_uses_real_plan_shapes_and_dtypes():
+def _item(name, global_shape, local_shape, dtype=1, item_type="SHARD"):
+    return SimpleNamespace(
+        name=name,
+        type=item_type,
+        tensor_data=SimpleNamespace(
+            size=global_shape,
+            chunk=SimpleNamespace(sizes=local_shape),
+            properties=SimpleNamespace(dtype=dtype),
+        ),
+    )
+
+
+def _accounting_functions(*names):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    functions = [
+    wanted = {
+        "_shape_bytes", "_global_logical_tensor_bytes", "_local_write_item_bytes",
+        "_bucket_local_bytes", "_bounded_file_buckets", "_validate_bucket_accounting",
+        "_bucket_summary",
+    }
+    namespace = {"torch": SimpleNamespace(_utils=SimpleNamespace(_element_size=lambda dtype: dtype))}
+    nodes = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"_planned_item_bytes", "_planned_tensor_bytes"}
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
-    namespace = {"torch": SimpleNamespace(_utils=SimpleNamespace(_element_size=lambda dtype: dtype))}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return tuple(namespace[name] for name in names)
+
+
+def test_local_write_bytes_use_chunk_extent_not_global_logical_shape():
+    global_bytes, local_bytes, bucket_bytes = _accounting_functions(
+        "_global_logical_tensor_bytes", "_local_write_item_bytes", "_bucket_local_bytes"
+    )
     items = [
-        SimpleNamespace(tensor_data=SimpleNamespace(size=(2, 3), properties=SimpleNamespace(dtype=4))),
-        SimpleNamespace(tensor_data=SimpleNamespace(size=(5,), properties=SimpleNamespace(dtype=2))),
+        _item("huge_global_small_shard", (128, 4096, 4096), (1, 128, 128), dtype=2),
+        _item("ordinary", (5,), (5,), dtype=2, item_type="TENSOR"),
         SimpleNamespace(tensor_data=None),
     ]
-    assert namespace["_planned_tensor_bytes"](items) == (34, 24)
+    assert global_bytes(items[0]) == 128 * 4096 * 4096 * 2
+    assert local_bytes(items[0]) == 1 * 128 * 128 * 2
+    assert bucket_bytes(items) == (1 * 128 * 128 * 2 + 10, 1 * 128 * 128 * 2)
 
 
 def test_file_buckets_respect_cap_and_isolate_oversize_tensor():
-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_planned_item_bytes", "_bounded_file_buckets"}
-    ]
-    namespace = {"torch": SimpleNamespace(_utils=SimpleNamespace(_element_size=lambda dtype: dtype))}
-    exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    buckets_for = _accounting_functions("_bounded_file_buckets")[0]
     items = [
-        SimpleNamespace(name=name, tensor_data=SimpleNamespace(size=(size,), properties=SimpleNamespace(dtype=1)))
+        _item(name, (4096, 4096), (size,))
         for name, size in (("a", 60), ("b", 40), ("c", 70), ("large", 250), ("d", 30))
     ]
-    buckets = namespace["_bounded_file_buckets"](items, 100)
+    buckets = buckets_for(items, 100)
 
     assert [[item.name for item in bucket] for bucket in buckets] == [
         ["a", "b"], ["c"], ["large"], ["d"]
     ]
     for bucket in buckets:
-        size = sum(item.tensor_data.size[0] for item in bucket)
+        size = sum(item.tensor_data.chunk.sizes[0] for item in bucket)
         assert size <= 100 or (len(bucket) == 1 and size > 100)
+
+
+def test_large_global_small_local_shards_pack_together():
+    buckets_for, bucket_bytes = _accounting_functions("_bounded_file_buckets", "_bucket_local_bytes")
+    cap = 256 * 1024**2
+    items = [_item(str(index), (128, 4096, 4096), (1, 128, 128), dtype=2) for index in range(8)]
+    buckets = buckets_for(items, cap)
+
+    assert len(buckets) == 1
+    assert bucket_bytes(buckets[0])[0] == 8 * 1 * 128 * 128 * 2
+
+
+def test_real_local_shard_over_256mib_is_a_singleton_bucket():
+    buckets_for, bucket_bytes = _accounting_functions("_bounded_file_buckets", "_bucket_local_bytes")
+    cap = 256 * 1024**2
+    items = [
+        _item("small_a", (128, 4096, 4096), (1024,), dtype=2),
+        _item("oversize", (128, 4096, 4096), (140 * 1024**2,), dtype=2),
+        _item("small_b", (128, 4096, 4096), (1024,), dtype=2),
+    ]
+    buckets = buckets_for(items, cap)
+
+    assert [[item.name for item in bucket] for bucket in buckets] == [["small_a"], ["oversize"], ["small_b"]]
+    assert bucket_bytes(buckets[1])[0] == 280 * 1024**2
+
+
+def test_bucket_accounting_guard_rejects_non_singleton_over_cap():
+    validate = _accounting_functions("_validate_bucket_accounting")[0]
+    items = [_item("a", (100,), (60,)), _item("b", (100,), (60,))]
+
+    with pytest.raises(RuntimeError, match="CHECKPOINT_DCP_BUCKET_ACCOUNTING_INVALID") as error:
+        validate(items, bucket_index=3, cap_bytes=100, rank=7)
+    assert "rank=7 bucket_index=3 bucket_cap_bytes=100" in str(error.value)
+    assert "global_logical_bytes=100,local_chunk_bytes=60" in str(error.value)
 
 
 def test_writer_finishes_each_file_bucket_before_starting_the_next():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     wanted = {
-        "_planned_item_bytes", "_planned_tensor_bytes", "_bounded_file_buckets",
+        "_shape_bytes", "_global_logical_tensor_bytes", "_local_write_item_bytes",
+        "_bucket_local_bytes", "_bounded_file_buckets", "_validate_bucket_accounting",
+        "_bucket_summary",
         "_TelemetryFileSystemWriter",
     }
     nodes = [
@@ -97,11 +152,12 @@ def test_writer_finishes_each_file_bucket_before_starting_the_next():
         "_SYNC_DCP_COPY_AHEAD_BYTES": 64,
         "_SYNC_DCP_BUCKET_BYTES": 100,
         "queue": __import__("queue"),
+        "warnings": warnings,
         "torch": fake_torch,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
     items = [
-        SimpleNamespace(name=name, tensor_data=SimpleNamespace(size=(size,), properties=SimpleNamespace(dtype=1)))
+        _item(name, (4096, 4096), (size,))
         for name, size in (("a", 60), ("b", 40), ("c", 70), ("large", 250), ("d", 30))
     ]
     events = []
@@ -115,14 +171,26 @@ def test_writer_finishes_each_file_bucket_before_starting_the_next():
     assert result.wait() == ["__0_0.distcp", "__0_1.distcp", "__0_2.distcp", "__0_3.distcp"]
     before = [extra for stage, extra in events if stage == "checkpoint_dcp_before_bucket_write"]
     after = [extra for stage, extra in events if stage == "checkpoint_dcp_after_bucket_write"]
+    summary = next(extra for stage, extra in events if stage == "checkpoint_dcp_bucket_summary")
     assert [item["checkpoint_dcp_bucket_index"] for item in before] == [0, 1, 2, 3]
+    assert [item["checkpoint_dcp_bucket_planned_local_bytes"] for item in before] == [100, 70, 250, 30]
     assert before == after
+    assert summary == {
+        "checkpoint_dcp_total_local_planned_bytes": 450,
+        "checkpoint_dcp_bucket_count": 4,
+        "checkpoint_dcp_avg_bucket_local_bytes": 112,
+        "checkpoint_dcp_max_bucket_local_bytes": 250,
+        "checkpoint_dcp_oversize_local_item_count": 1,
+        "checkpoint_dcp_estimated_min_bucket_count": 3,
+    }
 
 
 def test_bounded_strategy_uses_single_thread_streaming_writer_and_mcore_planner(monkeypatch):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     wanted = {
-        "_planned_item_bytes", "_planned_tensor_bytes", "_bounded_file_buckets",
+        "_shape_bytes", "_global_logical_tensor_bytes", "_local_write_item_bytes",
+        "_bucket_local_bytes", "_bounded_file_buckets", "_validate_bucket_accounting",
+        "_bucket_summary",
         "_TelemetryFileSystemWriter", "_bounded_sync_torch_dist_strategy",
     }
     nodes = [
@@ -159,6 +227,7 @@ def test_bounded_strategy_uses_single_thread_streaming_writer_and_mcore_planner(
         "_SYNC_DCP_COPY_AHEAD_BYTES": 64 * 1024**2,
         "_SYNC_DCP_BUCKET_BYTES": 256 * 1024**2,
         "queue": __import__("queue"),
+        "warnings": warnings,
         "torch": SimpleNamespace(_utils=SimpleNamespace(_element_size=lambda _: 4)),
         "torch_dist_save": lambda state, **kwargs: events.append(("save", state, kwargs)),
     }
@@ -188,7 +257,9 @@ def test_bounded_writer_produces_a_loadable_dcp(tmp_path):
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.ClassDef))
         and node.name in {
-            "_planned_item_bytes", "_planned_tensor_bytes", "_bounded_file_buckets",
+            "_shape_bytes", "_global_logical_tensor_bytes", "_local_write_item_bytes",
+            "_bucket_local_bytes", "_bounded_file_buckets", "_validate_bucket_accounting",
+            "_bucket_summary",
             "_TelemetryFileSystemWriter",
         }
     ]
@@ -198,6 +269,7 @@ def test_bounded_writer_produces_a_loadable_dcp(tmp_path):
         "_SYNC_DCP_COPY_AHEAD_BYTES": 64 * 1024**2,
         "_SYNC_DCP_BUCKET_BYTES": 20,
         "queue": __import__("queue"),
+        "warnings": warnings,
         "torch": torch,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
