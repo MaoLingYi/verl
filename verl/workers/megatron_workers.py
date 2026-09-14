@@ -58,12 +58,13 @@ from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_con
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
+    megatron_model_cpu_data_bytes,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
     per_tensor_generator,
     register_megatron_training_hooks,
 )
-from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.memory_utils import aggressive_empty_cache, log_eu_derpo_memory
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
     DistProfiler,
@@ -672,12 +673,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 override_transformer_config=override_transformer_config,
                 override_ddp_config=override_ddp_config,
             )
+            if self.config.actor.eu_derpo.enabled:
+                log_eu_derpo_memory("after_optimizer_construction", self.actor_optimizer)
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+            if self.config.actor.eu_derpo.enabled:
+                log_eu_derpo_memory(
+                    "after_phase_offload_init",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                )
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
@@ -824,12 +833,25 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        eu_enabled = self.config.actor.eu_derpo.enabled
+        if eu_enabled:
+            log_eu_derpo_memory(
+                "before_actor_update",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+            )
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        if eu_enabled:
+            log_eu_derpo_memory(
+                "after_actor_load",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+            )
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -861,6 +883,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        if eu_enabled:
+            log_eu_derpo_memory(
+                "after_actor_phase_offload",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+            )
 
         aggressive_empty_cache(force_sync=True)
         return output

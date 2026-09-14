@@ -27,6 +27,153 @@ from verl.utils.device import get_torch_device, is_cuda_available
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_GIB = 1024**3
+
+
+def _parse_proc_kib(text: str) -> dict[str, int]:
+    """Parse kB-valued /proc records without adding a process dependency."""
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].endswith(":"):
+            try:
+                values[fields[0][:-1]] = int(fields[1]) * 1024
+            except ValueError:
+                pass
+    return values
+
+
+def _read_proc_kib(path: str) -> dict[str, int]:
+    try:
+        with open(path, encoding="ascii") as stream:
+            return _parse_proc_kib(stream.read())
+    except OSError:
+        return {}
+
+
+def _read_cgroup_memory():
+    for current_path, max_path in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            current = int(Path(current_path).read_text(encoding="ascii").strip())
+            maximum_text = Path(max_path).read_text(encoding="ascii").strip()
+            maximum = None if maximum_text == "max" else int(maximum_text)
+            return current, maximum
+        except (OSError, ValueError):
+            continue
+    return None, None
+
+
+def _storage_key_and_bytes(tensor: torch.Tensor):
+    storage = tensor.untyped_storage()
+    return (tensor.device.type, tensor.device.index, storage.data_ptr()), storage.nbytes()
+
+
+def estimate_hdo_memory(optimizer) -> dict[str, int]:
+    """Estimate materialized and first-step HDO tensor bytes from its real groups."""
+    result = {
+        "hdo_cpu_master_bytes": 0,
+        "hdo_cpu_exp_avg_bytes": 0,
+        "hdo_cpu_exp_avg_sq_bytes": 0,
+        "hdo_cpu_grad_bytes": 0,
+        "hdo_cpu_other_bytes": 0,
+        "hdo_gpu_master_bytes": 0,
+        "hdo_gpu_exp_avg_bytes": 0,
+        "hdo_gpu_exp_avg_sq_bytes": 0,
+        "hdo_gpu_other_bytes": 0,
+        "hdo_cpu_estimated_bytes": 0,
+        "hdo_gpu_estimated_bytes": 0,
+        "hdo_full_cpu_estimated_bytes": 0,
+        "hdo_partial_cpu_savings_estimated_bytes": 0,
+        "hdo_gpu_incremental_state_estimated_bytes": 0,
+        "hdo_cpu_param_numel": 0,
+        "hdo_gpu_param_numel": 0,
+        "hdo_realized_offload_fraction": 0.0,
+    }
+    outers = getattr(optimizer, "chained_optimizers", (optimizer,))
+    seen: set[tuple] = set()
+
+    def add(name, tensor):
+        if not isinstance(tensor, torch.Tensor):
+            return
+        key, size = _storage_key_and_bytes(tensor)
+        if key not in seen:
+            seen.add(key)
+            result[name] += size
+
+    for outer in outers:
+        hdo = getattr(outer, "optimizer", None)
+        if not all(hasattr(hdo, attr) for attr in ("sub_optimizers", "param_to_inner_param")):
+            continue
+        inner_params = set(hdo.param_to_inner_param.values())
+        for param in inner_params:
+            device = "gpu" if param.device.type == "cuda" else param.device.type
+            add(f"hdo_{device}_master_bytes", param)
+        for param in getattr(hdo, "cpu_copy_map_grad", {}).values():
+            add("hdo_cpu_grad_bytes", param)
+        for sub_optimizer in hdo.sub_optimizers:
+            for state in sub_optimizer.state.values():
+                for name, tensor in state.items():
+                    if name == "master_param":
+                        continue
+                    device = "gpu" if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda" else "cpu"
+                    field = name if name in ("exp_avg", "exp_avg_sq") else "other"
+                    add(f"hdo_{device}_{field}_bytes", tensor)
+
+        # CPUAdam/FusedAdam lazily create FP32 grad and two FP32 moments. Use the
+        # actual selected inner params, so tensor-boundary fraction overshoot is included.
+        cpu_selected = set(getattr(hdo, "gpu_params_map_cpu_copy", {}).values())
+        cpu_numel = sum(param.numel() for param in cpu_selected)
+        gpu_numel = sum(param.numel() for param in inner_params - cpu_selected)
+        result["hdo_cpu_param_numel"] += cpu_numel
+        result["hdo_gpu_param_numel"] += gpu_numel
+        result["hdo_cpu_estimated_bytes"] += cpu_numel * 16
+        result["hdo_gpu_estimated_bytes"] += gpu_numel * 12
+    total_numel = result["hdo_cpu_param_numel"] + result["hdo_gpu_param_numel"]
+    if total_numel:
+        result["hdo_realized_offload_fraction"] = result["hdo_cpu_param_numel"] / total_numel
+        result["hdo_full_cpu_estimated_bytes"] = total_numel * 16
+        result["hdo_partial_cpu_savings_estimated_bytes"] = result["hdo_gpu_param_numel"] * 16
+        result["hdo_gpu_incremental_state_estimated_bytes"] = result["hdo_gpu_param_numel"] * 8
+    return result
+
+
+def log_eu_derpo_memory(stage: str, optimizer=None, phase_model_cpu_backing_bytes: int = 0) -> dict:
+    """Emit one non-collective process/node/GPU memory record per caller rank."""
+    status = _read_proc_kib("/proc/self/status")
+    rollup = _read_proc_kib("/proc/self/smaps_rollup")
+    meminfo = _read_proc_kib("/proc/meminfo")
+    cgroup_current, cgroup_max = _read_cgroup_memory()
+    device = get_torch_device()
+    gpu = device.is_available()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    values = {
+        "stage": stage,
+        "rank": rank,
+        "rss_gib": status.get("VmRSS", rollup.get("Rss", 0)) / _GIB,
+        "pss_gib": rollup.get("Pss", status.get("VmRSS", 0)) / _GIB,
+        "rss_anon_gib": status.get("RssAnon", 0) / _GIB,
+        "rss_file_gib": status.get("RssFile", 0) / _GIB,
+        "private_clean_gib": rollup.get("Private_Clean", 0) / _GIB,
+        "private_dirty_gib": rollup.get("Private_Dirty", 0) / _GIB,
+        "mem_available_gib": meminfo.get("MemAvailable", 0) / _GIB,
+        "cgroup_current_gib": None if cgroup_current is None else cgroup_current / _GIB,
+        "cgroup_max_gib": None if cgroup_max is None else cgroup_max / _GIB,
+        "cuda_allocated_gib": device.memory_allocated() / _GIB if gpu else 0.0,
+        "cuda_reserved_gib": device.memory_reserved() / _GIB if gpu else 0.0,
+        "cuda_max_allocated_gib": device.max_memory_allocated() / _GIB if gpu else 0.0,
+        "cuda_max_reserved_gib": device.max_memory_reserved() / _GIB if gpu else 0.0,
+        "phase_model_cpu_backing_gib": phase_model_cpu_backing_bytes / _GIB,
+    }
+    values.update(
+        {key.replace("_bytes", "_gib"): value / _GIB if key.endswith("_bytes") else value
+         for key, value in estimate_hdo_memory(optimizer).items()}
+    )
+    logger.warning("EU-DERPO memory: %s", " ".join(f"{key}={value}" for key, value in values.items()))
+    return values
+
 
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:
     """

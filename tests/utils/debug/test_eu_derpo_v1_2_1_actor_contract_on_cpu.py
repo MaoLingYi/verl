@@ -9,6 +9,7 @@ ROOT = Path(__file__).parents[3]
 ACTOR = ROOT / "verl" / "workers" / "actor" / "megatron_actor.py"
 OBSERVER = ROOT / "verl" / "utils" / "debug" / "eu_derpo.py"
 CONFIG = ROOT / "verl" / "workers" / "config" / "actor.py"
+OPTIMIZER = ROOT / "verl" / "utils" / "megatron" / "optimizer.py"
 
 
 def function_source(path: Path, name: str) -> str:
@@ -21,11 +22,17 @@ def function_source(path: Path, name: str) -> str:
 
 
 class TestEUDERPOV121ActorContract(unittest.TestCase):
-    def test_actor_requires_native_hdo_full_cpu_offload(self):
+    def test_actor_requires_native_hdo_partial_cpu_offload(self):
         source = ACTOR.read_text(encoding="utf-8")
         self.assertIn('optimizer_override.get("optimizer_cpu_offload") is not True', source)
-        self.assertIn('optimizer_override.get("optimizer_offload_fraction") != 1.0', source)
-        self.assertIn("optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=1.0", source)
+        self.assertIn('optimizer_override.get("optimizer_offload_fraction") != 0.75', source)
+        self.assertIn("optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75", source)
+
+    def test_optimizer_override_is_passed_to_mcore_optimizer_config(self):
+        source = function_source(OPTIMIZER, "init_megatron_optim_config")
+        self.assertIn("for k, v in override_config.items()", source)
+        self.assertIn("optim_args[k] = v", source)
+        self.assertLess(source.index("optim_args[k] = v"), source.index("OptimizerConfig(**optim_args)"))
 
     def test_update_policy_has_no_full_auxiliary_forward(self):
         source = function_source(ACTOR, "update_policy")

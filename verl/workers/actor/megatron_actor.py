@@ -62,6 +62,7 @@ from verl.utils.debug.router_shift import RouterShiftObserver, clear_router_shif
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.logger import print_rank_0
+from verl.utils.memory_utils import log_eu_derpo_memory
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -249,14 +250,14 @@ class MegatronPPOActor(BasePPOActor):
                 ),
                 "native_hdo_cpu_offload": (
                     optimizer_override.get("optimizer_cpu_offload") is not True
-                    or optimizer_override.get("optimizer_offload_fraction") != 1.0
+                    or optimizer_override.get("optimizer_offload_fraction") != 0.75
                 ),
             }
             enabled_conflicts = [name for name, enabled in conflicts.items() if enabled]
             if enabled_conflicts:
                 raise ValueError(f"EU-DERPO V1.2.1 incompatible actor settings: {enabled_conflicts}")
             print_rank_0(
-                "EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=1.0"
+                "EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75"
             )
             self.eu_derpo_observer = EUDERPOObserver(
                 [unwrap_model(model) for model in self.actor_module],
@@ -1100,6 +1101,13 @@ class MegatronPPOActor(BasePPOActor):
                     mini_batch_size=self.config.ppo_mini_batch_size,
                 )
                 if self.eu_derpo_observer is not None:
+                    for memory_stage in (
+                        "after_actual_f",
+                        "after_main_backward",
+                        "after_native_finalize",
+                        "after_eu_cache_complete",
+                    ):
+                        log_eu_derpo_memory(memory_stage, self.actor_optimizer)
                     main_finished = time.perf_counter()
                     utility_sum, utility_sum_sq, utility_count, eu_metrics = self.eu_derpo_observer.finish_main_batch()
                     aggregation_started = time.perf_counter()
@@ -1149,6 +1157,7 @@ class MegatronPPOActor(BasePPOActor):
                         utility_cfg.lambda_u,
                         self._eu_derpo_optimizer_generation,
                     )
+                    log_eu_derpo_memory("after_step_e", self.actor_optimizer)
                     auxiliary_objective = torch.tensor(
                         auxiliary_metrics["utility_objective"], dtype=torch.float32, device=get_device_id()
                     )
@@ -1299,8 +1308,10 @@ class MegatronPPOActor(BasePPOActor):
                 self.eu_derpo_observer.validate_before_optimizer_step(
                     self._eu_derpo_optimizer_generation
                 )
+                log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             if self.eu_derpo_observer is not None:
+                log_eu_derpo_memory("after_optimizer_step", self.actor_optimizer)
                 eu_optimizer_steps += 1
                 self._eu_derpo_optimizer_generation += 1
                 cleanup_metrics = self.eu_derpo_observer.finish_optimizer_step(

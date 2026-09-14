@@ -505,6 +505,24 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
     get_torch_device().empty_cache()
 
 
+def megatron_model_cpu_data_bytes(models):
+    seen = set()
+    total = 0
+    for model_chunk in models:
+        if not isinstance(model_chunk, DDP):
+            continue
+        for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                cpu_data = getattr(buffer.param_data, "cpu_data", None)
+                if cpu_data is None:
+                    continue
+                key, size = cpu_data.untyped_storage().data_ptr(), cpu_data.untyped_storage().nbytes()
+                if key not in seen:
+                    seen.add(key)
+                    total += size
+    return total
+
+
 @torch.no_grad()
 def offload_megatron_copy_params(optimizers):
     """
