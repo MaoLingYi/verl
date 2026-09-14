@@ -224,9 +224,10 @@ class MegatronPPOActor(BasePPOActor):
                 [unwrap_model(model) for model in self.actor_module], self.tf_config
             )
         self.eu_derpo_observer = None
+        self._eu_derpo_optimizer_generation = 0
         if self.config.eu_derpo.enabled:
             if float(self.actor_optimizer.get_loss_scale().item()) != 1.0:
-                raise ValueError("EU-DERPO V1.2 alpha sensitivity requires unit BF16 loss scale")
+                raise ValueError("EU-DERPO V1.2.1 alpha sensitivity requires unit BF16 loss scale")
             optimizer_override = self.config.optim.override_optimizer_config or {}
             conflicts = {
                 "router_replay": self.config.router_replay.mode != "disabled",
@@ -252,12 +253,13 @@ class MegatronPPOActor(BasePPOActor):
             }
             enabled_conflicts = [name for name, enabled in conflicts.items() if enabled]
             if enabled_conflicts:
-                raise ValueError(f"EU-DERPO V1.2 incompatible actor settings: {enabled_conflicts}")
+                raise ValueError(f"EU-DERPO V1.2.1 incompatible actor settings: {enabled_conflicts}")
             self.eu_derpo_observer = EUDERPOObserver(
                 [unwrap_model(model) for model in self.actor_module],
                 self.tf_config,
                 diagnostics=self.config.eu_derpo.routing_utility.diagnostics,
                 route_attribution=self.config.eu_derpo.route_attribution,
+                staging_mib=self.config.eu_derpo.staging_mib,
             )
 
         config = get_model_config(self.actor_module[0])
@@ -484,7 +486,7 @@ class MegatronPPOActor(BasePPOActor):
             validate_prompt_groups(data.batch["eu_derpo_prompt_group"], rollout_n)
             if yielded != 1:
                 raise RuntimeError(
-                    "EU-DERPO V1.2 F-single-source implementation requires one actual optimizer mini-step; "
+                    "EU-DERPO V1.2.1 F-single-source implementation requires one actual optimizer mini-step; "
                     f"expanded_batch={len(data)}, normalized_mini_batch={self.config.ppo_mini_batch_size}, "
                     f"ppo_epochs={self.config.ppo_epochs}, yielded={yielded}"
                 )
@@ -1038,7 +1040,15 @@ class MegatronPPOActor(BasePPOActor):
                     raise RuntimeError(f"EU-DERPO missing required DataProto fields: {sorted(missing)}")
                 sample_ids = data.batch["eu_derpo_sample_ids"].cpu()
                 self.eu_derpo_observer.start_main_batch(
-                    sample_ids, data.batch["eu_derpo_prompt_group"].cpu()
+                    sample_ids,
+                    data.batch["eu_derpo_prompt_group"].cpu(),
+                    data.batch["attention_mask"].cpu(),
+                    data.batch["response_mask"].cpu(),
+                    data.batch["responses"].shape[1],
+                    self._eu_derpo_optimizer_generation,
+                )
+                self.tf_config.finalize_model_grads_func = self.eu_derpo_observer.wrap_native_finalize(
+                    original_finalize
                 )
                 eu_state = sample_ids
             if self.config.router_shift_weighting.enabled:
@@ -1126,20 +1136,15 @@ class MegatronPPOActor(BasePPOActor):
                         utility_cfg.min_group_size,
                         utility_cfg.min_std,
                     )
-                    self.eu_derpo_observer.start_aux_batch(
-                        sample_ids, stats_eu, normalized, active_total, utility_cfg.lambda_u
-                    )
                     auxiliary_started = time.perf_counter()
-                    with torch.no_grad():
-                        auxiliary_output = self.forward_backward_batch(
-                            data,
-                            forward_only=True,
-                            calculate_entropy=False,
-                            use_dynamic_bsz=False,
-                            micro_batch_size=micro_batch_size,
-                            mini_batch_size=self.config.ppo_mini_batch_size,
-                        )
-                    auxiliary_metrics = self.eu_derpo_observer.finish_aux_batch()
+                    auxiliary_metrics = self.eu_derpo_observer.run_router_only_step_e(
+                        sample_ids,
+                        stats_eu,
+                        normalized,
+                        active_total,
+                        utility_cfg.lambda_u,
+                        self._eu_derpo_optimizer_generation,
+                    )
                     auxiliary_objective = torch.tensor(
                         auxiliary_metrics["utility_objective"], dtype=torch.float32, device=get_device_id()
                     )
@@ -1166,7 +1171,13 @@ class MegatronPPOActor(BasePPOActor):
                         objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
                     ]
                     for key, value in (eu_metrics | auxiliary_metrics).items():
-                        if key in {"layer_mismatch_count", "gradient_hook_count_by_layer", "utility_edge_count_by_layer"}:
+                        if key in {
+                            "layer_mismatch_count",
+                            "gradient_hook_count_by_layer",
+                            "utility_edge_count_by_layer",
+                            "aux_reduce_count_by_layer",
+                            "main_grad_add_count_by_layer",
+                        }:
                             for layer, count in enumerate(value):
                                 metrics[f"actor/eu_derpo/{key}_{layer}"] = [count]
                         elif not isinstance(value, list):
@@ -1249,7 +1260,7 @@ class MegatronPPOActor(BasePPOActor):
                             max(0.0, main_total_seconds - main_forward_seconds)
                         ]
                         metrics["actor/eu_derpo/timing_main_forward_backward_s"] = [main_total_seconds]
-                        metrics["actor/eu_derpo/timing_aux_forward_s"] = [auxiliary_output["model_forward_seconds"]]
+                        metrics["actor/eu_derpo/timing_aux_forward_s"] = [0.0]
                         metrics["actor/eu_derpo/timing_aux_router_s"] = [time.perf_counter() - auxiliary_started]
                         memory = torch.tensor(
                             [get_torch_device().max_memory_allocated(), get_torch_device().max_memory_reserved()],
@@ -1280,9 +1291,19 @@ class MegatronPPOActor(BasePPOActor):
                 # Note that o[0] is metrics, o[1] is entropy, o[2] is response_mask
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
+            if self.eu_derpo_observer is not None:
+                self.eu_derpo_observer.validate_before_optimizer_step(
+                    self._eu_derpo_optimizer_generation
+                )
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             if self.eu_derpo_observer is not None:
                 eu_optimizer_steps += 1
+                self._eu_derpo_optimizer_generation += 1
+                cleanup_metrics = self.eu_derpo_observer.finish_optimizer_step(
+                    self._eu_derpo_optimizer_generation
+                )
+                for key, value in cleanup_metrics.items():
+                    metrics[f"actor/eu_derpo/{key}"] = [value]
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 

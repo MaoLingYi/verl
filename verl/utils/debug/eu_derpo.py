@@ -1,10 +1,11 @@
-"""Memory-safe Megatron observer for frozen EU-DERPO V1.2."""
+"""Memory-safe Megatron observer for frozen EU-DERPO V1.2.1."""
 
 from __future__ import annotations
 
 from collections import deque
 from functools import wraps
 import os
+import time
 from types import MethodType
 
 import torch
@@ -15,6 +16,133 @@ from verl.trainer.ppo.eu_derpo import (
     validate_recompute_hook_count,
 )
 from verl.utils.debug.router_shift import RouterShiftObserver
+
+
+GIB = 1024**3
+HOST_RAM_SAFETY_MARGIN_BYTES = 32 * GIB
+
+
+def _selected_support_loss(logits, support, coefficient, lambda_u):
+    """Return -lambda*J_U and J_U on the fixed actual-F selected support."""
+    flat = logits.reshape(-1, logits.shape[-1])
+    ids = support.to(device=flat.device, dtype=torch.long)
+    weights = coefficient.detach().to(device=flat.device, dtype=torch.float32)
+    if ids.shape != weights.shape or ids.shape[0] != flat.shape[0]:
+        raise RuntimeError(
+            f"EU-DERPO Step E shape mismatch: logits={tuple(flat.shape)}, "
+            f"support={tuple(ids.shape)}, coefficient={tuple(weights.shape)}"
+        )
+    selected_logits = flat.gather(-1, ids)
+    log_q = selected_logits.float().log_softmax(-1)
+    objective = (weights * log_q).sum()
+    return -float(lambda_u) * objective, objective
+
+
+def _cache_byte_plan(rows, layers, hidden_size, topk):
+    rows, layers, hidden_size, topk = map(int, (rows, layers, hidden_size, topk))
+    return {
+        "hidden": rows * layers * hidden_size * 2,
+        "support": rows * layers * topk,
+        "metadata": rows * (8 + 4 + 4),
+    }
+
+
+def _staging_chunk_rows(staging_mib, hidden_size, topk):
+    bytes_per_row = int(hidden_size) * 2 + int(topk) + int(topk) * 4
+    rows = int(staging_mib) * 1024**2 // bytes_per_row
+    if rows < 1:
+        raise ValueError("EU-DERPO Step E staging cap cannot hold one row")
+    return rows
+
+
+def _node_ram_decision(required_by_rank, mem_available, safety_margin):
+    node_required = sum(int(value) for value in required_by_rank)
+    mem_available = int(mem_available)
+    safety_margin = int(safety_margin)
+    return {
+        "required_by_rank": [int(value) for value in required_by_rank],
+        "node_required": node_required,
+        "mem_available": mem_available,
+        "safety_margin": safety_margin,
+        "passed": mem_available >= node_required + safety_margin,
+    }
+
+
+def _read_mem_available():
+    with open("/proc/meminfo", encoding="ascii") as stream:
+        for line in stream:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("EU-DERPO cannot read MemAvailable from /proc/meminfo")
+
+
+def _plan_local_response_rows(attention_mask, response_mask, sample_ids, response_length, tp_size, tp_rank):
+    """Plan MB1 sequence-parallel valid-response rows without allocating hidden cache."""
+    attention = attention_mask.detach().cpu().bool()
+    response = response_mask.detach().cpu().bool()
+    ids = sample_ids.detach().cpu().long().reshape(-1)
+    batch, sequence = attention.shape
+    if response.shape != (batch, int(response_length)) or ids.numel() != batch:
+        raise RuntimeError("EU-DERPO cache planner received inconsistent batch shapes")
+    if len(set(ids.tolist())) != batch:
+        raise RuntimeError("EU-DERPO cache planner received duplicate sample IDs")
+    if not 0 <= int(tp_rank) < int(tp_size):
+        raise RuntimeError("EU-DERPO cache planner received invalid TP rank")
+
+    planned = []
+    spans = {}
+    cursor = 0
+    response_start = sequence - int(response_length) - 1
+    if response_start < 0:
+        raise RuntimeError("EU-DERPO response does not fit padded sequence")
+    for sample_row, sample_id in enumerate(ids.tolist()):
+        full_valid = torch.zeros(sequence, dtype=torch.bool)
+        full_position = torch.full((sequence,), -1, dtype=torch.int32)
+        full_valid[response_start : sequence - 1] = response[sample_row]
+        full_position[response_start : sequence - 1] = torch.arange(response_length, dtype=torch.int32)
+        packed_valid = full_valid[attention[sample_row]]
+        packed_position = full_position[attention[sample_row]]
+        padded_length = ((packed_valid.numel() + tp_size - 1) // tp_size) * tp_size
+        local_length = padded_length // tp_size
+        local_start = tp_rank * local_length
+        local_end = local_start + local_length
+        if padded_length > packed_valid.numel():
+            padding = padded_length - packed_valid.numel()
+            packed_valid = torch.nn.functional.pad(packed_valid, (0, padding), value=False)
+            packed_position = torch.nn.functional.pad(packed_position, (0, padding), value=-1)
+        positions = packed_position[local_start:local_end][packed_valid[local_start:local_end]]
+        start, end = cursor, cursor + positions.numel()
+        spans[int(sample_id)] = (start, end)
+        cursor = end
+        planned.append((sample_row, sample_id, positions))
+
+    sample_row_table = torch.empty(cursor, dtype=torch.int32)
+    sample_id_table = torch.empty(cursor, dtype=torch.int64)
+    response_position_table = torch.empty(cursor, dtype=torch.int32)
+    for sample_row, sample_id, positions in planned:
+        start, end = spans[int(sample_id)]
+        sample_row_table[start:end] = sample_row
+        sample_id_table[start:end] = sample_id
+        response_position_table[start:end] = positions
+    return {
+        "rows": cursor,
+        "spans": spans,
+        "sample_row": sample_row_table,
+        "sample_id": sample_id_table,
+        "response_position": response_position_table,
+    }
+
+
+def _build_edge_coefficients(stats, normalized, active_total, sample_rows, layer, support, batch_size):
+    rows = sample_rows.long()
+    ids = support.long()
+    count = stats.count[rows, layer].gather(1, ids)
+    if (count <= 0).any():
+        raise RuntimeError("EU-DERPO actual-F support edge is missing from cluster statistics")
+    keep = stats.mask[rows, layer].gather(1, ids)
+    utility = normalized[rows, layer].gather(1, ids)
+    denominator = float(batch_size) * active_total[rows, None].float() * count.masked_fill(count == 0, 1.0)
+    return (keep.float() * utility.float() / denominator).detach()
 
 
 def clear_eu_derpo_on_error(method):
@@ -109,9 +237,9 @@ def _route_attribution_summary(valid, order_only, set_mismatch):
 
 
 class EUDERPOObserver:
-    """Capture natural routes and stream actual-alpha routing credit during main backward."""
+    """Capture actual-F state and apply deferred Router-only utility gradients."""
 
-    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False):
+    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -159,9 +287,14 @@ class EUDERPOObserver:
             raise ValueError("EU-DERPO requires at least one TopKRouter")
         self.topk = self.routers[0].topk
         self.num_experts = self.routers[0].weight.shape[0]
+        self.hidden_size = self.routers[0].weight.shape[1]
+        self.staging_mib = int(staging_mib)
         if self.topk != 8 or self.num_experts != 128:
-            raise ValueError("EU-DERPO V1.2 Qwen3 recipe requires 128 Experts and Top-K=8")
-        if any(router.topk != self.topk or router.weight.shape[0] != self.num_experts for router in self.routers):
+            raise ValueError("EU-DERPO V1.2.1 Qwen3 recipe requires 128 Experts and Top-K=8")
+        if any(
+            router.topk != self.topk or tuple(router.weight.shape) != (self.num_experts, self.hidden_size)
+            for router in self.routers
+        ):
             raise ValueError("EU-DERPO requires uniform local Router shapes")
         if len(self.routers) != 48:
             raise ValueError("EU-DERPO PP1 requires exactly 48 local MoE layers")
@@ -208,6 +341,29 @@ class EUDERPOObserver:
         self._native_router_grad_sq = 0.0
         self._utility_router_grad_sq = 0.0
         self._router_grad_dot = 0.0
+        self._hidden_cache = None
+        self._support_cache = None
+        self._provenance = None
+        self._planned_spans = None
+        self._cache_cursor_by_layer = None
+        self._cache_consumed_by_layer = None
+        self._cache_plan = None
+        self._cache_metrics = None
+        self._native_finalize_count = 0
+        self._native_finalize_completed = False
+        self._optimizer_generation = None
+        self._parameter_snapshot = None
+        self._step_e_started = False
+        self._full_auxiliary_transformer_forward_count = 0
+        self._step_e_natural_topk_call_count = 0
+        self._step_e_router_forward_call_count = 0
+        self._step_e_routing_call_count = 0
+        self._step_e_dispatch_count = 0
+        self._d2h_seconds = 0.0
+        self._h2d_seconds = 0.0
+        self._aux_reduce_count = None
+        self._main_grad_add_count = None
+        self._step_e_complete = False
         for index, router in enumerate(self.routers):
             self._remember_gating(router)
             self._wrap_routing(router, index)
@@ -269,7 +425,7 @@ class EUDERPOObserver:
                 self._prepass_routes[index] = self._selected(output[1], self.topk).to(torch.uint8)
                 return
             if self.mode == "main":
-                self._observe_main(index, module, output)
+                self._observe_main(index, module, inputs[0], output)
                 return
             if self.mode == "aux":
                 self._observe_aux(index, module, inputs[0], output)
@@ -373,7 +529,84 @@ class EUDERPOObserver:
         except KeyError as exc:
             raise RuntimeError(f"missing EU-DERPO actual-F current logprob for sample {exc.args[0]}") from exc
 
-    def start_main_batch(self, sample_ids: torch.Tensor, prompt_groups: torch.Tensor | None = None):
+    @staticmethod
+    def _router_parameters(router):
+        parameters = dict(router.named_parameters(recurse=False))
+        if set(parameters) != {"weight"}:
+            raise RuntimeError(
+                f"EU-DERPO V1.2.1 supports the frozen Router parameter set {{weight}}, got {sorted(parameters)}"
+            )
+        return tuple(parameters.items())
+
+    def _coordinated_ram_preflight(self, local_required):
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else self.routers[0].weight.device
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_world_size() != 8:
+                raise RuntimeError("EU-DERPO V1.2.1 node RAM preflight requires one world8 node")
+            local = torch.tensor([int(local_required)], dtype=torch.int64, device=device)
+            gathered = [torch.zeros_like(local) for _ in range(8)]
+            torch.distributed.all_gather(gathered, local)
+            required_by_rank = [int(item.item()) for item in gathered]
+            payload = torch.zeros(2, dtype=torch.int64, device=device)
+            if torch.distributed.get_rank() == 0:
+                available = _read_mem_available()
+                decision = _node_ram_decision(
+                    required_by_rank, available, HOST_RAM_SAFETY_MARGIN_BYTES
+                )
+                payload[0] = available
+                payload[1] = int(decision["passed"])
+            torch.distributed.broadcast(payload, src=0)
+            decision = _node_ram_decision(
+                required_by_rank, int(payload[0].item()), HOST_RAM_SAFETY_MARGIN_BYTES
+            )
+            if bool(payload[1].item()) != decision["passed"]:
+                raise RuntimeError("EU-DERPO node RAM preflight broadcast was inconsistent")
+        else:
+            try:
+                available = _read_mem_available()
+            except (OSError, RuntimeError):
+                available = (1 << 63) - 1
+            decision = _node_ram_decision(
+                [local_required], available, HOST_RAM_SAFETY_MARGIN_BYTES
+            )
+        if not decision["passed"]:
+            raise MemoryError(f"EU-DERPO node RAM preflight failed: {decision}")
+        return decision
+
+    def wrap_native_finalize(self, original_finalize):
+        if original_finalize is None:
+            raise RuntimeError("EU-DERPO requires MCore native finalize_model_grads")
+
+        @wraps(original_finalize)
+        def wrapped(*args, **kwargs):
+            if self._native_finalize_count != 0 or self._native_finalize_completed:
+                raise RuntimeError("EU-DERPO native finalize_model_grads was invoked more than once")
+            result = original_finalize(*args, **kwargs)
+            self._native_finalize_count += 1
+            self._native_finalize_completed = True
+            return result
+
+        return wrapped
+
+    def _assert_native_finalize(self):
+        if self._native_finalize_count != 1 or not self._native_finalize_completed:
+            raise RuntimeError(
+                "EU-DERPO Router-only Step E requires one completed native finalize_model_grads"
+            )
+
+    def start_main_batch(
+        self,
+        sample_ids: torch.Tensor,
+        prompt_groups: torch.Tensor,
+        attention_mask: torch.Tensor,
+        response_mask: torch.Tensor,
+        response_length: int,
+        optimizer_generation: int,
+    ):
         ids = self._ids(sample_ids, sample_ids.numel())
         if len(set(ids)) != len(ids):
             raise RuntimeError("duplicate EU-DERPO main sample id")
@@ -383,11 +616,72 @@ class EUDERPOObserver:
         self.current_logprob_cache.clear()
         self.mode = "main"
         self._sample_row = {sample_id: row for row, sample_id in enumerate(ids)}
-        if prompt_groups is None:
-            prompt_groups = torch.full_like(sample_ids, -1)
         groups = self._ids(prompt_groups, sample_ids.numel())
         self._prompt_group_by_sample = dict(zip(ids, groups))
         device = self.routers[0].weight.device
+        from megatron.core import parallel_state as mpu
+
+        if getattr(self.tf_config, "hidden_size", self.hidden_size) != self.hidden_size:
+            raise RuntimeError("EU-DERPO Router hidden-size contract changed")
+        if self.hidden_size == 2048 and self.routers[0].weight.dtype != torch.bfloat16:
+            raise RuntimeError("EU-DERPO V1.2.1 production Router must remain BF16")
+        plan = _plan_local_response_rows(
+            attention_mask,
+            response_mask,
+            sample_ids,
+            response_length,
+            mpu.get_tensor_model_parallel_world_size(),
+            mpu.get_tensor_model_parallel_rank(),
+        )
+        byte_plan = _cache_byte_plan(plan["rows"], len(self.routers), self.hidden_size, self.topk)
+        ram = self._coordinated_ram_preflight(sum(byte_plan.values()))
+        self._hidden_cache = [
+            torch.empty((plan["rows"], self.hidden_size), dtype=torch.bfloat16)
+            for _ in self.routers
+        ]
+        self._support_cache = [
+            torch.empty((plan["rows"], self.topk), dtype=torch.uint8)
+            for _ in self.routers
+        ]
+        if any(tensor.is_pinned() for tensor in self._hidden_cache + self._support_cache):
+            raise RuntimeError("EU-DERPO full cache must use pageable CPU memory")
+        self._provenance = {
+            key: plan[key] for key in ("sample_row", "sample_id", "response_position")
+        }
+        self._planned_spans = plan["spans"]
+        self._cache_cursor_by_layer = [0] * len(self.routers)
+        self._cache_consumed_by_layer = [0] * len(self.routers)
+        self._cache_plan = byte_plan
+        self._cache_metrics = {
+            "planned_valid_rows": plan["rows"],
+            "hidden_cache_bytes": byte_plan["hidden"],
+            "support_cache_bytes": byte_plan["support"],
+            "semantic_metadata_bytes": byte_plan["metadata"],
+            "pageable_cache_peak_bytes": sum(byte_plan.values()),
+            "node_required_cache_bytes": ram["node_required"],
+            "mem_available_before_allocation_bytes": ram["mem_available"],
+            "host_safety_margin_bytes": ram["safety_margin"],
+        }
+        self._native_finalize_count = 0
+        self._native_finalize_completed = False
+        self._optimizer_generation = int(optimizer_generation)
+        self._parameter_snapshot = []
+        for router in self.routers:
+            snapshot = []
+            for name, parameter in self._router_parameters(router):
+                snapshot.append((name, parameter, id(parameter), parameter._version))
+            self._parameter_snapshot.append(tuple(snapshot))
+        self._step_e_started = False
+        self._d2h_seconds = 0.0
+        self._h2d_seconds = 0.0
+        self._aux_reduce_count = [0] * len(self.routers)
+        self._main_grad_add_count = [0] * len(self.routers)
+        self._step_e_complete = False
+        self._full_auxiliary_transformer_forward_count = 0
+        self._step_e_natural_topk_call_count = 0
+        self._step_e_router_forward_call_count = 0
+        self._step_e_routing_call_count = 0
+        self._step_e_dispatch_count = 0
         self._sample_ids_by_row = sample_ids.to(device)
         shape = (len(ids), len(self.routers), self.num_experts)
         self._utility_sum = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -423,6 +717,8 @@ class EUDERPOObserver:
     @torch.no_grad()
     def begin_main_microbatch(self, input_ids, attention_mask, sample_ids, response_mask, response_length):
         ids = self._ids(sample_ids, input_ids.shape[0])
+        if len(ids) != 1:
+            raise RuntimeError("EU-DERPO V1.2.1 frozen cache planner requires microbatch=1")
         rows = torch.tensor([self._sample_row[sample_id] for sample_id in ids], dtype=torch.int64)[:, None]
         rows = rows.expand(-1, response_length)
         packed_rows = RouterShiftObserver._pack_sequence_parallel(rows[..., None], input_ids, attention_mask, response_length).squeeze(-1)
@@ -431,7 +727,19 @@ class EUDERPOObserver:
         packed_tokens = RouterShiftObserver._pack_sequence_parallel(
             tokens[..., None], input_ids, attention_mask, response_length
         ).squeeze(-1)
-        self._active = (packed_rows.long(), packed_valid, packed_tokens.long())
+        start, end = self._planned_spans[ids[0]]
+        actual_positions = packed_tokens[packed_valid].detach().cpu().to(torch.int32)
+        expected_positions = self._provenance["response_position"][start:end]
+        if not torch.equal(actual_positions, expected_positions):
+            raise RuntimeError(
+                "EU-DERPO planned response rows differ from actual packed SP-local rows"
+            )
+        if not torch.equal(
+            packed_rows[packed_valid].detach().cpu().to(torch.int32),
+            self._provenance["sample_row"][start:end],
+        ):
+            raise RuntimeError("EU-DERPO planned sample rows differ from actual packed rows")
+        self._active = (packed_rows.long(), packed_valid, packed_tokens.long(), start, end)
         self._forward_routes = [None] * len(self.routers)
         if self.route_attribution:
             self._forward_ordered_routes = [None] * len(self.routers)
@@ -479,7 +787,7 @@ class EUDERPOObserver:
                 raise RuntimeError(f"duplicate EU-DERPO actual-F current logprob: {sample_id}")
             self.current_logprob_cache[sample_id] = current_logprobs[row].detach().float().cpu()
 
-    def _observe_main(self, index, module, output):
+    def _observe_main(self, index, module, hidden, output):
         actual_set = self._selected(output[1], self.topk)
         if torch.is_grad_enabled() and output[0].requires_grad:
             self._record_execution("R", module)
@@ -504,11 +812,36 @@ class EUDERPOObserver:
             self._record_execution("F", module)
             if self._active is None:
                 raise RuntimeError("EU-DERPO original forward has no microbatch context")
-            rows, valid, tokens = self._active
+            rows, valid, tokens, start, end = self._active
+            flat_hidden = hidden.detach().reshape(-1, hidden.shape[-1])
+            if flat_hidden.shape != (actual_set.shape[0], self.hidden_size):
+                raise RuntimeError(
+                    f"EU-DERPO actual-F hidden shape mismatch: {tuple(flat_hidden.shape)}"
+                )
+            if end - start != int(valid.sum().item()):
+                raise RuntimeError("EU-DERPO actual-F cache span cardinality mismatch")
+            if self._cache_cursor_by_layer[index] != start:
+                raise RuntimeError("EU-DERPO actual-F hidden cache write cursor mismatch")
+            selected_support = actual_set[valid]
+            if selected_support.numel() and (
+                selected_support.min().item() < 0
+                or selected_support.max().item() >= self.num_experts
+                or not (selected_support.sort(-1).values.diff(dim=-1) > 0).all()
+            ):
+                raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
+            copy_started = time.perf_counter()
+            self._hidden_cache[index][start:end].copy_(
+                flat_hidden[valid].to(device="cpu", dtype=torch.bfloat16), non_blocking=False
+            )
+            self._support_cache[index][start:end].copy_(
+                selected_support.to(device="cpu", dtype=torch.uint8), non_blocking=False
+            )
+            self._d2h_seconds += time.perf_counter() - copy_started
+            self._cache_cursor_by_layer[index] = end
             self._forward_routes[index] = actual_set.detach().to(torch.uint8)
             if self.route_attribution:
                 self._forward_ordered_routes[index] = self._ordered_selected(output[0], actual_set).to(torch.uint8)
-            self._pending_recompute[index].append((self._active, actual_set.detach()))
+            self._pending_recompute[index].append(((rows, valid, tokens), actual_set.detach()))
 
     @torch.no_grad()
     def _check_route(self, phase, index, expected, actual, rows, tokens, valid):
@@ -629,6 +962,7 @@ class EUDERPOObserver:
 
     @torch.no_grad()
     def finish_main_batch(self):
+        self._assert_native_finalize()
         if self._pending_alpha:
             raise RuntimeError("EU-DERPO has unconsumed actual-alpha records")
         if any(self._pending_recompute):
@@ -655,7 +989,16 @@ class EUDERPOObserver:
             "gradient_hook_count_by_layer": self._main_hook_count_by_layer.cpu().tolist(),
             "utility_edge_count_by_layer": self._edge_count_by_layer.cpu().tolist(),
             "weighted_center_max_abs": self._center_residual_max.item(),
+            "native_finalize_count": self._native_finalize_count,
+            "native_finalize_completed": float(self._native_finalize_completed),
+            "captured_valid_rows": self._cache_plan["hidden"] // (
+                len(self.routers) * self.hidden_size * 2
+            ),
+            "d2h_capture_seconds": self._d2h_seconds,
+            **self._cache_metrics,
         }
+        if any(cursor != self._cache_metrics["planned_valid_rows"] for cursor in self._cache_cursor_by_layer):
+            raise RuntimeError("EU-DERPO planned/captured/final hidden cache rows differ")
         if mismatch or forward_recompute_mismatch:
             raise RuntimeError(f"EU-DERPO actual-F/recompute natural route mismatch: {metrics}")
         if invalid:
@@ -740,7 +1083,223 @@ class EUDERPOObserver:
             torch.distributed.all_reduce(result, group=mpu.get_pipeline_model_parallel_group())
         return result
 
+    def _assert_parameters_unchanged(self, optimizer_generation):
+        if int(optimizer_generation) != self._optimizer_generation:
+            raise RuntimeError("EU-DERPO optimizer generation changed between F and Step E")
+        for router, snapshot in zip(self.routers, self._parameter_snapshot):
+            current = dict(self._router_parameters(router))
+            for name, parameter, identity, version in snapshot:
+                if current[name] is not parameter or id(current[name]) != identity:
+                    raise RuntimeError("EU-DERPO Router Parameter object changed between F and Step E")
+                if parameter._version != version:
+                    raise RuntimeError("EU-DERPO Router Parameter version changed between F and Step E")
+
+    def run_router_only_step_e(
+        self,
+        sample_ids,
+        stats,
+        normalized_utility,
+        total_active,
+        lambda_u,
+        optimizer_generation,
+    ):
+        """Replay only Router gating on detached actual-F cache and merge its gradient."""
+        self._assert_native_finalize()
+        self._assert_parameters_unchanged(optimizer_generation)
+        forbidden_counts = (
+            self._full_auxiliary_transformer_forward_count,
+            self._step_e_natural_topk_call_count,
+            self._step_e_router_forward_call_count,
+            self._step_e_routing_call_count,
+            self._step_e_dispatch_count,
+        )
+        if any(forbidden_counts):
+            raise RuntimeError("EU-DERPO V1.2.1 Step E observed a forbidden full-A/routing call")
+        if self._step_e_started:
+            raise RuntimeError("EU-DERPO Router-only Step E was invoked more than once")
+        if self._hidden_cache is None or self._support_cache is None or self._provenance is None:
+            raise RuntimeError("EU-DERPO Router-only Step E is missing actual-F cache")
+        if not torch.equal(sample_ids.detach().cpu().long(), self._sample_ids_by_row.detach().cpu().long()):
+            raise RuntimeError("EU-DERPO Router-only Step E sample ordering changed")
+        self._step_e_started = True
+        rows = self._cache_metrics["planned_valid_rows"]
+        chunk_rows = _staging_chunk_rows(self.staging_mib, self.hidden_size, self.topk)
+        allocation_rows = max(1, min(rows, chunk_rows))
+        device = self.routers[0].weight.device
+        use_pinned = device.type == "cuda"
+        hidden_stage = torch.empty(
+            (allocation_rows, self.hidden_size), dtype=torch.bfloat16, pin_memory=use_pinned
+        )
+        support_stage = torch.empty(
+            (allocation_rows, self.topk), dtype=torch.uint8, pin_memory=use_pinned
+        )
+        coefficient_stage = torch.empty(
+            (allocation_rows, self.topk), dtype=torch.float32, pin_memory=use_pinned
+        )
+        pinned_bytes = (
+            hidden_stage.numel() * hidden_stage.element_size()
+            + support_stage.numel() * support_stage.element_size()
+            + coefficient_stage.numel() * coefficient_stage.element_size()
+        ) if use_pinned else 0
+        if pinned_bytes > self.staging_mib * 1024**2:
+            raise RuntimeError("EU-DERPO pinned staging exceeded its configured cap")
+
+        objective_total = 0.0
+        native_router_grad_sq = 0.0
+        utility_router_grad_sq = 0.0
+        router_grad_dot = 0.0
+        max_gpu_chunk_bytes = 0
+        gpu_memory_before = torch.cuda.memory_allocated(device) if use_pinned else 0
+        gpu_memory_peak = gpu_memory_before
+        replay_started = time.perf_counter()
+        for layer, router in enumerate(self.routers):
+            parameters = self._router_parameters(router)
+            accumulators = {
+                name: torch.zeros_like(parameter, dtype=torch.float32, device=parameter.device)
+                for name, parameter in parameters
+            }
+            cursor = 0
+            while cursor < rows:
+                end = min(rows, cursor + chunk_rows)
+                length = end - cursor
+                if self._cache_consumed_by_layer[layer] != cursor:
+                    raise RuntimeError("EU-DERPO Step E cache consumption cursor mismatch")
+                support = self._support_cache[layer][cursor:end]
+                sample_rows = self._provenance["sample_row"][cursor:end]
+                coefficient = _build_edge_coefficients(
+                    stats,
+                    normalized_utility,
+                    total_active,
+                    sample_rows,
+                    layer,
+                    support,
+                    len(sample_ids),
+                )
+                hidden_stage[:length].copy_(self._hidden_cache[layer][cursor:end])
+                support_stage[:length].copy_(support)
+                coefficient_stage[:length].copy_(coefficient)
+                transfer_started = time.perf_counter()
+                hidden_device = hidden_stage[:length].to(
+                    device=device, dtype=router.weight.dtype, non_blocking=False
+                )
+                support_uint8 = support_stage[:length].to(device=device, non_blocking=False)
+                support_long = support_uint8.long()
+                coefficient_device = coefficient_stage[:length].to(device=device, non_blocking=False)
+                self._h2d_seconds += time.perf_counter() - transfer_started
+                if hidden_device.requires_grad or coefficient_device.requires_grad:
+                    raise RuntimeError("EU-DERPO Step E hidden/coefficient must be detached")
+                with torch.enable_grad():
+                    logits = router._verl_eu_derpo_original_gating(hidden_device)
+                    loss, objective = _selected_support_loss(
+                        logits, support_long, coefficient_device, lambda_u
+                    )
+                    gradients = torch.autograd.grad(
+                        loss,
+                        tuple(parameter for _, parameter in parameters),
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=False,
+                    )
+                if not torch.isfinite(loss).all() or any(
+                    not torch.isfinite(gradient).all() for gradient in gradients
+                ):
+                    raise FloatingPointError("EU-DERPO Router-only Step E produced a non-finite gradient")
+                for (name, _), gradient in zip(parameters, gradients):
+                    accumulators[name].add_(gradient.float())
+                objective_total += objective.detach().float().item()
+                self._cache_consumed_by_layer[layer] = end
+                max_gpu_chunk_bytes = max(
+                    max_gpu_chunk_bytes,
+                    hidden_device.numel() * hidden_device.element_size()
+                    + support_uint8.numel() * support_uint8.element_size()
+                    + support_long.numel() * support_long.element_size()
+                    + coefficient_device.numel() * coefficient_device.element_size()
+                    + logits.numel() * logits.element_size(),
+                )
+                if use_pinned:
+                    gpu_memory_peak = max(gpu_memory_peak, torch.cuda.memory_allocated(device))
+                cursor = end
+
+            for name, parameter in parameters:
+                auxiliary_grad = accumulators[name]
+                _reduce_router_auxiliary_grad(auxiliary_grad)
+                self._aux_reduce_count[layer] += 1
+                main_grad = getattr(parameter, "main_grad", None)
+                if main_grad is None or main_grad.shape != auxiliary_grad.shape:
+                    raise RuntimeError("EU-DERPO requires matching Megatron main_grad for Router Step E")
+                if not torch.isfinite(main_grad).all() or not torch.isfinite(auxiliary_grad).all():
+                    raise FloatingPointError("EU-DERPO main or reduced auxiliary Router grad is non-finite")
+                with torch.no_grad():
+                    before_native = main_grad.clone()
+                    before = before_native.float()
+                    native_router_grad_sq += before.square().sum().item()
+                    utility_router_grad_sq += auxiliary_grad.square().sum().item()
+                    router_grad_dot += (before * auxiliary_grad).sum().item()
+                    auxiliary_native = auxiliary_grad.to(main_grad.dtype)
+                    expected_after = before_native + auxiliary_native
+                    main_grad.add_(auxiliary_native)
+                    if not torch.isfinite(main_grad).all():
+                        raise FloatingPointError("EU-DERPO combined Router main_grad is non-finite")
+                    delta = main_grad.float() - before
+                    expected_delta = expected_after.float() - before
+                    if not torch.equal(delta, expected_delta):
+                        raise RuntimeError("EU-DERPO main_grad delta differs from one auxiliary add")
+                self._main_grad_add_count[layer] += 1
+
+        if self._native_finalize_count != 1:
+            raise RuntimeError("EU-DERPO native finalize count changed during Step E")
+        if any(value != rows for value in self._cache_consumed_by_layer):
+            raise RuntimeError("EU-DERPO Step E left an orphan or duplicate hidden chunk")
+        if any(value != 1 for value in self._aux_reduce_count):
+            raise RuntimeError("EU-DERPO auxiliary Router grad reduce count is not one per layer")
+        if any(value != 1 for value in self._main_grad_add_count):
+            raise RuntimeError("EU-DERPO Router main_grad add count is not one per layer")
+        self._step_e_complete = True
+        utility_norm = utility_router_grad_sq**0.5
+        native_norm = native_router_grad_sq**0.5
+        denominator = utility_norm * native_norm
+        return {
+            "utility_objective": objective_total,
+            "native_router_grad_norm": native_norm,
+            "utility_router_grad_norm": utility_norm,
+            "router_grad_cosine": router_grad_dot / denominator if denominator else 0.0,
+            "full_auxiliary_transformer_forward_count": self._full_auxiliary_transformer_forward_count,
+            "step_e_natural_topk_call_count": self._step_e_natural_topk_call_count,
+            "step_e_router_forward_call_count": self._step_e_router_forward_call_count,
+            "step_e_routing_call_count": self._step_e_routing_call_count,
+            "step_e_dispatch_count": self._step_e_dispatch_count,
+            "hidden_source_actual_f": 1.0,
+            "support_source_actual_f": 1.0,
+            "native_finalize_count": self._native_finalize_count,
+            "aux_reduce_count_by_layer": self._aux_reduce_count.copy(),
+            "main_grad_add_count_by_layer": self._main_grad_add_count.copy(),
+            "all_cache_layers_consumed": float(all(value == rows for value in self._cache_consumed_by_layer)),
+            "utility_edges_consumed": rows * len(self.routers) * self.topk,
+            "orphan_cache_count": 0,
+            "pinned_peak_bytes": pinned_bytes,
+            "step_e_max_chunk_rows": min(rows, chunk_rows),
+            "step_e_live_tensor_bytes_lower_bound": max_gpu_chunk_bytes,
+            "step_e_gpu_memory_allocated_delta_bytes": max(0, gpu_memory_peak - gpu_memory_before),
+            "h2d_replay_seconds": self._h2d_seconds,
+            "router_only_step_e_seconds": time.perf_counter() - replay_started,
+        }
+
+    def validate_before_optimizer_step(self, optimizer_generation):
+        self._assert_native_finalize()
+        self._assert_parameters_unchanged(optimizer_generation)
+        if not self._step_e_complete:
+            raise RuntimeError("EU-DERPO optimizer step attempted before Router-only Step E completed")
+        if any(value != 1 for value in self._aux_reduce_count + self._main_grad_add_count):
+            raise RuntimeError("EU-DERPO Router auxiliary reduce/add ledger is incomplete")
+
+    def finish_optimizer_step(self, optimizer_generation):
+        if int(optimizer_generation) != self._optimizer_generation + 1:
+            raise RuntimeError("EU-DERPO optimizer step generation did not advance exactly once")
+        self.clear()
+        return {"cache_clear_count": 1, "orphan_cache_count": 0}
+
     def start_aux_batch(self, sample_ids, stats, normalized_utility, total_active, lambda_u):
+        self._full_auxiliary_transformer_forward_count += 1
         self.mode = "aux"
         self._aux_stats = (sample_ids.clone(), stats, normalized_utility, total_active.float(), float(lambda_u))
         self._aux_objective = 0.0
@@ -870,6 +1429,10 @@ class EUDERPOObserver:
         print("================================================", flush=True)
 
     def _observe_aux(self, index, module, hidden, output):
+        self._step_e_natural_topk_call_count += 1
+        self._step_e_router_forward_call_count += 1
+        self._step_e_routing_call_count += 1
+        self._step_e_dispatch_count += 1
         if self._active is None:
             raise RuntimeError("EU-DERPO auxiliary forward has no microbatch context")
         routes, weights, valid, lambda_u = self._active
@@ -1036,6 +1599,29 @@ class EUDERPOObserver:
         self._alpha_min = None
         self._invalid_flag = None
         self._center_residual_max = None
+        self._hidden_cache = None
+        self._support_cache = None
+        self._provenance = None
+        self._planned_spans = None
+        self._cache_cursor_by_layer = None
+        self._cache_consumed_by_layer = None
+        self._cache_plan = None
+        self._cache_metrics = None
+        self._native_finalize_count = 0
+        self._native_finalize_completed = False
+        self._optimizer_generation = None
+        self._parameter_snapshot = None
+        self._step_e_started = False
+        self._step_e_complete = False
+        self._aux_reduce_count = None
+        self._main_grad_add_count = None
+        self._d2h_seconds = 0.0
+        self._h2d_seconds = 0.0
+        self._full_auxiliary_transformer_forward_count = 0
+        self._step_e_natural_topk_call_count = 0
+        self._step_e_router_forward_call_count = 0
+        self._step_e_routing_call_count = 0
+        self._step_e_dispatch_count = 0
 
     def close(self):
         self.clear()

@@ -270,14 +270,21 @@ router_shift_weighting:
   enabled: false
   gamma_min: 0.8
 
-# Frozen EU-DERPO V1.2. Public default is fully disabled.
+# Frozen EU-DERPO V1.2.1. Public default is fully disabled.
 eu_derpo:
 
   _target_: verl.workers.config.EUDERPOConfig
 
   enabled: false
-  version: "1.2"
+  version: "1.2.1"
   route_attribution: false
+  step_e_implementation: actual_f_router_only
+  hidden_source: actual_f
+  support_source: actual_f
+  cache_backend: cpu_pageable
+  staging_mib: 64
+  natural_topk_step_e: false
+  full_aux_forward: false
 
   behavior_expert_is:
     _target_: verl.workers.config.BehaviorExpertISConfig

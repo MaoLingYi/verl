@@ -209,7 +209,14 @@ class TestEUDERPOObserver(unittest.TestCase):
         prepass_training=True,
     ):
         self.run_prepass(training=prepass_training)
-        self.observer.start_main_batch(self.sample_ids, torch.tensor([4, 9], dtype=torch.int64))
+        self.observer.start_main_batch(
+            self.sample_ids,
+            torch.tensor([4, 9], dtype=torch.int64),
+            self.attention_mask,
+            self.response_mask,
+            2,
+            0,
+        )
         self.assertFalse(self.observer._utility_sum[:, 0].is_contiguous())
         expert_weight = torch.arange(128, dtype=torch.float32)
         for row, sample_id in enumerate(self.sample_ids):
@@ -234,6 +241,7 @@ class TestEUDERPOObserver(unittest.TestCase):
         self.set_route_behavior()
         for router in self.model.routers:
             router.weight.main_grad = router.weight.grad.detach().clone()
+        self.observer.wrap_native_finalize(lambda: None)()
 
     def finish_main(self):
         utility_sum, utility_sum_sq, utility_count, metrics = self.observer.finish_main_batch()
@@ -267,7 +275,14 @@ class TestEUDERPOObserver(unittest.TestCase):
         return self.observer.finish_aux_batch()
 
     def test_invalid_alpha_flag_is_sticky_and_preserves_buffer_identity(self):
-        self.observer.start_main_batch(self.sample_ids)
+        self.observer.start_main_batch(
+            self.sample_ids,
+            torch.tensor([4, 9], dtype=torch.int64),
+            self.attention_mask,
+            self.response_mask,
+            2,
+            0,
+        )
         flag = self.observer._invalid_flag
         pointer = flag.data_ptr()
         alpha = torch.full((2, 8), 0.125)
@@ -317,6 +332,46 @@ class TestEUDERPOObserver(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "hook count"):
             self.observer.finish_main_batch()
 
+    def test_native_finalize_wrapper_marks_only_after_success_and_rejects_second_call(self):
+        self.observer._native_finalize_count = 0
+        self.observer._native_finalize_completed = False
+        calls = []
+        wrapped = self.observer.wrap_native_finalize(lambda: calls.append("done"))
+        wrapped()
+        self.assertEqual(calls, ["done"])
+        self.assertEqual(self.observer._native_finalize_count, 1)
+        self.assertTrue(self.observer._native_finalize_completed)
+        with self.assertRaisesRegex(RuntimeError, "more than once"):
+            wrapped()
+
+    def test_native_finalize_failure_is_not_marked_complete(self):
+        self.observer._native_finalize_count = 0
+        self.observer._native_finalize_completed = False
+
+        def fail():
+            raise ValueError("native failure")
+
+        with self.assertRaisesRegex(ValueError, "native failure"):
+            self.observer.wrap_native_finalize(fail)()
+        self.assertEqual(self.observer._native_finalize_count, 0)
+        self.assertFalse(self.observer._native_finalize_completed)
+
+    def test_optimizer_generation_and_parameter_version_are_frozen_until_step_e(self):
+        self.observer.start_main_batch(
+            self.sample_ids,
+            torch.tensor([4, 9], dtype=torch.int64),
+            self.attention_mask,
+            self.response_mask,
+            2,
+            7,
+        )
+        with self.assertRaisesRegex(RuntimeError, "optimizer generation"):
+            self.observer._assert_parameters_unchanged(8)
+        with torch.no_grad():
+            self.model.routers[0].weight.add_(0)
+        with self.assertRaisesRegex(RuntimeError, "Parameter version"):
+            self.observer._assert_parameters_unchanged(7)
+
     def test_edge_count_mismatch_still_fails_fast(self):
         self.run_main_backward()
         self.observer._edge_count_by_layer[0] += 1
@@ -354,6 +409,39 @@ class TestEUDERPOObserver(unittest.TestCase):
         self.assertGreaterEqual(routes.min().item(), 0)
         self.assertLessEqual(routes.max().item(), 127)
         self.assertEqual(self.observer.current_logprobs_for(self.sample_ids).shape, (2, 2))
+
+    def test_v121_router_only_step_e_uses_actual_f_cache_without_new_routing(self):
+        self.run_main_backward()
+        _, utility_count, _ = self.finish_main()
+        stats = SimpleNamespace(count=utility_count, mask=utility_count > 0)
+        normalized = (utility_count > 0).float()
+        total_active = self.response_mask.sum(-1).float()
+        before = [router.weight.main_grad.clone() for router in self.model.routers]
+        original_routing = [router.routing for router in self.model.routers]
+        for router in self.model.routers:
+            router.routing = mock.Mock(side_effect=AssertionError("routing invoked"))
+        with mock.patch.object(self.model, "forward", side_effect=AssertionError("full A invoked")), mock.patch(
+            "torch.topk", side_effect=AssertionError("new Top-K invoked")
+        ), mock.patch.object(torch.Tensor, "topk", side_effect=AssertionError("Tensor.topk invoked")):
+            try:
+                metrics = self.observer.run_router_only_step_e(
+                    self.sample_ids, stats, normalized, total_active, 0.05, 0
+                )
+            finally:
+                for router, routing in zip(self.model.routers, original_routing):
+                    router.routing = routing
+        self.assertEqual(metrics["full_auxiliary_transformer_forward_count"], 0)
+        self.assertEqual(metrics["step_e_natural_topk_call_count"], 0)
+        self.assertEqual(metrics["aux_reduce_count_by_layer"], [1] * 48)
+        self.assertEqual(metrics["main_grad_add_count_by_layer"], [1] * 48)
+        self.assertTrue(metrics["all_cache_layers_consumed"])
+        self.assertTrue(
+            all(not torch.equal(old, router.weight.main_grad) for old, router in zip(before, self.model.routers))
+        )
+        self.observer.validate_before_optimizer_step(0)
+        cleanup = self.observer.finish_optimizer_step(1)
+        self.assertEqual(cleanup, {"cache_clear_count": 1, "orphan_cache_count": 0})
+        self.assertIsNone(self.observer._hidden_cache)
 
     def test_saved_tensor_and_routing_map_must_match_within_invocation(self):
         with self.assertRaisesRegex(RuntimeError, "saved-tensor Top-K differs from routing-map Top-K"):

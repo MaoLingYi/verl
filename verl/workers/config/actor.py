@@ -73,8 +73,15 @@ class RoutingUtilityConfig(BaseConfig):
 @dataclass
 class EUDERPOConfig(BaseConfig):
     enabled: bool = False
-    version: str = "1.2"
+    version: str = "1.2.1"
     route_attribution: bool = False
+    step_e_implementation: str = "actual_f_router_only"
+    hidden_source: str = "actual_f"
+    support_source: str = "actual_f"
+    cache_backend: str = "cpu_pageable"
+    staging_mib: int = 64
+    natural_topk_step_e: bool = False
+    full_aux_forward: bool = False
     behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
     expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
     routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)
@@ -82,15 +89,28 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version != "1.2":
-            raise ValueError("EU-DERPO production implementation requires version 1.2")
+        if self.version != "1.2.1":
+            raise ValueError("EU-DERPO production implementation requires version 1.2.1")
+        step_e_contract = (
+            self.step_e_implementation,
+            self.hidden_source,
+            self.support_source,
+            self.cache_backend,
+            self.staging_mib,
+            self.natural_topk_step_e,
+            self.full_aux_forward,
+        )
+        if step_e_contract != (
+            "actual_f_router_only", "actual_f", "actual_f", "cpu_pageable", 64, False, False
+        ):
+            raise ValueError("EU-DERPO V1.2.1 Step E contract is frozen to actual-F Router-only replay")
         if not self.behavior_expert_is.enabled or not self.expert_cluster_dppo.enabled or not self.routing_utility.enabled:
             raise ValueError("EU-DERPO requires behavior ExpertIS, Expert-cluster DPPO, and Routing Utility")
         if self.behavior_expert_is.behavior_source != "rollout" or not self.behavior_expert_is.require_rollout_logprob:
             raise ValueError("EU-DERPO requires true rollout sampled-token log probabilities")
         dppo = self.expert_cluster_dppo
         if dppo.divergence_type != "binary_tv":
-            raise ValueError("EU-DERPO V1.2 requires binary_tv")
+            raise ValueError("EU-DERPO V1.2.1 requires binary_tv")
         if not dppo.diagnostics_only and dppo.delta_e is None:
             raise ValueError("EU-DERPO requires explicit delta_e outside diagnostics-only mode")
         if dppo.delta_e is not None and not 0 < dppo.delta_e < 1:
