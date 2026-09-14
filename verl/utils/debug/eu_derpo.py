@@ -42,6 +42,30 @@ def _reduce_router_auxiliary_grad(auxiliary_grad):
         auxiliary_grad.div_(dense_dp_size)
 
 
+def _canonicalize_router_auxiliary_inputs(hidden, raw_logits, probs, routing_map, actual, topk, num_experts):
+    logits = raw_logits.reshape(-1, raw_logits.shape[-1]) if raw_logits.ndim else raw_logits
+    actual = actual.long()
+    valid = (
+        logits.ndim == probs.ndim == routing_map.ndim == actual.ndim == 2
+        and logits.shape[0] == probs.shape[0] == routing_map.shape[0] == actual.shape[0]
+        and logits.shape[-1] == probs.shape[-1] == routing_map.shape[-1] == num_experts
+        and actual.shape[-1] == topk
+        and actual.dtype == torch.long
+        and actual.numel() > 0
+        and actual.min().item() >= 0
+        and actual.max().item() < num_experts
+    )
+    if not valid:
+        raise RuntimeError(
+            "EU-DERPO Router auxiliary shape contract failed: "
+            f"hidden={tuple(hidden.shape)}, raw_logits={tuple(raw_logits.shape)}, "
+            f"flattened_logits={tuple(logits.shape)}, probs={tuple(probs.shape)}, "
+            f"routing_map={tuple(routing_map.shape)}, actual={tuple(actual.shape)}, "
+            f"topk={topk}, num_experts={num_experts}"
+        )
+    return logits, actual
+
+
 class EUDERPOObserver:
     """Capture natural routes and stream actual-alpha routing credit during main backward."""
 
@@ -640,9 +664,22 @@ class EUDERPOObserver:
         actual = self._selected(output[1], self.topk)
         self._check_aux_route(index, routes[index], actual, valid)
         with torch.enable_grad():
-            logits = module._verl_eu_derpo_original_gating(hidden.detach())
-            log_alpha = logits.float().gather(-1, actual).log_softmax(-1)
+            raw_logits = module._verl_eu_derpo_original_gating(hidden.detach())
+            logits, actual = _canonicalize_router_auxiliary_inputs(
+                hidden, raw_logits, output[0], output[1], actual, self.topk, self.num_experts
+            )
+            selected_logits = logits.float().gather(-1, actual)
+            log_alpha = selected_logits.log_softmax(-1)
             actual_alpha = output[0].gather(-1, actual)
+            if actual_alpha.shape != log_alpha.shape:
+                raise RuntimeError(
+                    "EU-DERPO Router auxiliary selected-alpha shape contract failed: "
+                    f"hidden={tuple(hidden.shape)}, raw_logits={tuple(raw_logits.shape)}, "
+                    f"flattened_logits={tuple(logits.shape)}, probs={tuple(output[0].shape)}, "
+                    f"routing_map={tuple(output[1].shape)}, actual={tuple(actual.shape)}, "
+                    f"log_alpha={tuple(log_alpha.shape)}, actual_alpha={tuple(actual_alpha.shape)}, "
+                    f"topk={self.topk}, num_experts={self.num_experts}"
+                )
             self._mark_invalid_alpha(log_alpha.detach().exp(), actual_alpha)
             loss = -lambda_u * (weights[index].to(log_alpha.device) * log_alpha).sum()
             auxiliary_grad = torch.autograd.grad(loss, module.weight, create_graph=False)[0]

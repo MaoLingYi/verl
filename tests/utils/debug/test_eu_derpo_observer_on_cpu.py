@@ -48,6 +48,7 @@ class TopKRouter(torch.nn.Module):
         return torch.nn.functional.linear(hidden, self.weight)
 
     def routing(self, logits):
+        logits = logits.reshape(-1, logits.shape[-1])
         if not self.training and self.eval_route_shift:
             logits = logits.roll(self.eval_route_shift, dims=-1)
         if self.route_shift:
@@ -252,7 +253,7 @@ class TestEUDERPOObserver(unittest.TestCase):
                 2,
             )
             with torch.no_grad():
-                self.model(self.hidden[row])
+                self.model(self.hidden[row].reshape(3, 1, 4))
             self.observer.finish_aux_microbatch()
         return self.observer.finish_aux_batch()
 
@@ -399,6 +400,62 @@ class TestEUDERPOObserver(unittest.TestCase):
             self.model.routers[0].weight.main_grad - before,
             reduced[0] + reduced[48],
         )
+
+    def test_mcore_3d_gating_logits_are_flattened_without_reselecting_routes(self):
+        for sequence, batch in ((2, 3), (3, 1), (1, 3)):
+            with self.subTest(sequence=sequence, batch=batch):
+                hidden = torch.randn(sequence, batch, 4)
+                weight = torch.nn.Parameter(torch.randn(16, 4))
+                raw_logits = torch.nn.functional.linear(hidden, weight)
+                flat = raw_logits.view(-1, 16)
+                selected = flat.topk(3, dim=-1).indices
+                selected_probs = flat.gather(-1, selected).float().softmax(-1)
+                probs = torch.zeros_like(flat).scatter(-1, selected, selected_probs)
+                routing_map = torch.zeros_like(flat, dtype=torch.bool).scatter(-1, selected, True)
+                actual = self.observer_class._selected(routing_map, 3)
+
+                if sequence > 1 and batch > 1:
+                    with self.assertRaisesRegex(RuntimeError, "same number of dimensions"):
+                        raw_logits.gather(-1, actual)
+
+                logits, actual = self.observer_module._canonicalize_router_auxiliary_inputs(
+                    hidden, raw_logits, probs, routing_map, actual, 3, 16
+                )
+                selected_logits = logits.float().gather(-1, actual)
+                log_alpha = selected_logits.log_softmax(-1)
+                actual_alpha = probs.gather(-1, actual)
+                self.assertEqual(logits.shape, (sequence * batch, 16))
+                self.assertEqual(actual.shape, (sequence * batch, 3))
+                self.assertEqual(selected_logits.shape, (sequence * batch, 3))
+                self.assertEqual(log_alpha.shape, (sequence * batch, 3))
+                self.assertEqual(actual_alpha.shape, (sequence * batch, 3))
+                torch.testing.assert_close(log_alpha.exp(), actual_alpha)
+                torch.testing.assert_close(log_alpha.exp().sum(-1), torch.ones(sequence * batch))
+                objective = -(torch.ones_like(log_alpha) * log_alpha).sum()
+                auxiliary_grad = torch.autograd.grad(objective, weight)[0]
+                self.assertTrue(torch.isfinite(objective))
+                self.assertTrue(torch.isfinite(auxiliary_grad).all())
+
+    def test_auxiliary_shape_contract_reports_all_shapes(self):
+        hidden = torch.randn(2, 3, 4)
+        raw_logits = torch.randn(2, 3, 16)
+        probs = torch.randn(5, 16)
+        routing_map = torch.zeros(6, 16, dtype=torch.bool)
+        actual = torch.zeros(6, 3, dtype=torch.long)
+        with self.assertRaisesRegex(RuntimeError, "hidden=.*raw_logits=.*flattened_logits=.*probs=.*routing_map=.*actual=.*topk=3, num_experts=16"):
+            self.observer_module._canonicalize_router_auxiliary_inputs(
+                hidden, raw_logits, probs, routing_map, actual, 3, 16
+            )
+
+    def test_auxiliary_route_mismatch_still_fails_fast(self):
+        self.run_main_backward()
+        _, utility_count, _ = self.finish_main()
+        self.set_route_behavior(route_shift=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "auxiliary natural route differs"):
+                self.run_auxiliary(utility_count)
+        finally:
+            self.set_route_behavior()
 
 
 if __name__ == "__main__":
