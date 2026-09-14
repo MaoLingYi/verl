@@ -628,7 +628,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             sharded_state_dict = None
             gc.collect()
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep=None,
+        stage_callback=None,
+    ):
         # record the previous global step
         self.previous_global_step = global_step
 
@@ -649,6 +656,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 self.should_save_extra,
                 metadata=sharded_sd_metadata,
             )
+            if stage_callback is not None:
+                stage_callback("after_checkpoint_state_dict")
             log_with_rank(f"Generated state dict for saving: {state_dict.keys()}", rank=self.rank, logger=logger)
             for vpp_rank, model in enumerate(self.model):
                 if len(self.model) > 1:
@@ -670,6 +679,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             if not self.checkpoint_config.async_save:
                 assert async_save_request is None, "Async save request should be None when not using async save."
                 torch.distributed.barrier()
+                if stage_callback is not None:
+                    stage_callback("after_checkpoint_write")
         else:
             assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
             # Generate optimizer and exra state dicts

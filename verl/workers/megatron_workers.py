@@ -56,6 +56,8 @@ from verl.utils.fs import copy_to_local
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
+    is_megatron_model_offloaded,
+    is_megatron_optimizer_offloaded,
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
     megatron_model_cpu_data_bytes,
@@ -1135,18 +1137,45 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module)
-        if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
-            load_megatron_optimizer(self.actor_optimizer)
-        self.checkpoint_mananager.save_checkpoint(
-            local_path=checkpoint_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+        model_was_offloaded = self._is_offload_param and is_megatron_model_offloaded(self.actor_module)
+        optimizer_was_offloaded = self._is_offload_optimizer and is_megatron_optimizer_offloaded(
+            self.actor_optimizer
         )
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-        if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
+        eu_enabled = self.config.actor.eu_derpo.enabled
+
+        def log_checkpoint_memory(stage):
+            if eu_enabled:
+                log_eu_derpo_memory(
+                    stage,
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                )
+
+        log_checkpoint_memory("before_checkpoint")
+        model_loaded = False
+        optimizer_loaded = False
+        try:
+            if model_was_offloaded:
+                load_megatron_model_to_gpu(self.actor_module)
+                model_loaded = True
+            if optimizer_was_offloaded:
+                load_megatron_optimizer(self.actor_optimizer)
+                optimizer_loaded = True
+            log_checkpoint_memory("after_checkpoint_training_residency_load")
+            self.checkpoint_mananager.save_checkpoint(
+                local_path=checkpoint_path,
+                hdfs_path=hdfs_path,
+                global_step=global_step,
+                max_ckpt_to_keep=max_ckpt_to_keep,
+                stage_callback=log_checkpoint_memory if eu_enabled else None,
+            )
+            torch.distributed.barrier()
+        finally:
+            if model_loaded:
+                offload_megatron_model_to_cpu(self.actor_module)
+            if optimizer_loaded:
+                offload_megatron_optimizer(self.actor_optimizer)
+            log_checkpoint_memory("after_checkpoint_reoffload")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):

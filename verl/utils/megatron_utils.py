@@ -523,6 +523,27 @@ def megatron_model_cpu_data_bytes(models):
     return total
 
 
+def is_megatron_model_offloaded(models):
+    """Return whether any DDP parameter buffer currently has no device storage."""
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+                if any(buffer.param_data.storage().size() == 0 for buffer in buffers):
+                    return True
+    return False
+
+
+def is_megatron_optimizer_offloaded(optimizer):
+    """Use DistributedOptimizer main-param residency as the phase state guard."""
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    return any(
+        param.device.type == "cpu"
+        for distributed_optimizer in optimizers
+        for group in getattr(distributed_optimizer, "shard_fp32_from_float16_groups", ())
+        for param in group
+    )
+
+
 @torch.no_grad()
 def offload_megatron_copy_params(optimizers):
     """
