@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import queue
+
 import megatron.core
 import torch
 from megatron.core import dist_checkpointing, mpu
@@ -25,34 +27,63 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 )
 from packaging import version
 from torch.distributed.checkpoint import FileSystemWriter, save as torch_dist_save
+from torch.distributed.checkpoint.filesystem import SerializationFormat
 
 
 _SYNC_DCP_COPY_AHEAD_BYTES = 64 * 1024**2
+_SYNC_DCP_BUCKET_BYTES = 256 * 1024**2
 
 
-def _planned_tensor_bytes(plan):
+def _planned_item_bytes(item):
+    tensor_data = getattr(item, "tensor_data", None)
+    if tensor_data is None:
+        return 0
+    size = 1
+    for dim in tensor_data.size:
+        size *= dim
+    return size * torch._utils._element_size(tensor_data.properties.dtype)
+
+
+def _planned_tensor_bytes(items):
     total = 0
     largest = 0
-    for item in plan.items:
-        tensor_data = getattr(item, "tensor_data", None)
-        if tensor_data is None:
-            continue
-        size = 1
-        for dim in tensor_data.size:
-            size *= dim
-        size *= torch._utils._element_size(tensor_data.properties.dtype)
+    for item in items:
+        size = _planned_item_bytes(item)
         total += size
         largest = max(largest, size)
     return total, largest
+
+
+def _bounded_file_buckets(items, cap_bytes):
+    buckets = []
+    bucket = []
+    bucket_bytes = 0
+    for item in items:
+        item_bytes = _planned_item_bytes(item)
+        if bucket and bucket_bytes + item_bytes > cap_bytes:
+            buckets.append(bucket)
+            bucket = []
+            bucket_bytes = 0
+        bucket.append(item)
+        bucket_bytes += item_bytes
+        if item_bytes > cap_bytes:
+            buckets.append(bucket)
+            bucket = []
+            bucket_bytes = 0
+    if bucket:
+        buckets.append(bucket)
+    return buckets
 
 
 class _TelemetryFileSystemWriter(FileSystemWriter):
     def __init__(self, path, stage_callback):
         super().__init__(
             path,
+            single_file_per_rank=False,
             thread_count=1,
             per_thread_copy_ahead=_SYNC_DCP_COPY_AHEAD_BYTES,
         )
+        self.serialization_format = SerializationFormat.TORCH_SAVE
         self._stage_callback = stage_callback
 
     def _report(self, stage, plan=None):
@@ -60,11 +91,14 @@ class _TelemetryFileSystemWriter(FileSystemWriter):
             return
         extra = {"checkpoint_copy_ahead_bytes": _SYNC_DCP_COPY_AHEAD_BYTES}
         if plan is not None:
-            total, largest = _planned_tensor_bytes(plan)
+            total, largest = _planned_tensor_bytes(plan.items)
             extra.update(
                 checkpoint_planned_tensor_bytes=total,
                 checkpoint_largest_tensor_bytes=largest,
-                checkpoint_streaming_target_bytes=_SYNC_DCP_COPY_AHEAD_BYTES + largest,
+                checkpoint_bucket_cap_bytes=_SYNC_DCP_BUCKET_BYTES,
+                checkpoint_streaming_tensor_target_bytes=(
+                    _SYNC_DCP_BUCKET_BYTES + _SYNC_DCP_COPY_AHEAD_BYTES + largest
+                ),
             )
         self._stage_callback(stage, extra)
 
@@ -80,7 +114,26 @@ class _TelemetryFileSystemWriter(FileSystemWriter):
 
     def write_data(self, plan, planner):
         self._report("checkpoint_dcp_before_staging", plan)
-        result = super().write_data(plan, planner)
+        buckets = _bounded_file_buckets(plan.items, _SYNC_DCP_BUCKET_BYTES)
+        results = []
+        for index, bucket in enumerate(buckets):
+            planned, largest = _planned_tensor_bytes(bucket)
+            extra = {
+                "checkpoint_dcp_bucket_count": len(buckets),
+                "checkpoint_dcp_bucket_index": index,
+                "checkpoint_dcp_bucket_planned_bytes": planned,
+                "checkpoint_dcp_bucket_largest_tensor_bytes": largest,
+            }
+            if self._stage_callback is not None:
+                self._stage_callback("checkpoint_dcp_before_bucket_write", extra)
+            file_name = f"{plan.storage_data.prefix}{index}.distcp"
+            file_queue = queue.Queue()
+            file_queue.put((self.fs.concat_path(self.path, file_name), file_name, bucket))
+            results.extend(self._write_data(planner, file_queue).wait())
+            if self._stage_callback is not None:
+                self._stage_callback("checkpoint_dcp_after_bucket_write", extra)
+        result = torch.futures.Future()
+        result.set_result(results)
         self._report("checkpoint_dcp_after_write_data", plan)
         return result
 
