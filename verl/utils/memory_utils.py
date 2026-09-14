@@ -140,7 +140,12 @@ def estimate_hdo_memory(optimizer) -> dict[str, int]:
     return result
 
 
-def log_eu_derpo_memory(stage: str, optimizer=None, phase_model_cpu_backing_bytes: int = 0) -> dict:
+def log_eu_derpo_memory(
+    stage: str,
+    optimizer=None,
+    phase_model_cpu_backing_bytes: int = 0,
+    extra=None,
+) -> dict:
     """Emit one non-collective process/node/GPU memory record per caller rank."""
     status = _read_proc_kib("/proc/self/status")
     rollup = _read_proc_kib("/proc/self/smaps_rollup")
@@ -149,6 +154,7 @@ def log_eu_derpo_memory(stage: str, optimizer=None, phase_model_cpu_backing_byte
     device = get_torch_device()
     gpu = device.is_available()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    cuda_free, cuda_total = device.mem_get_info() if gpu else (0, 0)
     values = {
         "stage": stage,
         "rank": rank,
@@ -165,12 +171,16 @@ def log_eu_derpo_memory(stage: str, optimizer=None, phase_model_cpu_backing_byte
         "cuda_reserved_gib": device.memory_reserved() / _GIB if gpu else 0.0,
         "cuda_max_allocated_gib": device.max_memory_allocated() / _GIB if gpu else 0.0,
         "cuda_max_reserved_gib": device.max_memory_reserved() / _GIB if gpu else 0.0,
+        "cuda_free_gib": cuda_free / _GIB,
+        "cuda_total_gib": cuda_total / _GIB,
         "phase_model_cpu_backing_gib": phase_model_cpu_backing_bytes / _GIB,
     }
     values.update(
         {key.replace("_bytes", "_gib"): value / _GIB if key.endswith("_bytes") else value
          for key, value in estimate_hdo_memory(optimizer).items()}
     )
+    if extra:
+        values.update(extra)
     logger.warning("EU-DERPO memory: %s", " ".join(f"{key}={value}" for key, value in values.items()))
     return values
 

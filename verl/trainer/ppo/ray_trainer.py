@@ -1242,6 +1242,12 @@ class RayPPOTrainer:
 
         return actor_output
 
+    def _should_save_checkpoint_this_step(self, is_last_step: bool, esi_close_to_expiration: bool) -> bool:
+        save_freq = self.config.trainer.save_freq
+        return save_freq > 0 and (
+            is_last_step or self.global_steps % save_freq == 0 or esi_close_to_expiration
+        )
+
     def _update_critic(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1598,31 +1604,29 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
-
-                        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
                             redundant_time=self.config.trainer.esi_redundant_time,
                         )
-                        # Check if the conditions for saving a checkpoint are met.
-                        # The conditions include a mandatory condition (1) and
-                        # one of the following optional conditions (2/3/4):
-                        # 1. The save frequency is set to a positive value.
-                        # 2. It's the last training step.
-                        # 3. The current step number is a multiple of the save frequency.
-                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_close_to_expiration
-                        ):
-                            if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                        will_save_checkpoint = self._should_save_checkpoint_this_step(
+                            is_last_step=is_last_step,
+                            esi_close_to_expiration=esi_close_to_expiration,
+                        )
+                        batch.meta_info["defer_phase_offload_for_checkpoint"] = will_save_checkpoint
+                        # update actor
+                        try:
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self._update_actor(batch)
+
+                            # The same decision drives both the worker hold and the save.
+                            if will_save_checkpoint:
+                                if esi_close_to_expiration:
+                                    print("Force saving checkpoint: ESI instance expiration approaching.")
+                                with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                    self._save_checkpoint()
+                        finally:
+                            if will_save_checkpoint:
+                                self.actor_rollout_wg.release_checkpoint_residency_hold()
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):

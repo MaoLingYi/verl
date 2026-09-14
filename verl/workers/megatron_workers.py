@@ -90,6 +90,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _GIB = 1024**3
 _RESUME_MAX_HOST_MEMORY_PERCENT = 80.0
 _RESUME_MIN_HOST_AVAILABLE_BYTES = 200 * _GIB
+_CHECKPOINT_MIN_CUDA_FREE_BYTES = 16 * _GIB
+_CHECKPOINT_MAX_CUDA_RESERVED_BYTES = 64 * _GIB
 
 
 def _is_gpu_adam_distributed_optimizer(optimizer):
@@ -425,6 +427,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_offload_param = False
         self._is_offload_grad = False
         self._is_offload_optimizer = False
+        self._checkpoint_training_residency_held = False
 
         # Initialize LoRA-related attributes (will be updated in _build_rollout if needed)
         self.base_sync_done = False
@@ -836,6 +839,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def update_actor(self, data: DataProto):
         assert self._is_actor
         eu_enabled = self.config.actor.eu_derpo.enabled
+        defer_phase_offload = bool(data.meta_info.get("defer_phase_offload_for_checkpoint", False))
         if eu_enabled:
             log_eu_derpo_memory(
                 "before_actor_update",
@@ -879,22 +883,92 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-        if eu_enabled:
-            log_eu_derpo_memory(
-                "after_actor_phase_offload",
-                self.actor_optimizer,
-                megatron_model_cpu_data_bytes(self.actor_module),
-            )
+        self._finish_actor_update_residency(defer_phase_offload, eu_enabled)
 
         aggressive_empty_cache(force_sync=True)
         return output
+
+    def _finish_actor_update_residency(self, defer_phase_offload, eu_enabled):
+        if defer_phase_offload:
+            if self._checkpoint_training_residency_held:
+                raise RuntimeError("checkpoint training residency hold is already active")
+            self._checkpoint_training_residency_held = True
+            if eu_enabled:
+                log_eu_derpo_memory(
+                    "checkpoint_hold_enter",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={
+                        "checkpoint_hold_active": 1,
+                        "defer_phase_offload_for_checkpoint": 1,
+                    },
+                )
+        else:
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+                log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+            if self._is_offload_optimizer:
+                offload_megatron_optimizer(self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+            if eu_enabled:
+                log_eu_derpo_memory(
+                    "after_actor_phase_offload",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={
+                        "checkpoint_hold_active": 0,
+                        "defer_phase_offload_for_checkpoint": 0,
+                    },
+                )
+
+    def _release_checkpoint_residency_hold(self):
+        if not self._checkpoint_training_residency_held:
+            return False
+        first_error = None
+        try:
+            if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
+                try:
+                    offload_megatron_model_to_cpu(self.actor_module)
+                except Exception as error:
+                    first_error = error
+            if self._is_offload_optimizer and not is_megatron_optimizer_offloaded(self.actor_optimizer):
+                try:
+                    offload_megatron_optimizer(self.actor_optimizer)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+            if self.config.actor.eu_derpo.enabled:
+                log_eu_derpo_memory(
+                    "after_checkpoint_reoffload",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={
+                        "checkpoint_hold_active": 1,
+                        "defer_phase_offload_for_checkpoint": 1,
+                    },
+                )
+        finally:
+            if self.config.actor.eu_derpo.enabled:
+                log_eu_derpo_memory(
+                    "checkpoint_hold_exit" if first_error is None else "checkpoint_hold_release_failed",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={
+                        "checkpoint_hold_active": int(first_error is not None),
+                        "defer_phase_offload_for_checkpoint": int(first_error is not None),
+                    },
+                )
+            self._checkpoint_training_residency_held = first_error is not None
+        aggressive_empty_cache(force_sync=True)
+        if first_error is not None:
+            raise first_error
+        return True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_checkpoint_residency_hold(self):
+        """Idempotently restore phase-offloaded residency after a checkpoint hold."""
+        return self._release_checkpoint_residency_hold()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
@@ -1137,6 +1211,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        checkpoint_hold = self._checkpoint_training_residency_held
         model_was_offloaded = self._is_offload_param and is_megatron_model_offloaded(self.actor_module)
         optimizer_was_offloaded = self._is_offload_optimizer and is_megatron_optimizer_offloaded(
             self.actor_optimizer
@@ -1149,12 +1224,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     stage,
                     self.actor_optimizer,
                     megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={
+                        "checkpoint_hold_active": int(self._checkpoint_training_residency_held),
+                        "defer_phase_offload_for_checkpoint": int(checkpoint_hold),
+                    },
                 )
 
         log_checkpoint_memory("before_checkpoint")
         model_loaded = False
         optimizer_loaded = False
         try:
+            if checkpoint_hold and (model_was_offloaded or optimizer_was_offloaded):
+                raise RuntimeError("checkpoint residency hold lost training residency before save")
             if model_was_offloaded:
                 load_megatron_model_to_gpu(self.actor_module)
                 model_loaded = True
@@ -1162,6 +1243,27 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 load_megatron_optimizer(self.actor_optimizer)
                 optimizer_loaded = True
             log_checkpoint_memory("after_checkpoint_training_residency_load")
+            if checkpoint_hold:
+                device = get_torch_device()
+                cuda_free, cuda_total = device.mem_get_info()
+                cuda_reserved = device.memory_reserved()
+                local_insufficient = (
+                    cuda_free < _CHECKPOINT_MIN_CUDA_FREE_BYTES
+                    or cuda_reserved > _CHECKPOINT_MAX_CUDA_RESERVED_BYTES
+                )
+                failure = torch.tensor(
+                    int(local_insufficient), device=get_device_name(), dtype=torch.int32
+                )
+                torch.distributed.all_reduce(failure, op=torch.distributed.ReduceOp.MAX)
+                log_checkpoint_memory("checkpoint_gpu_headroom")
+                if failure.item():
+                    raise RuntimeError(
+                        "CHECKPOINT_GPU_HEADROOM_INSUFFICIENT "
+                        f"rank={torch.distributed.get_rank()} "
+                        f"allocated_gib={device.memory_allocated() / _GIB:.2f} "
+                        f"reserved_gib={cuda_reserved / _GIB:.2f} "
+                        f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f}"
+                    )
             self.checkpoint_mananager.save_checkpoint(
                 local_path=checkpoint_path,
                 hdfs_path=hdfs_path,
@@ -1171,11 +1273,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
             torch.distributed.barrier()
         finally:
-            if model_loaded:
-                offload_megatron_model_to_cpu(self.actor_module)
-            if optimizer_loaded:
-                offload_megatron_optimizer(self.actor_optimizer)
-            log_checkpoint_memory("after_checkpoint_reoffload")
+            if checkpoint_hold:
+                self._release_checkpoint_residency_hold()
+            else:
+                if model_loaded:
+                    offload_megatron_model_to_cpu(self.actor_module)
+                if optimizer_loaded:
+                    offload_megatron_optimizer(self.actor_optimizer)
+                log_checkpoint_memory("after_checkpoint_reoffload")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):

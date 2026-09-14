@@ -57,6 +57,19 @@ def test_missing_smaps_uses_rss_for_pss(monkeypatch):
     snapshot = memory_utils.log_eu_derpo_memory("test")
     assert snapshot["rss_gib"] == 2.0
     assert snapshot["pss_gib"] == 2.0
+    assert snapshot["cuda_free_gib"] >= 0.0
+    assert snapshot["cuda_total_gib"] >= snapshot["cuda_free_gib"]
+
+
+def test_memory_log_includes_caller_lifecycle_fields(monkeypatch):
+    monkeypatch.setattr(memory_utils, "_read_proc_kib", lambda _: {})
+    monkeypatch.setattr(memory_utils, "_read_cgroup_memory", lambda: (None, None))
+    snapshot = memory_utils.log_eu_derpo_memory(
+        "checkpoint_hold_enter",
+        extra={"checkpoint_hold_active": 1, "defer_phase_offload_for_checkpoint": 1},
+    )
+    assert snapshot["checkpoint_hold_active"] == 1
+    assert snapshot["defer_phase_offload_for_checkpoint"] == 1
 
 
 def test_hdo_estimate_uses_real_selected_params_and_deduplicates_state_aliases():
