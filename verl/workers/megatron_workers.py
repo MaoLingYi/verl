@@ -1218,16 +1218,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         )
         eu_enabled = self.config.actor.eu_derpo.enabled
 
-        def log_checkpoint_memory(stage):
+        def log_checkpoint_memory(stage, checkpoint_extra=None):
             if eu_enabled:
+                extra = {
+                    "checkpoint_hold_active": int(self._checkpoint_training_residency_held),
+                    "defer_phase_offload_for_checkpoint": int(checkpoint_hold),
+                }
+                if checkpoint_extra:
+                    extra.update(checkpoint_extra)
                 log_eu_derpo_memory(
                     stage,
                     self.actor_optimizer,
                     megatron_model_cpu_data_bytes(self.actor_module),
-                    extra={
-                        "checkpoint_hold_active": int(self._checkpoint_training_residency_held),
-                        "defer_phase_offload_for_checkpoint": int(checkpoint_hold),
-                    },
+                    extra=extra,
                 )
 
         log_checkpoint_memory("before_checkpoint")

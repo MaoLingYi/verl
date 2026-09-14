@@ -673,6 +673,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 ckpt_path=dist_checkpoint_path,
                 async_save=self.checkpoint_config.async_save,
                 content_metadata=sharded_sd_metadata,
+                stage_callback=stage_callback,
             )
 
             # Synchronize all async save requests
@@ -698,6 +699,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 ckpt_path=dist_checkpoint_path,
                 async_save=self.checkpoint_config.async_save,
                 content_metadata=sharded_sd_metadata,
+                stage_callback=stage_callback,
             )
 
             # Synchronize all async save requests

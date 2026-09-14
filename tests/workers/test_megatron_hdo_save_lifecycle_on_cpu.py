@@ -312,3 +312,4 @@ def test_manager_telemetry_brackets_state_dict_and_sync_write():
     write = save.index("async_save_request = save_dist_checkpointing")
     write_stage = save.index('stage_callback("after_checkpoint_write")')
     assert generated < state_dict_stage < write < write_stage
+    assert "stage_callback=stage_callback" in save
