@@ -277,6 +277,7 @@ eu_derpo:
 
   enabled: false
   version: "1.2"
+  route_attribution: false
 
   behavior_expert_is:
     _target_: verl.workers.config.BehaviorExpertISConfig

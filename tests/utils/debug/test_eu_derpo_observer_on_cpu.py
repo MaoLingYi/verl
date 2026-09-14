@@ -114,6 +114,9 @@ class TestEUDERPOObserver(unittest.TestCase):
         parallel_state.get_tensor_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_world_size = lambda: 1
         parallel_state.get_pipeline_model_parallel_rank = lambda: 0
+        parallel_state.get_tensor_model_parallel_rank = lambda: 0
+        parallel_state.get_data_parallel_rank = lambda: 0
+        parallel_state.get_expert_model_parallel_rank = lambda: 0
         parallel_state.get_tensor_model_parallel_group = lambda: "tp"
         parallel_state.get_pipeline_model_parallel_group = lambda: "pp"
         parallel_state.get_data_parallel_group = lambda: "dp"
@@ -159,6 +162,12 @@ class TestEUDERPOObserver(unittest.TestCase):
             ]
         )
 
+    def enable_route_attribution(self):
+        self.observer.close()
+        self.observer = self.observer_class(
+            [self.model], observer_config(), diagnostics=True, route_attribution=True
+        )
+
     def tearDown(self):
         self.observer.close()
         self.all_reduce_patcher.stop()
@@ -200,7 +209,7 @@ class TestEUDERPOObserver(unittest.TestCase):
         prepass_training=True,
     ):
         self.run_prepass(training=prepass_training)
-        self.observer.start_main_batch(self.sample_ids)
+        self.observer.start_main_batch(self.sample_ids, torch.tensor([4, 9], dtype=torch.int64))
         self.assertFalse(self.observer._utility_sum[:, 0].is_contiguous())
         expert_weight = torch.arange(128, dtype=torch.float32)
         for row, sample_id in enumerate(self.sample_ids):
@@ -456,6 +465,69 @@ class TestEUDERPOObserver(unittest.TestCase):
                 self.run_auxiliary(utility_count)
         finally:
             self.set_route_behavior()
+
+    def test_route_attribution_classifies_equal_order_only_and_set_mismatch(self):
+        compare = self.observer_module._route_attribution_comparison
+        equal = compare(torch.tensor([[1, 2, 3, 4]]), torch.tensor([[1, 2, 3, 4]]))
+        self.assertTrue(equal["ordered_equal"].item())
+        self.assertTrue(equal["set_equal"].item())
+        self.assertFalse(equal["order_only"].item())
+        self.assertFalse(equal["set_mismatch"].item())
+
+        order_only = compare(torch.tensor([[1, 2, 3, 4]]), torch.tensor([[2, 1, 3, 4]]))
+        self.assertFalse(order_only["ordered_equal"].item())
+        self.assertTrue(order_only["set_equal"].item())
+        self.assertTrue(order_only["order_only"].item())
+
+        mismatch = compare(torch.tensor([[1, 2, 3, 4]]), torch.tensor([[1, 2, 3, 5]]))
+        self.assertFalse(mismatch["set_equal"].item())
+        self.assertEqual(mismatch["intersection"].item(), 3)
+        self.assertTrue(mismatch["set_mismatch"].item())
+
+    def test_route_attribution_detects_semantic_token_packing_permutation(self):
+        routes = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        # sample, group, physical row, response token, original token, valid, packed ordinal
+        f_metadata = torch.tensor([[17, 4, 0, 10, 20, 1, 30], [17, 4, 1, 11, 21, 1, 31]])
+        a_metadata = f_metadata.flip(0).clone()
+        a_metadata[:, 2] = torch.tensor([0, 1])
+        result = self.observer_module._route_attribution_comparison(
+            routes, routes, f_metadata, a_metadata
+        )
+        self.assertTrue(result["set_equal"].all())
+        self.assertFalse(result["semantic_equal"].any())
+
+    def test_route_attribution_summary_finds_first_divergence(self):
+        summary = self.observer_module._route_attribution_summary(
+            torch.tensor([3, 3, 3]), torch.tensor([0, 0, 1]), torch.tensor([0, 1, 2])
+        )
+        self.assertEqual(summary["first_order_only_layer"], 2)
+        self.assertEqual(summary["first_set_mismatch_layer"], 1)
+        self.assertEqual(summary["set_mismatch_by_layer"], [0, 1, 2])
+
+    def test_route_attribution_is_disabled_by_default(self):
+        self.run_main_backward()
+        self.finish_main()
+        self.assertFalse(self.observer.route_attribution)
+        self.assertFalse(self.observer._ordered_route_cache)
+        self.assertIsNone(self.observer._aux_attribution_counts)
+
+    def test_route_attribution_reports_detail_and_still_fails_fast(self):
+        self.enable_route_attribution()
+        self.run_main_backward()
+        _, utility_count, _ = self.finish_main()
+        self.set_route_behavior(route_shift=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "GENUINE_SET_MISMATCH"):
+                self.run_auxiliary(utility_count)
+        finally:
+            self.set_route_behavior()
+        detail = self.observer._aux_first_set_mismatch
+        self.assertEqual(detail["layer_index"], 0)
+        self.assertEqual(detail["classification"], "GENUINE_SET_MISMATCH")
+        self.assertLess(detail["intersection_count"], 8)
+        self.assertEqual(len(detail["A_top_ids"]), 12)
+        self.assertEqual(detail["response_token_F"], detail["response_token_A"])
+        self.assertEqual(detail["original_token_position_F"], detail["original_token_position_A"])
 
 
 if __name__ == "__main__":

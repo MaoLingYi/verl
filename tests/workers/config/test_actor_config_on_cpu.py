@@ -77,6 +77,7 @@ class TestActorConfig(unittest.TestCase):
 
     def test_eu_derpo_is_disabled_by_default_and_requires_explicit_hyperparameters(self):
         self.assertFalse(EUDERPOConfig().enabled)
+        self.assertFalse(EUDERPOConfig().route_attribution)
         with self.assertRaisesRegex(ValueError, "delta_e"):
             EUDERPOConfig(
                 enabled=True,

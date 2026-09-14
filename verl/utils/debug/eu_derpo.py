@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from functools import wraps
+import os
 from types import MethodType
 
 import torch
@@ -66,10 +67,51 @@ def _canonicalize_router_auxiliary_inputs(hidden, raw_logits, probs, routing_map
     return logits, actual
 
 
+@torch.no_grad()
+def _route_attribution_comparison(expected_ordered, actual_ordered, expected_metadata=None, actual_metadata=None):
+    """Classify route rows without changing the production route acceptance rule."""
+    expected = expected_ordered.long()
+    actual = actual_ordered.long()
+    ordered_equal = expected.eq(actual).all(-1)
+    expected_sorted = expected.sort(-1).values
+    actual_sorted = actual.sort(-1).values
+    set_equal = expected_sorted.eq(actual_sorted).all(-1)
+    semantic_equal = torch.ones_like(set_equal)
+    if expected_metadata is not None and actual_metadata is not None:
+        # local physical-row fields are intentionally excluded from semantic identity.
+        semantic_columns = (0, 1, 3, 4, 5, 6)
+        semantic_equal = expected_metadata[..., semantic_columns].eq(
+            actual_metadata[..., semantic_columns]
+        ).all(-1)
+    intersection = (expected[:, :, None] == actual[:, None, :]).any(-1).sum(-1)
+    return {
+        "ordered_equal": ordered_equal,
+        "set_equal": set_equal,
+        "semantic_equal": semantic_equal,
+        "intersection": intersection,
+        "order_only": ~ordered_equal & set_equal,
+        "set_mismatch": ~set_equal,
+    }
+
+
+def _route_attribution_summary(valid, order_only, set_mismatch):
+    fraction = set_mismatch.float() / valid.clamp_min(1)
+    order_layers = (order_only > 0).nonzero(as_tuple=False)
+    set_layers = (set_mismatch > 0).nonzero(as_tuple=False)
+    return {
+        "valid_by_layer": valid.cpu().tolist(),
+        "order_only_by_layer": order_only.cpu().tolist(),
+        "set_mismatch_by_layer": set_mismatch.cpu().tolist(),
+        "set_mismatch_fraction_by_layer": fraction.cpu().tolist(),
+        "first_order_only_layer": int(order_layers[0, 0].item()) if order_layers.numel() else None,
+        "first_set_mismatch_layer": int(set_layers[0, 0].item()) if set_layers.numel() else None,
+    }
+
+
 class EUDERPOObserver:
     """Capture natural routes and stream actual-alpha routing credit during main backward."""
 
-    def __init__(self, models, tf_config, diagnostics=False):
+    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -106,6 +148,7 @@ class EUDERPOObserver:
 
         self.tf_config = tf_config
         self.diagnostics = bool(diagnostics)
+        self.route_attribution = bool(route_attribution)
         self.routers = [
             module
             for model in models
@@ -125,6 +168,8 @@ class EUDERPOObserver:
 
         self.mode = None
         self.route_cache = {}
+        self._ordered_route_cache = {}
+        self._route_metadata_cache = {}
         self.current_logprob_cache = {}
         self._prepass_route_cache = {}
         self._handles = []
@@ -132,10 +177,13 @@ class EUDERPOObserver:
         self._pending_recompute = [deque() for _ in self.routers]
         self._active = None
         self._forward_routes = None
+        self._forward_ordered_routes = None
+        self._main_route_metadata = None
         self._prepass_routes = None
         self._prepass_ids = None
         self._sample_row = {}
         self._sample_ids_by_row = None
+        self._prompt_group_by_sample = {}
         self._utility_sum = None
         self._utility_sum_sq = None
         self._utility_count = None
@@ -153,6 +201,9 @@ class EUDERPOObserver:
         self._invalid_flag = None
         self._center_residual_max = None
         self._aux_stats = None
+        self._aux_attribution = None
+        self._aux_attribution_counts = None
+        self._aux_first_set_mismatch = None
         self._aux_objective = 0.0
         self._native_router_grad_sq = 0.0
         self._utility_router_grad_sq = 0.0
@@ -285,20 +336,57 @@ class EUDERPOObserver:
         except KeyError as exc:
             raise RuntimeError(f"missing EU-DERPO actual-F route for sample {exc.args[0]}") from exc
 
+    def _ordered_routes_for(self, sample_ids: torch.Tensor) -> torch.Tensor:
+        try:
+            return torch.stack([self._ordered_route_cache[int(sample_id)] for sample_id in sample_ids.tolist()])
+        except KeyError as exc:
+            raise RuntimeError(f"missing EU-DERPO attribution route for sample {exc.args[0]}") from exc
+
+    @staticmethod
+    def _ordered_selected(probs, selected):
+        order = probs.detach().float().gather(-1, selected).argsort(-1, descending=True)
+        return selected.gather(-1, order)
+
+    def _route_metadata(self, input_ids, attention_mask, sample_ids, response_mask, response_length):
+        ids = self._ids(sample_ids, input_ids.shape[0])
+        device = attention_mask.device
+        batch, sequence = attention_mask.shape
+        response = torch.arange(response_length, dtype=torch.int64, device=device)[None, :].expand(batch, -1)
+        original = response + sequence - response_length - 1
+        lengths = attention_mask.sum(-1, dtype=torch.int64)
+        tp_size = self.tf_config.tensor_model_parallel_size
+        padded = lengths + (tp_size - lengths.remainder(tp_size)).remainder(tp_size)
+        starts = torch.cat((torch.zeros(1, dtype=torch.int64, device=device), padded.cumsum(0)[:-1]))
+        valid_ordinal = attention_mask.long().cumsum(-1).gather(1, original).sub(1)
+        packed_ordinal = starts[:, None] + valid_ordinal
+        sample = torch.tensor(ids, dtype=torch.int64, device=device)[:, None].expand(-1, response_length)
+        groups = torch.tensor(
+            [self._prompt_group_by_sample[value] for value in ids], dtype=torch.int64, device=device
+        )[:, None].expand(-1, response_length)
+        local_row = torch.arange(batch, dtype=torch.int64, device=device)[:, None].expand(-1, response_length)
+        valid = response_mask.to(device).long()
+        return torch.stack((sample, groups, local_row, response, original, valid, packed_ordinal), dim=-1)
+
     def current_logprobs_for(self, sample_ids: torch.Tensor) -> torch.Tensor:
         try:
             return torch.stack([self.current_logprob_cache[int(sample_id)] for sample_id in sample_ids.tolist()])
         except KeyError as exc:
             raise RuntimeError(f"missing EU-DERPO actual-F current logprob for sample {exc.args[0]}") from exc
 
-    def start_main_batch(self, sample_ids: torch.Tensor):
+    def start_main_batch(self, sample_ids: torch.Tensor, prompt_groups: torch.Tensor | None = None):
         ids = self._ids(sample_ids, sample_ids.numel())
         if len(set(ids)) != len(ids):
             raise RuntimeError("duplicate EU-DERPO main sample id")
         self.route_cache.clear()
+        self._ordered_route_cache.clear()
+        self._route_metadata_cache.clear()
         self.current_logprob_cache.clear()
         self.mode = "main"
         self._sample_row = {sample_id: row for row, sample_id in enumerate(ids)}
+        if prompt_groups is None:
+            prompt_groups = torch.full_like(sample_ids, -1)
+        groups = self._ids(prompt_groups, sample_ids.numel())
+        self._prompt_group_by_sample = dict(zip(ids, groups))
         device = self.routers[0].weight.device
         self._sample_ids_by_row = sample_ids.to(device)
         shape = (len(ids), len(self.routers), self.num_experts)
@@ -345,21 +433,37 @@ class EUDERPOObserver:
         ).squeeze(-1)
         self._active = (packed_rows.long(), packed_valid, packed_tokens.long())
         self._forward_routes = [None] * len(self.routers)
+        if self.route_attribution:
+            self._forward_ordered_routes = [None] * len(self.routers)
+            self._main_route_metadata = self._route_metadata(
+                input_ids, attention_mask, sample_ids, response_mask, response_length
+            ).cpu()
 
     @torch.no_grad()
     def finish_main_microbatch(self, input_ids, attention_mask, sample_ids, response_length):
         routes = RouterShiftObserver._unpack_sequence_parallel(
             self._forward_routes, input_ids, attention_mask
         )[:, -response_length - 1 : -1]
+        if self.route_attribution:
+            ordered_routes = RouterShiftObserver._unpack_sequence_parallel(
+                self._forward_ordered_routes, input_ids, attention_mask
+            )[:, -response_length - 1 : -1]
         expected = (input_ids.shape[0], response_length, len(self.routers), self.topk)
         if routes.shape != expected or routes.dtype != torch.uint8:
             raise RuntimeError(f"EU-DERPO actual-F route shape/dtype mismatch: {routes.shape}, {routes.dtype}")
+        if self.route_attribution and (ordered_routes.shape != expected or ordered_routes.dtype != torch.uint8):
+            raise RuntimeError("EU-DERPO attribution ordered-route shape/dtype mismatch")
         for row, sample_id in enumerate(self._ids(sample_ids, input_ids.shape[0])):
             if sample_id in self.route_cache:
                 raise RuntimeError(f"duplicate EU-DERPO actual-F sample id: {sample_id}")
             self.route_cache[sample_id] = routes[row].cpu()
+            if self.route_attribution:
+                self._ordered_route_cache[sample_id] = ordered_routes[row].cpu()
+                self._route_metadata_cache[sample_id] = self._main_route_metadata[row]
         self._active = None
         self._forward_routes = None
+        self._forward_ordered_routes = None
+        self._main_route_metadata = None
         return routes
 
     @torch.no_grad()
@@ -402,6 +506,8 @@ class EUDERPOObserver:
                 raise RuntimeError("EU-DERPO original forward has no microbatch context")
             rows, valid, tokens = self._active
             self._forward_routes[index] = actual_set.detach().to(torch.uint8)
+            if self.route_attribution:
+                self._forward_ordered_routes[index] = self._ordered_selected(output[0], actual_set).to(torch.uint8)
             self._pending_recompute[index].append((self._active, actual_set.detach()))
 
     @torch.no_grad()
@@ -468,9 +574,19 @@ class EUDERPOObserver:
             )
 
     @torch.no_grad()
-    def _check_aux_route(self, index, expected, actual, valid):
+    def _check_aux_route(self, index, expected, actual, valid, expected_ordered=None, actual_ordered=None):
         mismatch = (~expected.long().sort(-1).values.eq(actual.long().sort(-1).values))[valid].sum()
         self._route_mismatch_by_layer[index] += mismatch
+        if not self.route_attribution:
+            return None
+        expected_metadata, actual_metadata = self._aux_attribution[1:]
+        comparison = _route_attribution_comparison(
+            expected_ordered, actual_ordered, expected_metadata, actual_metadata
+        )
+        self._aux_attribution_counts[0, index] += valid.sum()
+        self._aux_attribution_counts[1, index] += (comparison["order_only"] & valid).sum()
+        self._aux_attribution_counts[2, index] += (comparison["set_mismatch"] & valid).sum()
+        return comparison
 
     @torch.no_grad()
     def _alpha_grad(self, record, grad):
@@ -631,6 +747,10 @@ class EUDERPOObserver:
         self._native_router_grad_sq = 0.0
         self._utility_router_grad_sq = 0.0
         self._router_grad_dot = 0.0
+        if self.route_attribution:
+            device = self.routers[0].weight.device
+            self._aux_attribution_counts = torch.zeros((3, len(self.routers)), dtype=torch.int64, device=device)
+            self._aux_first_set_mismatch = None
 
     @torch.no_grad()
     def begin_aux_microbatch(self, input_ids, attention_mask, sample_ids, response_mask, response_length):
@@ -653,16 +773,107 @@ class EUDERPOObserver:
             response_mask[..., None], input_ids, attention_mask, response_length
         ).squeeze(-1).bool()
         self._active = (packed_routes, packed_weights, packed_valid, lambda_u)
+        if self.route_attribution:
+            ordered = self._ordered_routes_for(sample_ids)
+            packed_ordered = RouterShiftObserver._pack_sequence_parallel(
+                ordered, input_ids, attention_mask, response_length
+            ).permute(1, 0, 2)
+            expected_metadata = torch.stack(
+                [self._route_metadata_cache[int(sample_id)] for sample_id in sample_ids.tolist()]
+            )
+            actual_metadata = self._route_metadata(
+                input_ids, attention_mask, sample_ids, response_mask, response_length
+            )
+            packed_expected_metadata = RouterShiftObserver._pack_sequence_parallel(
+                expected_metadata, input_ids, attention_mask, response_length
+            )
+            packed_actual_metadata = RouterShiftObserver._pack_sequence_parallel(
+                actual_metadata, input_ids, attention_mask, response_length
+            )
+            self._aux_attribution = (
+                packed_ordered,
+                packed_expected_metadata,
+                packed_actual_metadata,
+            )
 
     def finish_aux_microbatch(self):
         self._active = None
+        self._aux_attribution = None
+
+    @torch.no_grad()
+    def _remember_aux_attribution(self, index, logits, expected, actual, actual_ordered, valid, comparison):
+        mismatch = comparison["set_mismatch"] & valid
+        if self._aux_first_set_mismatch is not None or not mismatch.any():
+            return
+        packed = int(mismatch.nonzero(as_tuple=False)[0, 0].item())
+        expected_ordered, expected_metadata, actual_metadata = self._aux_attribution
+        f_ordered = expected_ordered[index, packed].long()
+        a_ordered = actual_ordered[packed].long()
+        f_sorted = f_ordered.sort().values
+        a_sorted = a_ordered.sort().values
+        f_only = f_sorted[~(f_sorted[:, None] == a_sorted[None, :]).any(-1)]
+        a_only = a_sorted[~(a_sorted[:, None] == f_sorted[None, :]).any(-1)]
+        topn = min(self.topk + 4, self.num_experts)
+        top_scores, top_ids = logits[packed].detach().float().topk(topn)
+        top_positions = {int(expert): position + 1 for position, expert in enumerate(top_ids.tolist())}
+        f_meta = expected_metadata[packed].long()
+        a_meta = actual_metadata[packed].long()
+        from megatron.core import parallel_state as mpu
+
+        self._aux_first_set_mismatch = {
+            "global_rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            "tp_rank": mpu.get_tensor_model_parallel_rank(),
+            "dp_rank": mpu.get_data_parallel_rank(),
+            "ep_rank": mpu.get_expert_model_parallel_rank(),
+            "layer_index": index,
+            "module": type(self.routers[index]).__name__,
+            "sample_id": int(a_meta[0].item()),
+            "sample_row": self._sample_row.get(int(a_meta[0].item()), -1),
+            "local_batch_index_F": int(f_meta[2].item()),
+            "local_batch_index_A": int(a_meta[2].item()),
+            "prompt_group": int(a_meta[1].item()),
+            "original_token_position_F": int(f_meta[4].item()),
+            "original_token_position_A": int(a_meta[4].item()),
+            "response_token_F": int(f_meta[3].item()),
+            "response_token_A": int(a_meta[3].item()),
+            "packed_token_ordinal_F": int(f_meta[6].item()),
+            "packed_token_ordinal_A": int(a_meta[6].item()),
+            "sp_local_token_index": packed,
+            "valid_F": bool(f_meta[5].item()),
+            "valid_A": bool(a_meta[5].item()),
+            "semantic_equal": bool(comparison["semantic_equal"][packed].item()),
+            "F_ordered": f_ordered.tolist(),
+            "A_ordered": a_ordered.tolist(),
+            "F_sorted": f_sorted.tolist(),
+            "A_sorted": a_sorted.tolist(),
+            "ordered_equal": bool(comparison["ordered_equal"][packed].item()),
+            "set_equal": bool(comparison["set_equal"][packed].item()),
+            "intersection_count": int(comparison["intersection"][packed].item()),
+            "F_only": f_only.tolist(),
+            "A_only": a_only.tolist(),
+            "F_only_A_top_positions": {
+                int(expert): top_positions.get(int(expert)) for expert in f_only.tolist()
+            },
+            "A_top_ids": top_ids.tolist(),
+            "A_top_scores": top_scores.tolist(),
+            "A_kth_expert": int(top_ids[self.topk - 1].item()),
+            "A_kplus1_expert": int(top_ids[self.topk].item()),
+            "A_boundary_margin": float((top_scores[self.topk - 1] - top_scores[self.topk]).item()),
+            "classification": (
+                "GENUINE_SET_MISMATCH" if comparison["semantic_equal"][packed] else "ALIGNMENT_MISMATCH"
+            ),
+        }
+        print("========== EU-DERPO ROUTE ATTRIBUTION ==========", flush=True)
+        for key, value in self._aux_first_set_mismatch.items():
+            print(f"{key}={value}", flush=True)
+        print("================================================", flush=True)
 
     def _observe_aux(self, index, module, hidden, output):
         if self._active is None:
             raise RuntimeError("EU-DERPO auxiliary forward has no microbatch context")
         routes, weights, valid, lambda_u = self._active
         actual = self._selected(output[1], self.topk)
-        self._check_aux_route(index, routes[index], actual, valid)
         with torch.enable_grad():
             raw_logits = module._verl_eu_derpo_original_gating(hidden.detach())
             logits, actual = _canonicalize_router_auxiliary_inputs(
@@ -671,6 +882,16 @@ class EUDERPOObserver:
             selected_logits = logits.float().gather(-1, actual)
             log_alpha = selected_logits.log_softmax(-1)
             actual_alpha = output[0].gather(-1, actual)
+            if self.route_attribution:
+                actual_ordered = self._ordered_selected(output[0], actual)
+                comparison = self._check_aux_route(
+                    index, routes[index], actual, valid, self._aux_attribution[0][index], actual_ordered
+                )
+                self._remember_aux_attribution(
+                    index, logits, routes[index], actual, actual_ordered, valid, comparison
+                )
+            else:
+                self._check_aux_route(index, routes[index], actual, valid)
             if actual_alpha.shape != log_alpha.shape:
                 raise RuntimeError(
                     "EU-DERPO Router auxiliary selected-alpha shape contract failed: "
@@ -703,11 +924,34 @@ class EUDERPOObserver:
     def finish_aux_batch(self):
         mismatch = int(self._global_layer_mismatch().sum().item())
         invalid = self._global_invalid()
+        attribution = None
+        if self.route_attribution:
+            valid = self._global_layer_values(self._aux_attribution_counts[0])
+            order_only = self._global_layer_values(self._aux_attribution_counts[1])
+            set_mismatch = self._global_layer_values(self._aux_attribution_counts[2])
+            attribution = _route_attribution_summary(valid, order_only, set_mismatch)
+            attribution["first_local_set_mismatch"] = self._aux_first_set_mismatch
+            set_fraction = torch.tensor(attribution["set_mismatch_fraction_by_layer"])
+            from megatron.core import parallel_state as mpu
+
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                print("EU-DERPO route attribution summary", flush=True)
+                print("layer | valid | order_only | set_mismatch | fraction", flush=True)
+                for layer, values in enumerate(zip(valid.tolist(), order_only.tolist(), set_mismatch.tolist(), set_fraction.tolist())):
+                    print(f"{layer} | {values[0]} | {values[1]} | {values[2]} | {values[3]:.8g}", flush=True)
+                print(
+                    f"first_order_only_layer={attribution['first_order_only_layer']} "
+                    f"first_set_mismatch_layer={attribution['first_set_mismatch_layer']}",
+                    flush=True,
+                )
         if mismatch:
-            raise RuntimeError("EU-DERPO auxiliary natural route differs from the main route")
+            suffix = f": {attribution}" if attribution is not None else ""
+            raise RuntimeError("EU-DERPO auxiliary natural route differs from the main route" + suffix)
         if invalid:
             raise FloatingPointError("EU-DERPO auxiliary alpha or Router gradient is invalid")
         metrics = {"utility_objective": self._aux_objective}
+        if attribution is not None:
+            metrics["route_attribution"] = attribution
         if self.diagnostics:
             grad_stats = torch.tensor(
                 [self._native_router_grad_sq, self._utility_router_grad_sq, self._router_grad_dot],
@@ -729,9 +973,12 @@ class EUDERPOObserver:
         self.mode = None
         self._aux_stats = None
         self.route_cache.clear()
+        self._ordered_route_cache.clear()
+        self._route_metadata_cache.clear()
         self.current_logprob_cache.clear()
         self._prepass_route_cache.clear()
         self._sample_row.clear()
+        self._prompt_group_by_sample.clear()
         self._sample_ids_by_row = None
         self._utility_sum = None
         self._utility_sum_sq = None
@@ -747,11 +994,16 @@ class EUDERPOObserver:
         self._alpha_min = None
         self._invalid_flag = None
         self._center_residual_max = None
+        self._aux_attribution = None
+        self._aux_attribution_counts = None
+        self._aux_first_set_mismatch = None
         return metrics
 
     def clear(self):
         self.mode = None
         self.route_cache.clear()
+        self._ordered_route_cache.clear()
+        self._route_metadata_cache.clear()
         self.current_logprob_cache.clear()
         self._prepass_route_cache.clear()
         self._pending_alpha.clear()
@@ -759,9 +1011,12 @@ class EUDERPOObserver:
             queue.clear()
         self._active = None
         self._forward_routes = None
+        self._forward_ordered_routes = None
+        self._main_route_metadata = None
         self._prepass_routes = None
         self._prepass_ids = None
         self._sample_row.clear()
+        self._prompt_group_by_sample.clear()
         self._utility_sum = None
         self._utility_sum_sq = None
         self._utility_count = None
@@ -774,6 +1029,9 @@ class EUDERPOObserver:
         self._first_route_mismatch.clear()
         self._phase_execution.clear()
         self._aux_stats = None
+        self._aux_attribution = None
+        self._aux_attribution_counts = None
+        self._aux_first_set_mismatch = None
         self._alpha_summary.clear()
         self._alpha_min = None
         self._invalid_flag = None

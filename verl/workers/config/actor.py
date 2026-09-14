@@ -74,6 +74,7 @@ class RoutingUtilityConfig(BaseConfig):
 class EUDERPOConfig(BaseConfig):
     enabled: bool = False
     version: str = "1.2"
+    route_attribution: bool = False
     behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
     expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
     routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)

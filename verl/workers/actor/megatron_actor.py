@@ -257,6 +257,7 @@ class MegatronPPOActor(BasePPOActor):
                 [unwrap_model(model) for model in self.actor_module],
                 self.tf_config,
                 diagnostics=self.config.eu_derpo.routing_utility.diagnostics,
+                route_attribution=self.config.eu_derpo.route_attribution,
             )
 
         config = get_model_config(self.actor_module[0])
@@ -1036,7 +1037,9 @@ class MegatronPPOActor(BasePPOActor):
                 if missing:
                     raise RuntimeError(f"EU-DERPO missing required DataProto fields: {sorted(missing)}")
                 sample_ids = data.batch["eu_derpo_sample_ids"].cpu()
-                self.eu_derpo_observer.start_main_batch(sample_ids)
+                self.eu_derpo_observer.start_main_batch(
+                    sample_ids, data.batch["eu_derpo_prompt_group"].cpu()
+                )
                 eu_state = sample_ids
             if self.config.router_shift_weighting.enabled:
                 self.router_shift_observer.start_current_batch()
