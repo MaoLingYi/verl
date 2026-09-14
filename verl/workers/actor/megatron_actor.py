@@ -61,6 +61,7 @@ from verl.utils.megatron.router_replay_utils import (
 from verl.utils.debug.router_shift import RouterShiftObserver, clear_router_shift_on_error
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
+from verl.utils.logger import print_rank_0
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -246,14 +247,17 @@ class MegatronPPOActor(BasePPOActor):
                     or not self.config.megatron.optimizer_offload
                     or self.config.megatron.grad_offload
                 ),
-                "native_cpu_adam": (
-                    optimizer_override.get("optimizer_cpu_offload", False)
-                    or optimizer_override.get("optimizer_offload_fraction", 0.0) != 0.0
+                "native_hdo_cpu_offload": (
+                    optimizer_override.get("optimizer_cpu_offload") is not True
+                    or optimizer_override.get("optimizer_offload_fraction") != 1.0
                 ),
             }
             enabled_conflicts = [name for name, enabled in conflicts.items() if enabled]
             if enabled_conflicts:
                 raise ValueError(f"EU-DERPO V1.2.1 incompatible actor settings: {enabled_conflicts}")
+            print_rank_0(
+                "EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=1.0"
+            )
             self.eu_derpo_observer = EUDERPOObserver(
                 [unwrap_model(model) for model in self.actor_module],
                 self.tf_config,

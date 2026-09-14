@@ -21,6 +21,12 @@ def function_source(path: Path, name: str) -> str:
 
 
 class TestEUDERPOV121ActorContract(unittest.TestCase):
+    def test_actor_requires_native_hdo_full_cpu_offload(self):
+        source = ACTOR.read_text(encoding="utf-8")
+        self.assertIn('optimizer_override.get("optimizer_cpu_offload") is not True', source)
+        self.assertIn('optimizer_override.get("optimizer_offload_fraction") != 1.0', source)
+        self.assertIn("optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=1.0", source)
+
     def test_update_policy_has_no_full_auxiliary_forward(self):
         source = function_source(ACTOR, "update_policy")
         self.assertIn("run_router_only_step_e", source)

@@ -575,6 +575,14 @@ class EUDERPOObserver:
             )
         if not decision["passed"]:
             raise MemoryError(f"EU-DERPO node RAM preflight failed: {decision}")
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(
+                "EU-DERPO host RAM preflight: "
+                f"MemAvailable_before_actor_update={decision['mem_available']} "
+                f"EU_cache_required_bytes={local_required} "
+                f"node_EU_cache_required_bytes={decision['node_required']}",
+                flush=True,
+            )
         return decision
 
     def wrap_native_finalize(self, original_finalize):
@@ -658,8 +666,10 @@ class EUDERPOObserver:
             "support_cache_bytes": byte_plan["support"],
             "semantic_metadata_bytes": byte_plan["metadata"],
             "pageable_cache_peak_bytes": sum(byte_plan.values()),
+            "eu_cache_required_bytes": sum(byte_plan.values()),
             "node_required_cache_bytes": ram["node_required"],
             "mem_available_before_allocation_bytes": ram["mem_available"],
+            "mem_available_before_actor_update_bytes": ram["mem_available"],
             "host_safety_margin_bytes": ram["safety_margin"],
         }
         self._native_finalize_count = 0
