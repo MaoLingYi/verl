@@ -98,6 +98,25 @@ def _gather_diagnostic_values(values: torch.Tensor) -> torch.Tensor:
     return values.cpu()
 
 
+def _append_eu_derpo_scalar_metrics(metrics, observer_metrics):
+    structured = {"first_route_mismatch", "route_phase_execution", "route_attribution"}
+    by_layer = {
+        "layer_mismatch_count",
+        "gradient_hook_count_by_layer",
+        "utility_edge_count_by_layer",
+        "aux_reduce_count_by_layer",
+        "main_grad_add_count_by_layer",
+    }
+    for key, value in observer_metrics.items():
+        if key in structured:
+            continue
+        if key in by_layer:
+            for layer, count in enumerate(value):
+                metrics[f"actor/eu_derpo/{key}_{layer}"] = [count]
+        elif not isinstance(value, list):
+            metrics[f"actor/eu_derpo/{key}"] = [value]
+
+
 class MegatronPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -1183,18 +1202,7 @@ class MegatronPPOActor(BasePPOActor):
                     metrics["actor/eu_derpo/objective_total"] = [
                         objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
                     ]
-                    for key, value in (eu_metrics | auxiliary_metrics).items():
-                        if key in {
-                            "layer_mismatch_count",
-                            "gradient_hook_count_by_layer",
-                            "utility_edge_count_by_layer",
-                            "aux_reduce_count_by_layer",
-                            "main_grad_add_count_by_layer",
-                        }:
-                            for layer, count in enumerate(value):
-                                metrics[f"actor/eu_derpo/{key}_{layer}"] = [count]
-                        elif not isinstance(value, list):
-                            metrics[f"actor/eu_derpo/{key}"] = [value]
+                    _append_eu_derpo_scalar_metrics(metrics, eu_metrics | auxiliary_metrics)
                     if utility_cfg.diagnostics:
                         active = stats_eu.active
                         cluster_utility = utility_sum / utility_count.masked_fill(utility_count == 0, 1)

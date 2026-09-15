@@ -94,6 +94,19 @@ _CHECKPOINT_MIN_CUDA_FREE_BYTES = 16 * _GIB
 _CHECKPOINT_MAX_CUDA_RESERVED_BYTES = 64 * _GIB
 
 
+def _validate_actor_metrics_schema(metrics):
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            raise TypeError(f"actor metric {key!r} has non-reducible value_type=dict")
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    raise TypeError(
+                        f"actor metric {key!r} has non-reducible list element "
+                        f"index={index} element_type=dict"
+                    )
+
+
 def _is_gpu_adam_distributed_optimizer(optimizer):
     from megatron.core.optimizer import ChainedOptimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -888,6 +901,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)
         self.actor_optimizer_scheduler.step(1)
+        if eu_enabled:
+            _validate_actor_metrics_schema(metrics)
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={"metrics": metrics})
