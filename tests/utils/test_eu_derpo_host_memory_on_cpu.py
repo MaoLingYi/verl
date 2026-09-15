@@ -72,6 +72,17 @@ def test_memory_log_includes_caller_lifecycle_fields(monkeypatch):
     assert snapshot["defer_phase_offload_for_checkpoint"] == 1
 
 
+def test_memory_instrumentation_has_no_tensor_copy_or_cuda_sync():
+    source = Path(memory_utils.__file__).read_text(encoding="utf-8")
+    start = source.index("def log_eu_derpo_memory(")
+    end = source.index("\ndef aggressive_empty_cache", start)
+    instrumentation = source[start:end]
+    assert ".clone(" not in instrumentation
+    assert ".to(" not in instrumentation
+    assert ".cpu(" not in instrumentation
+    assert ".synchronize(" not in instrumentation
+
+
 def test_hdo_estimate_uses_real_selected_params_and_deduplicates_state_aliases():
     cpu_param = torch.zeros(7, dtype=torch.float32)
     exp_avg = torch.zeros_like(cpu_param)

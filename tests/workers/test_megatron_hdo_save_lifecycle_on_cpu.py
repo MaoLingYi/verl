@@ -28,9 +28,14 @@ def _residency_helpers():
     return namespace, DDP
 
 
-def _save_checkpoint_method(events, residency, *, held=False, fail=False, cuda_free_gib=32):
+def _save_checkpoint_method(
+    events, residency, *, held=False, fail=False, cuda_free_gib=32, skip_post_checkpoint_optimizer_offload=False
+):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker"
+    )
     release = next(
         node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_release_checkpoint_residency_hold"
     )
@@ -100,6 +105,7 @@ def _save_checkpoint_method(events, residency, *, held=False, fail=False, cuda_f
         "aggressive_empty_cache": lambda **_: events.append("empty_cache"),
         "get_torch_device": Device,
         "get_device_name": lambda: "cpu",
+        "logger": SimpleNamespace(warning=lambda message: events.append(message)),
         "torch": fake_torch,
     }
     exec(compile(ast.Module(body=[release, method], type_ignores=[]), str(WORKER), "exec"), namespace)
@@ -118,7 +124,14 @@ def _save_checkpoint_method(events, residency, *, held=False, fail=False, cuda_f
         _is_offload_optimizer=True,
         actor_module=object(),
         actor_optimizer=object(),
-        config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=SimpleNamespace(enabled=True))),
+        config=SimpleNamespace(
+            actor=SimpleNamespace(
+                eu_derpo=SimpleNamespace(
+                    enabled=True,
+                    skip_post_checkpoint_optimizer_offload=skip_post_checkpoint_optimizer_offload,
+                )
+            )
+        ),
         checkpoint_mananager=CheckpointManager(),
         _checkpoint_training_residency_held=held,
     )
@@ -233,12 +246,50 @@ def test_checkpoint_hold_skips_reload_and_reoffloads_after_sync_write():
         "after_checkpoint_state_dict",
         "after_checkpoint_write",
         "worker_barrier",
+        "post_ckpt_reoffload_before",
         "offload_model",
+        "post_ckpt_after_param_offload",
+        "post_ckpt_before_optimizer_offload",
         "offload_optimizer",
-        "after_checkpoint_reoffload",
+        "post_ckpt_after_optimizer_offload",
+        "post_ckpt_reoffload_done",
         "checkpoint_hold_exit",
         "empty_cache",
     ]
+
+
+def test_checkpoint_hold_experiment_offloads_param_but_keeps_hdo_gpu_residency():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    save = _save_checkpoint_method(events, residency, held=True, skip_post_checkpoint_optimizer_offload=True)
+    assert save.__self__._is_offload_optimizer is True
+    save("/checkpoint", global_step=1)
+    assert residency == {"model": False, "optimizer": True}
+    assert "offload_model" in events
+    assert "offload_optimizer" not in events
+    assert "optimizer phase offload skipped by experiment" in events
+    stages = [
+        "post_ckpt_reoffload_before",
+        "post_ckpt_after_param_offload",
+        "post_ckpt_before_optimizer_offload",
+        "post_ckpt_after_optimizer_offload",
+        "post_ckpt_reoffload_done",
+        "checkpoint_hold_exit",
+    ]
+    assert [event for event in events if event in stages] == stages
+
+
+def test_checkpoint_hold_experiment_save_failure_still_releases_hold():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    save = _save_checkpoint_method(
+        events, residency, held=True, fail=True, skip_post_checkpoint_optimizer_offload=True
+    )
+    with pytest.raises(RuntimeError, match="save failed"):
+        save("/checkpoint", global_step=1)
+    assert residency == {"model": False, "optimizer": True}
+    assert save.__self__._checkpoint_training_residency_held is False
+    assert events[-2:] == ["checkpoint_hold_exit", "empty_cache"]
 
 
 def test_checkpoint_hold_save_failure_still_reoffloads():
@@ -248,10 +299,14 @@ def test_checkpoint_hold_save_failure_still_reoffloads():
     with pytest.raises(RuntimeError, match="save failed"):
         save("/checkpoint", global_step=1)
     assert residency == {"model": False, "optimizer": False}
-    assert events[-5:] == [
+    assert events[-9:] == [
+        "post_ckpt_reoffload_before",
         "offload_model",
+        "post_ckpt_after_param_offload",
+        "post_ckpt_before_optimizer_offload",
         "offload_optimizer",
-        "after_checkpoint_reoffload",
+        "post_ckpt_after_optimizer_offload",
+        "post_ckpt_reoffload_done",
         "checkpoint_hold_exit",
         "empty_cache",
     ]
@@ -265,10 +320,14 @@ def test_checkpoint_gpu_headroom_failure_skips_write_and_releases_hold():
         save("/checkpoint", global_step=1)
     assert "save" not in events
     assert residency == {"model": False, "optimizer": False}
-    assert events[-5:] == [
+    assert events[-9:] == [
+        "post_ckpt_reoffload_before",
         "offload_model",
+        "post_ckpt_after_param_offload",
+        "post_ckpt_before_optimizer_offload",
         "offload_optimizer",
-        "after_checkpoint_reoffload",
+        "post_ckpt_after_optimizer_offload",
+        "post_ckpt_reoffload_done",
         "checkpoint_hold_exit",
         "empty_cache",
     ]
@@ -283,6 +342,25 @@ def test_checkpoint_hold_release_is_idempotent():
     after_first = list(events)
     assert worker._release_checkpoint_residency_hold() is False
     assert events == after_first
+
+
+def test_experiment_flag_is_read_only_by_checkpoint_hold_release():
+    source = WORKER.read_text(encoding="utf-8")
+    assert source.count("skip_post_checkpoint_optimizer_offload") == 1
+    release = source[source.index("    def _release_checkpoint_residency_hold") :]
+    assert "skip_post_checkpoint_optimizer_offload" in release
+    init = source[source.index("    def init_model") : source.index("    async def rollout_mode")]
+    normal_update = source[
+        source.index("    def _finish_actor_update_residency") :
+        source.index("    def _release_checkpoint_residency_hold")
+    ]
+    generate = source[source.index("    def generate_sequences") : source.index("    def compute_log_prob")]
+    assert "if self._is_offload_optimizer:" in init
+    assert "if self._is_offload_optimizer:" in normal_update
+    assert "if self._is_offload_optimizer:" in generate
+    load = source[source.index("    def load_checkpoint") : source.index("    def load_pretrained_model")]
+    assert "self._is_offload_optimizer" in load
+    assert "optimizer_offload=true" in load
 
 
 def test_residency_guards_read_storage_and_device_not_python_identity():

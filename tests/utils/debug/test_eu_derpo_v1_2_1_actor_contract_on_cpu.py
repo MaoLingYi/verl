@@ -9,6 +9,7 @@ ROOT = Path(__file__).parents[3]
 ACTOR = ROOT / "verl" / "workers" / "actor" / "megatron_actor.py"
 OBSERVER = ROOT / "verl" / "utils" / "debug" / "eu_derpo.py"
 CONFIG = ROOT / "verl" / "workers" / "config" / "actor.py"
+ACTOR_YAML = ROOT / "verl" / "trainer" / "config" / "actor" / "actor.yaml"
 OPTIMIZER = ROOT / "verl" / "utils" / "megatron" / "optimizer.py"
 
 
@@ -27,6 +28,23 @@ class TestEUDERPOV121ActorContract(unittest.TestCase):
         self.assertIn('optimizer_override.get("optimizer_cpu_offload") is not True', source)
         self.assertIn('optimizer_override.get("optimizer_offload_fraction") != 0.75', source)
         self.assertIn("optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75", source)
+
+    def test_actor_requires_original_phase_offload_contract(self):
+        source = ACTOR.read_text(encoding="utf-8")
+        phase_guard = source[source.index('"phase_offload"'):source.index('"native_hdo_cpu_offload"')]
+        self.assertIn("param_offload", phase_guard)
+        self.assertIn("grad_offload", phase_guard)
+        self.assertIn("optimizer_offload", phase_guard)
+
+    def test_post_checkpoint_optimizer_skip_defaults_off(self):
+        self.assertIn(
+            "skip_post_checkpoint_optimizer_offload: bool = False",
+            CONFIG.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "skip_post_checkpoint_optimizer_offload: false",
+            ACTOR_YAML.read_text(encoding="utf-8"),
+        )
 
     def test_optimizer_override_is_passed_to_mcore_optimizer_config(self):
         source = function_source(OPTIMIZER, "init_megatron_optim_config")

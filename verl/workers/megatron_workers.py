@@ -810,6 +810,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
+        if self.config.actor.eu_derpo.enabled:
+            log_eu_derpo_memory(
+                "before_rollout_update_weights",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+                extra={
+                    "checkpoint_hold_active": int(self._checkpoint_training_residency_held),
+                    "defer_phase_offload_for_checkpoint": 0,
+                },
+            )
         if do_lora_base_sync:
             # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
@@ -926,28 +936,48 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if not self._checkpoint_training_residency_held:
             return False
         first_error = None
-        try:
-            if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
-                try:
-                    offload_megatron_model_to_cpu(self.actor_module)
-                except Exception as error:
-                    first_error = error
-            if self._is_offload_optimizer and not is_megatron_optimizer_offloaded(self.actor_optimizer):
-                try:
-                    offload_megatron_optimizer(self.actor_optimizer)
-                except Exception as error:
-                    if first_error is None:
-                        first_error = error
+
+        def log_reoffload(stage, **extra):
             if self.config.actor.eu_derpo.enabled:
                 log_eu_derpo_memory(
-                    "after_checkpoint_reoffload",
+                    stage,
                     self.actor_optimizer,
                     megatron_model_cpu_data_bytes(self.actor_module),
                     extra={
                         "checkpoint_hold_active": 1,
                         "defer_phase_offload_for_checkpoint": 1,
+                        **extra,
                     },
                 )
+
+        skip_optimizer_offload = bool(
+            self.config.actor.eu_derpo.enabled
+            and self.config.actor.eu_derpo.skip_post_checkpoint_optimizer_offload
+        )
+        try:
+            log_reoffload("post_ckpt_reoffload_before")
+            if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
+                try:
+                    offload_megatron_model_to_cpu(self.actor_module)
+                except Exception as error:
+                    first_error = error
+            log_reoffload("post_ckpt_after_param_offload")
+            log_reoffload("post_ckpt_before_optimizer_offload")
+            if (
+                self._is_offload_optimizer
+                and not skip_optimizer_offload
+                and not is_megatron_optimizer_offloaded(self.actor_optimizer)
+            ):
+                try:
+                    offload_megatron_optimizer(self.actor_optimizer)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+            elif skip_optimizer_offload:
+                logger.warning("optimizer phase offload skipped by experiment")
+            skipped = int(skip_optimizer_offload)
+            log_reoffload("post_ckpt_after_optimizer_offload", optimizer_phase_offload_skipped=skipped)
+            log_reoffload("post_ckpt_reoffload_done", optimizer_phase_offload_skipped=skipped)
         finally:
             if self.config.actor.eu_derpo.enabled:
                 log_eu_derpo_memory(

@@ -6,6 +6,7 @@ from types import MethodType, SimpleNamespace
 
 
 TRAINER = Path(__file__).resolve().parents[3] / "verl" / "trainer" / "ppo" / "ray_trainer.py"
+WORKER = Path(__file__).resolve().parents[3] / "verl" / "workers" / "megatron_workers.py"
 
 
 def _save_decision(global_steps: int, save_freq: int, *, last=False, esi=False):
@@ -42,3 +43,10 @@ def test_checkpoint_hold_uses_the_same_decision_and_has_driver_cleanup():
     cleanup = fit.index("self.actor_rollout_wg.release_checkpoint_residency_hold()", save)
     update_weights = fit.index("self.checkpoint_manager.update_weights(self.global_steps)", cleanup)
     assert decision < defer < update < save < cleanup < update_weights
+
+
+def test_rollout_memory_stage_precedes_weight_update():
+    source = WORKER.read_text(encoding="utf-8")
+    start = source.index("    async def rollout_mode(self):")
+    rollout = source[start:source.index("    @register", start)]
+    assert rollout.index('"before_rollout_update_weights"') < rollout.index("await self.rollout.update_weights")

@@ -277,6 +277,7 @@ eu_derpo:
 
   enabled: false
   version: "1.2.1"
+  skip_post_checkpoint_optimizer_offload: false
   route_attribution: false
   step_e_implementation: actual_f_router_only
   hidden_source: actual_f
