@@ -49,6 +49,11 @@ def test_rollout_memory_stage_precedes_weight_update():
     source = WORKER.read_text(encoding="utf-8")
     start = source.index("    async def rollout_mode(self):")
     rollout = source[start:source.index("    @register", start)]
-    assert rollout.index('"before_rollout_update_weights"') < rollout.index("await self.rollout.update_weights")
+    update = rollout.index("await self.rollout.update_weights")
+    model_offload = rollout.index("offload_megatron_model_to_cpu", update)
+    cache_release = rollout.index("self._release_actor_cuda_cache_before_rollout_wakeup()", model_offload)
+    wakeup = rollout.index('await self.rollout.resume(tags=["kv_cache"])', cache_release)
+    assert rollout.index('"before_rollout_update_weights"') < update
+    assert update < model_offload < cache_release < wakeup
     assert '"before_rollout_wakeup"' in rollout
     assert "EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT" not in rollout

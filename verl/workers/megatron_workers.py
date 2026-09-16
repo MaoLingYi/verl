@@ -866,7 +866,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
-        aggressive_empty_cache(force_sync=True)
+        cache_released = self._release_actor_cuda_cache_before_rollout_wakeup()
+        if not cache_released:
+            aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
             self._warn_eu_derpo_hdo_gpu_headroom("before_rollout_wakeup")
             wakeup_started = time.perf_counter()
@@ -989,6 +991,42 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 f"reserved_gib={cuda_reserved / _GIB:.2f} "
                 f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f}"
             )
+
+    def _release_actor_cuda_cache_before_rollout_wakeup(self):
+        eu_derpo = self.config.actor.eu_derpo
+        if not (
+            self.config.rollout.free_cache_engine
+            and eu_derpo.enabled
+            and eu_derpo.release_actor_cuda_cache_before_rollout_wakeup
+        ):
+            return False
+
+        before = log_eu_derpo_memory(
+            "before_rollout_cuda_cache_release",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+        )
+        started = time.perf_counter()
+        device = get_torch_device()
+        device.synchronize()
+        device.empty_cache()
+        cuda_free, _ = device.mem_get_info()
+        cuda_allocated = device.memory_allocated()
+        cuda_reserved = device.memory_reserved()
+        log_eu_derpo_memory(
+            "after_rollout_cuda_cache_release",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                "reserved_minus_allocated_before_gib": (
+                    before["cuda_reserved_gib"] - before["cuda_allocated_gib"]
+                ),
+                "reserved_minus_allocated_after_gib": (cuda_reserved - cuda_allocated) / _GIB,
+                "cuda_free_gain_gib": cuda_free / _GIB - before["cuda_free_gib"],
+                "cache_release_elapsed_s": time.perf_counter() - started,
+            },
+        )
+        return True
 
     def _finish_actor_update_residency(self, defer_phase_offload, eu_enabled, preserve_hdo=False):
         if defer_phase_offload:

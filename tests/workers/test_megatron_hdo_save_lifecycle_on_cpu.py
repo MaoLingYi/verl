@@ -591,6 +591,109 @@ def test_preserved_hdo_low_gpu_headroom_warns_without_aborting_rollout_sync():
     ]
 
 
+def test_pre_wakeup_cuda_cache_release_is_opt_in_and_preserves_hdo_state():
+    events = []
+    extras = {}
+    state = {"released": False, "fail": False}
+
+    class Device:
+        def synchronize(self):
+            events.append("synchronize")
+
+        def empty_cache(self):
+            events.append("empty_cache")
+            if state["fail"]:
+                raise RuntimeError("empty cache failed")
+            state["released"] = True
+
+        def mem_get_info(self):
+            free = 11 if state["released"] else 8
+            return free * 1024**3, 80 * 1024**3
+
+        def memory_allocated(self):
+            return 22 * 1024**3
+
+        def memory_reserved(self):
+            reserved = 22.5 if state["released"] else 25
+            return reserved * 1024**3
+
+    device = Device()
+
+    def log_memory(stage, *_, extra=None):
+        events.append(stage)
+        if extra is not None:
+            assert all(not isinstance(value, (dict, list)) for value in extra.values())
+            extras[stage] = extra
+        free, total = device.mem_get_info()
+        return {
+            "cuda_allocated_gib": device.memory_allocated() / 1024**3,
+            "cuda_reserved_gib": device.memory_reserved() / 1024**3,
+            "cuda_free_gib": free / 1024**3,
+            "cuda_total_gib": total / 1024**3,
+        }
+
+    namespace = {
+        "_GIB": 1024**3,
+        "get_torch_device": lambda: device,
+        "log_eu_derpo_memory": log_memory,
+        "megatron_model_cpu_data_bytes": lambda _: 0,
+        "time": time,
+    }
+    exec(
+        compile(
+            ast.Module(
+                body=[_worker_method("_release_actor_cuda_cache_before_rollout_wakeup")],
+                type_ignores=[],
+            ),
+            str(WORKER),
+            "exec",
+        ),
+        namespace,
+    )
+    worker = SimpleNamespace(
+        actor_optimizer=object(),
+        actor_module=object(),
+        _hdo_optimizer_residency_preserved=True,
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(free_cache_engine=True),
+            actor=SimpleNamespace(
+                eu_derpo=SimpleNamespace(
+                    enabled=True,
+                    release_actor_cuda_cache_before_rollout_wakeup=False,
+                )
+            ),
+        ),
+    )
+    release = MethodType(namespace["_release_actor_cuda_cache_before_rollout_wakeup"], worker)
+    assert release() is False
+    assert events == []
+
+    worker.config.actor.eu_derpo.release_actor_cuda_cache_before_rollout_wakeup = True
+    assert release() is True
+    assert events == [
+        "before_rollout_cuda_cache_release",
+        "synchronize",
+        "empty_cache",
+        "after_rollout_cuda_cache_release",
+    ]
+    after = extras["after_rollout_cuda_cache_release"]
+    assert after["reserved_minus_allocated_before_gib"] == 3
+    assert after["reserved_minus_allocated_after_gib"] == 0.5
+    assert after["cuda_free_gain_gib"] == 3
+    assert after["cache_release_elapsed_s"] >= 0
+    assert worker._hdo_optimizer_residency_preserved is True
+    method_source = ast.get_source_segment(
+        WORKER.read_text(encoding="utf-8"),
+        _worker_method("_release_actor_cuda_cache_before_rollout_wakeup"),
+    )
+    assert "offload_megatron_optimizer" not in method_source
+
+    events.clear()
+    state.update(released=False, fail=True)
+    with pytest.raises(RuntimeError, match="empty cache failed"):
+        release()
+
+
 def test_residency_guards_read_storage_and_device_not_python_identity():
     helpers, ddp_type = _residency_helpers()
     model = ddp_type()
