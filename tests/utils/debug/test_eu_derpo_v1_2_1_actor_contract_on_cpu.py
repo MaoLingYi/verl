@@ -61,6 +61,14 @@ class TestEUDERPOV121ActorContract(unittest.TestCase):
             "release_actor_cuda_cache_before_rollout_wakeup: false",
             ACTOR_YAML.read_text(encoding="utf-8"),
         )
+        self.assertIn(
+            "offload_optimizer_copy_params_for_rollout: bool = False",
+            CONFIG.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "offload_optimizer_copy_params_for_rollout: false",
+            ACTOR_YAML.read_text(encoding="utf-8"),
+        )
 
     def test_optimizer_override_is_passed_to_mcore_optimizer_config(self):
         source = function_source(OPTIMIZER, "init_megatron_optim_config")

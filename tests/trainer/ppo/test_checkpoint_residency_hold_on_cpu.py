@@ -57,3 +57,14 @@ def test_rollout_memory_stage_precedes_weight_update():
     assert update < model_offload < cache_release < wakeup
     assert '"before_rollout_wakeup"' in rollout
     assert "EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT" not in rollout
+
+
+def test_selective_restore_precedes_actor_memory_and_training_work():
+    source = WORKER.read_text(encoding="utf-8")
+    start = source.index("    def update_actor(self, data: DataProto):")
+    update = source[start:source.index("    def _preserve_hdo_optimizer_residency", start)]
+    restore = update.index("self._restore_actor_optimizer_copy_params_for_update()")
+    memory = update.index('"before_actor_update"')
+    model_load = update.index("load_megatron_model_to_gpu")
+    training = update.index("self.actor.update_policy")
+    assert restore < memory < model_load < training

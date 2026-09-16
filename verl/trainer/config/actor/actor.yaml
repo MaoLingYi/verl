@@ -280,6 +280,7 @@ eu_derpo:
   skip_post_checkpoint_optimizer_offload: false
   preserve_hdo_optimizer_residency_between_steps: false
   release_actor_cuda_cache_before_rollout_wakeup: false
+  offload_optimizer_copy_params_for_rollout: false
   route_attribution: false
   step_e_implementation: actual_f_router_only
   hidden_source: actual_f

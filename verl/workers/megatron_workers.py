@@ -43,6 +43,7 @@ from verl.trainer.ppo.eu_derpo import policy_prepass_tensors
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES
 from verl.utils.device import (
     get_device_id,
     get_device_name,
@@ -60,9 +61,11 @@ from verl.utils.megatron_utils import (
     is_megatron_optimizer_offloaded,
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
+    load_megatron_optimizer_copy_params_to_gpu,
     megatron_model_cpu_data_bytes,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
+    offload_megatron_optimizer_copy_params_to_cpu,
     per_tensor_generator,
     register_megatron_training_hooks,
 )
@@ -110,6 +113,18 @@ def _validate_actor_metrics_schema(metrics):
                         f"actor metric {key!r} has non-reducible list element "
                         f"index={index} element_type=dict"
                     )
+
+
+def _optimizer_copy_param_host_decision(required_by_rank, mem_available):
+    node_required = sum(int(value) for value in required_by_rank)
+    mem_available = int(mem_available)
+    return {
+        "required_by_rank": [int(value) for value in required_by_rank],
+        "node_required": node_required,
+        "mem_available": mem_available,
+        "safety_margin": HOST_RAM_SAFETY_MARGIN_BYTES,
+        "passed": mem_available >= node_required + HOST_RAM_SAFETY_MARGIN_BYTES,
+    }
 
 
 def _is_gpu_adam_distributed_optimizer(optimizer):
@@ -447,6 +462,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_offload_optimizer = False
         self._checkpoint_training_residency_held = False
         self._hdo_optimizer_residency_preserved = False
+        self._optimizer_copy_params_offloaded_for_rollout = False
+        self._optimizer_copy_params_cuda_bytes_before_rollout_offload = 0
 
         # Initialize LoRA-related attributes (will be updated in _build_rollout if needed)
         self.base_sync_done = False
@@ -888,6 +905,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        self._restore_actor_optimizer_copy_params_for_update()
         eu_enabled = self.config.actor.eu_derpo.enabled
         defer_phase_offload = bool(data.meta_info.get("defer_phase_offload_for_checkpoint", False))
         if eu_enabled:
@@ -946,7 +964,195 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             and self.config.actor.eu_derpo.preserve_hdo_optimizer_residency_between_steps
         )
 
+    def _selective_optimizer_copy_param_offload_enabled(self):
+        return bool(
+            self.config.actor.eu_derpo.enabled
+            and self.config.actor.eu_derpo.offload_optimizer_copy_params_for_rollout
+        )
+
+    def _actor_optimizer_residency(self):
+        if self._optimizer_copy_params_offloaded_for_rollout:
+            return "ROLLOUT_PARTIAL"
+        if self._is_offload_optimizer and is_megatron_optimizer_offloaded(self.actor_optimizer):
+            return "FULL_OFFLOADED"
+        return "TRAINING_RESIDENT"
+
+    def _optimizer_copy_param_host_preflight(self, local_required):
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            if world_size != 8:
+                raise RuntimeError("EU-DERPO optimizer copy-param host preflight requires one world8 node")
+            local = torch.tensor([int(local_required)], dtype=torch.int64, device=get_device_name())
+            gathered = [torch.zeros_like(local) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, local)
+            required_by_rank = [int(item.item()) for item in gathered]
+            payload = torch.zeros(2, dtype=torch.int64, device=get_device_name())
+            if torch.distributed.get_rank() == 0:
+                decision = _optimizer_copy_param_host_decision(
+                    required_by_rank, psutil.virtual_memory().available
+                )
+                payload[0] = decision["mem_available"]
+                payload[1] = int(decision["passed"])
+            torch.distributed.broadcast(payload, src=0)
+            decision = _optimizer_copy_param_host_decision(required_by_rank, int(payload[0].item()))
+            if bool(payload[1].item()) != decision["passed"]:
+                raise RuntimeError("EU-DERPO optimizer copy-param host preflight broadcast was inconsistent")
+        else:
+            decision = _optimizer_copy_param_host_decision(
+                [local_required], psutil.virtual_memory().available
+            )
+        if not decision["passed"]:
+            raise MemoryError(
+                "EU_DERPO_COPY_PARAM_HOST_HEADROOM_INSUFFICIENT "
+                f"mem_available_bytes={decision['mem_available']} "
+                f"node_copy_param_bytes={decision['node_required']} "
+                f"host_safety_margin_bytes={decision['safety_margin']}"
+            )
+        return decision
+
+    def _complete_optimizer_copy_param_transition(self, stage, failure, error, moved):
+        moved_tensors = moved.get("moved_tensors", getattr(error, "moved_tensors", 0))
+        moved_bytes = moved.get("moved_bytes", getattr(error, "moved_bytes", 0))
+        if failure is not None:
+            failure.fill_(int(error is not None))
+            torch.distributed.all_reduce(failure, op=torch.distributed.ReduceOp.MAX)
+            failed = bool(failure.item())
+        else:
+            failed = error is not None
+        if failed:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            raise RuntimeError(
+                "EU_DERPO_COPY_PARAM_RESIDENCY_TRANSITION_FAILED "
+                f"stage={stage} rank={rank} moved_tensors={moved_tensors} "
+                f"moved_bytes={moved_bytes} local_error={error!r}"
+            ) from error
+
+    def _offload_actor_optimizer_copy_params_for_rollout(self):
+        if self._optimizer_copy_params_offloaded_for_rollout:
+            return False
+        before_estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
+        local_bytes = before_estimate["optimizer_phase_cuda_copy_param_bytes"]
+        if local_bytes <= 0:
+            raise RuntimeError("EU-DERPO selective rollout offload found no CUDA optimizer copy params")
+        host = self._optimizer_copy_param_host_preflight(local_bytes)
+        log_eu_derpo_memory(
+            "before_optimizer_copy_param_offload",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                "copy_param_offload_active": 0,
+                "optimizer_residency": self._actor_optimizer_residency(),
+                "node_copy_param_bytes_to_offload_gib": host["node_required"] / _GIB,
+                "host_safety_margin_gib": host["safety_margin"] / _GIB,
+                "copy_param_transition_elapsed_s": 0.0,
+            },
+        )
+        started = time.perf_counter()
+        failure = (
+            torch.zeros(1, dtype=torch.int32, device=get_device_name())
+            if torch.distributed.is_initialized()
+            else None
+        )
+        moved = {}
+        error = None
+        try:
+            moved = offload_megatron_optimizer_copy_params_to_cpu(self.actor_optimizer)
+        except Exception as caught:
+            error = caught
+        self._complete_optimizer_copy_param_transition("offload", failure, error, moved)
+        device = get_torch_device()
+        device.synchronize()
+        device.empty_cache()
+        self._optimizer_copy_params_cuda_bytes_before_rollout_offload = local_bytes
+        self._optimizer_copy_params_offloaded_for_rollout = True
+        self._hdo_optimizer_residency_preserved = True
+        after_estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
+        sanity_error = None
+        if (
+            after_estimate["optimizer_phase_cuda_copy_param_bytes"] != 0
+            or after_estimate["optimizer_phase_cuda_state_bytes"]
+            != before_estimate["optimizer_phase_cuda_state_bytes"]
+            or moved["moved_bytes"] != local_bytes
+        ):
+            sanity_error = RuntimeError(
+                "EU-DERPO optimizer copy-param offload residency sanity check failed "
+                f"before={before_estimate} after={after_estimate} moved={moved}"
+            )
+        self._complete_optimizer_copy_param_transition("offload_sanity", failure, sanity_error, moved)
+        log_eu_derpo_memory(
+            "after_optimizer_copy_param_offload",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                "copy_param_offload_active": 1,
+                "optimizer_residency": self._actor_optimizer_residency(),
+                "copy_param_moved_tensors": moved["moved_tensors"],
+                "copy_param_moved_gib": moved["moved_bytes"] / _GIB,
+                "copy_param_transition_elapsed_s": time.perf_counter() - started,
+            },
+        )
+        return True
+
+    def _restore_actor_optimizer_copy_params_for_update(self):
+        if not self._optimizer_copy_params_offloaded_for_rollout:
+            return False
+        before_estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
+        log_eu_derpo_memory(
+            "before_optimizer_copy_param_restore",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                "copy_param_offload_active": 1,
+                "optimizer_residency": self._actor_optimizer_residency(),
+                "copy_param_transition_elapsed_s": 0.0,
+            },
+        )
+        started = time.perf_counter()
+        failure = (
+            torch.zeros(1, dtype=torch.int32, device=get_device_name())
+            if torch.distributed.is_initialized()
+            else None
+        )
+        moved = {}
+        error = None
+        try:
+            moved = load_megatron_optimizer_copy_params_to_gpu(self.actor_optimizer)
+        except Exception as caught:
+            error = caught
+        self._complete_optimizer_copy_param_transition("restore", failure, error, moved)
+        get_torch_device().synchronize()
+        after_estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
+        expected = self._optimizer_copy_params_cuda_bytes_before_rollout_offload
+        sanity_error = None
+        if (
+            after_estimate["optimizer_phase_cuda_copy_param_bytes"] != expected
+            or after_estimate["optimizer_phase_cuda_state_bytes"]
+            != before_estimate["optimizer_phase_cuda_state_bytes"]
+            or moved["moved_bytes"] != expected
+        ):
+            sanity_error = RuntimeError(
+                "EU-DERPO optimizer copy-param restore residency sanity check failed "
+                f"before={before_estimate} after={after_estimate} moved={moved} expected={expected}"
+            )
+        self._complete_optimizer_copy_param_transition("restore_sanity", failure, sanity_error, moved)
+        self._optimizer_copy_params_offloaded_for_rollout = False
+        log_eu_derpo_memory(
+            "after_optimizer_copy_param_restore",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                "copy_param_offload_active": 0,
+                "optimizer_residency": self._actor_optimizer_residency(),
+                "copy_param_moved_tensors": moved["moved_tensors"],
+                "copy_param_moved_gib": moved["moved_bytes"] / _GIB,
+                "copy_param_transition_elapsed_s": time.perf_counter() - started,
+            },
+        )
+        return True
+
     def _load_actor_optimizer_for_update(self):
+        if self._optimizer_copy_params_offloaded_for_rollout:
+            raise RuntimeError("ROLLOUT_PARTIAL optimizer reached generic update load")
         if not self._is_offload_optimizer or self._hdo_optimizer_residency_preserved:
             return False
         load_megatron_optimizer(self.actor_optimizer)
@@ -955,8 +1161,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def _offload_actor_optimizer(self):
         offload_megatron_optimizer(self.actor_optimizer)
         self._hdo_optimizer_residency_preserved = False
+        self._optimizer_copy_params_offloaded_for_rollout = False
+        self._optimizer_copy_params_cuda_bytes_before_rollout_offload = 0
 
     def _validate_hdo_optimizer_residency_config(self):
+        selective = self._selective_optimizer_copy_param_offload_enabled()
+        if selective and not self._preserve_hdo_optimizer_residency():
+            raise RuntimeError(
+                "EU_DERPO_SELECTIVE_COPY_PARAM_OFFLOAD_REQUIRES_PRESERVED_PARTIAL_HDO"
+            )
         if not self._is_actor or not self._preserve_hdo_optimizer_residency():
             return
         optimizer_override = self.config.actor.optim.override_optimizer_config or {}
@@ -1047,9 +1260,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             transition_started = time.perf_counter()
             before = None
             predicted_host_increment = 0
+            selective_copy_param_offload = self._selective_optimizer_copy_param_offload_enabled()
             if eu_enabled:
                 estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
-                predicted_host_increment = estimate["optimizer_phase_cuda_total_bytes"]
+                predicted_host_increment = estimate[
+                    "optimizer_phase_cuda_copy_param_bytes"
+                    if selective_copy_param_offload
+                    else "optimizer_phase_cuda_total_bytes"
+                ]
                 before = log_eu_derpo_memory(
                     "before_actor_residency_transition",
                     self.actor_optimizer,
@@ -1065,7 +1283,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     self.actor_optimizer,
                     megatron_model_cpu_data_bytes(self.actor_module),
                 )
-            if self._is_offload_optimizer and not preserve_hdo:
+            if selective_copy_param_offload:
+                self._offload_actor_optimizer_copy_params_for_rollout()
+                logger.warning("optimizer copy params selectively offloaded for rollout")
+            elif self._is_offload_optimizer and not preserve_hdo:
                 self._offload_actor_optimizer()
                 log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
             elif preserve_hdo:
@@ -1082,6 +1303,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                         "checkpoint_hold_active": 0,
                         "defer_phase_offload_for_checkpoint": 0,
                         "optimizer_phase_offload_skipped": int(preserve_hdo),
+                        "copy_param_offload_active": int(
+                            self._optimizer_copy_params_offloaded_for_rollout
+                        ),
                         "predicted_optimizer_host_increment_gib": predicted_host_increment / _GIB,
                         "actual_rss_increment_gib": (
                             psutil.Process().memory_info().rss / _GIB - before["rss_gib"]
@@ -1113,6 +1337,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.config.actor.eu_derpo.enabled
             and self.config.actor.eu_derpo.skip_post_checkpoint_optimizer_offload
         ) or self._preserve_hdo_optimizer_residency()
+        selective_copy_param_offload = self._selective_optimizer_copy_param_offload_enabled()
         try:
             log_reoffload("post_ckpt_reoffload_before")
             if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
@@ -1122,7 +1347,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     first_error = error
             log_reoffload("post_ckpt_after_param_offload")
             log_reoffload("post_ckpt_before_optimizer_offload")
-            if (
+            if selective_copy_param_offload:
+                try:
+                    self._offload_actor_optimizer_copy_params_for_rollout()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+            elif (
                 self._is_offload_optimizer
                 and not skip_optimizer_offload
                 and not is_megatron_optimizer_offloaded(self.actor_optimizer)
@@ -1417,6 +1648,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         checkpoint_hold = self._checkpoint_training_residency_held
+        copy_params_were_partial = self._optimizer_copy_params_offloaded_for_rollout
+        if copy_params_were_partial:
+            self._restore_actor_optimizer_copy_params_for_update()
         model_was_offloaded = self._is_offload_param and is_megatron_model_offloaded(self.actor_module)
         optimizer_was_offloaded = self._is_offload_optimizer and is_megatron_optimizer_offloaded(
             self.actor_optimizer
@@ -1488,6 +1722,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     offload_megatron_model_to_cpu(self.actor_module)
                 if optimizer_loaded:
                     self._offload_actor_optimizer()
+                elif copy_params_were_partial:
+                    self._offload_actor_optimizer_copy_params_for_rollout()
                 log_checkpoint_memory("after_checkpoint_reoffload")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

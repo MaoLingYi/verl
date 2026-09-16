@@ -39,6 +39,8 @@ def _save_checkpoint_method(
     cuda_free_gib=32,
     skip_post_checkpoint_optimizer_offload=False,
     preserve_hdo_optimizer_residency_between_steps=False,
+    selective_copy_param_offload=False,
+    copy_params_partial=False,
 ):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(
@@ -146,12 +148,15 @@ def _save_checkpoint_method(
                     preserve_hdo_optimizer_residency_between_steps=(
                         preserve_hdo_optimizer_residency_between_steps
                     ),
+                    offload_optimizer_copy_params_for_rollout=selective_copy_param_offload,
                 )
             )
         ),
         checkpoint_mananager=CheckpointManager(),
         _checkpoint_training_residency_held=held,
         _hdo_optimizer_residency_preserved=False,
+        _optimizer_copy_params_offloaded_for_rollout=copy_params_partial,
+        _optimizer_copy_params_cuda_bytes_before_rollout_offload=0,
     )
     worker._preserve_hdo_optimizer_residency = MethodType(
         lambda self: bool(
@@ -161,13 +166,30 @@ def _save_checkpoint_method(
         worker,
     )
     worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
+    worker._selective_optimizer_copy_param_offload_enabled = lambda: selective_copy_param_offload
+
+    def restore_copy_params():
+        if not worker._optimizer_copy_params_offloaded_for_rollout:
+            return False
+        events.append("restore_copy_params")
+        worker._optimizer_copy_params_offloaded_for_rollout = False
+        return True
+
+    def offload_copy_params():
+        events.append("selective_offload")
+        worker._optimizer_copy_params_offloaded_for_rollout = True
+        worker._hdo_optimizer_residency_preserved = True
+        return True
+
+    worker._restore_actor_optimizer_copy_params_for_update = restore_copy_params
+    worker._offload_actor_optimizer_copy_params_for_rollout = offload_copy_params
     worker._release_checkpoint_residency_hold = MethodType(
         namespace["_release_checkpoint_residency_hold"], worker
     )
     return MethodType(namespace["save_checkpoint"], worker)
 
 
-def _finish_update_method(events, residency):
+def _finish_update_method(events, residency, *, selective_copy_param_offload=False):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
     method = next(
@@ -188,7 +210,8 @@ def _finish_update_method(events, residency):
         ),
         "megatron_model_cpu_data_bytes": lambda _: 0,
         "estimate_optimizer_phase_offload_memory": lambda _: {
-            "optimizer_phase_cuda_total_bytes": 8 * 1024**3
+            "optimizer_phase_cuda_copy_param_bytes": 6 * 1024**3,
+            "optimizer_phase_cuda_total_bytes": 8 * 1024**3,
         },
         "psutil": SimpleNamespace(
             virtual_memory=lambda: SimpleNamespace(available=400 * 1024**3),
@@ -206,8 +229,19 @@ def _finish_update_method(events, residency):
         actor_module=object(),
         actor_optimizer=object(),
         _hdo_optimizer_residency_preserved=False,
+        _optimizer_copy_params_offloaded_for_rollout=False,
+        _optimizer_copy_params_cuda_bytes_before_rollout_offload=0,
     )
     worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
+    worker._selective_optimizer_copy_param_offload_enabled = lambda: selective_copy_param_offload
+
+    def offload_copy_params():
+        events.append("selective_offload")
+        worker._optimizer_copy_params_offloaded_for_rollout = True
+        worker._hdo_optimizer_residency_preserved = True
+        return True
+
+    worker._offload_actor_optimizer_copy_params_for_rollout = offload_copy_params
     return MethodType(namespace["_finish_actor_update_residency"], worker), worker
 
 
@@ -240,6 +274,20 @@ def test_non_save_update_preserves_partial_hdo_but_offloads_model():
         "optimizer phase offload skipped to preserve native partial HDO residency",
         "after_optimizer_residency_decision",
     ]
+
+
+def test_non_save_update_selectively_offloads_copy_params_after_model():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    finish, worker = _finish_update_method(
+        events, residency, selective_copy_param_offload=True
+    )
+    finish(False, True, True)
+    assert residency == {"model": False, "optimizer": True}
+    assert events.index("offload_model") < events.index("selective_offload")
+    assert "offload_optimizer" not in events
+    assert worker._optimizer_copy_params_offloaded_for_rollout is True
+    assert worker._hdo_optimizer_residency_preserved is True
 
 
 def test_save_update_holds_training_residency_without_offload():
@@ -355,6 +403,39 @@ def test_checkpoint_hold_preserve_flag_keeps_partial_hdo_residency():
     assert save.__self__._hdo_optimizer_residency_preserved is True
 
 
+def test_checkpoint_hold_releases_to_rollout_partial_after_save():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    save = _save_checkpoint_method(
+        events,
+        residency,
+        held=True,
+        preserve_hdo_optimizer_residency_between_steps=True,
+        selective_copy_param_offload=True,
+    )
+    save("/checkpoint", global_step=50)
+    assert events.index("save") < events.index("offload_model") < events.index("selective_offload")
+    assert "offload_optimizer" not in events
+    assert save.__self__._optimizer_copy_params_offloaded_for_rollout is True
+    assert save.__self__._hdo_optimizer_residency_preserved is True
+
+
+def test_manual_save_restores_and_returns_to_previous_rollout_partial_residency():
+    events = []
+    residency = {"model": False, "optimizer": True}
+    save = _save_checkpoint_method(
+        events,
+        residency,
+        selective_copy_param_offload=True,
+        copy_params_partial=True,
+    )
+    save("/checkpoint", global_step=51)
+    assert events.index("restore_copy_params") < events.index("save")
+    assert events.index("save") < events.index("offload_model") < events.index("selective_offload")
+    assert "offload_optimizer" not in events
+    assert save.__self__._optimizer_copy_params_offloaded_for_rollout is True
+
+
 def test_checkpoint_hold_experiment_save_failure_still_releases_hold():
     events = []
     residency = {"model": True, "optimizer": True}
@@ -459,6 +540,7 @@ def test_next_actor_update_does_not_double_load_preserved_optimizer():
     worker = SimpleNamespace(
         _is_offload_optimizer=True,
         _hdo_optimizer_residency_preserved=True,
+        _optimizer_copy_params_offloaded_for_rollout=False,
         actor_optimizer=object(),
     )
     load = MethodType(namespace["_load_actor_optimizer_for_update"], worker)
@@ -522,6 +604,8 @@ def test_generate_sequences_preserve_flag_never_full_offloads_optimizer():
         _preserve_hdo_optimizer_residency=lambda: True,
     )
     worker._hdo_optimizer_residency_preserved = True
+    worker._optimizer_copy_params_offloaded_for_rollout = False
+    worker._optimizer_copy_params_cuda_bytes_before_rollout_offload = 0
     worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
     output = MethodType(namespace["generate_sequences"], worker)(prompts)
     assert "offload_optimizer" not in events
@@ -549,8 +633,31 @@ def test_preserve_validation_rejects_missing_partial_hdo_groups():
             )
         ),
         _preserve_hdo_optimizer_residency=lambda: True,
+        _selective_optimizer_copy_param_offload_enabled=lambda: False,
     )
     with pytest.raises(RuntimeError, match="EU_DERPO_PRESERVE_HDO_REQUIRES_PARTIAL_HDO"):
+        MethodType(namespace["_validate_hdo_optimizer_residency_config"], worker)()
+
+
+def test_selective_copy_param_offload_requires_preserved_partial_hdo():
+    namespace = {"estimate_hdo_memory": lambda _: {}}
+    exec(
+        compile(
+            ast.Module(body=[_worker_method("_validate_hdo_optimizer_residency_config")], type_ignores=[]),
+            str(WORKER),
+            "exec",
+        ),
+        namespace,
+    )
+    worker = SimpleNamespace(
+        _is_actor=True,
+        _selective_optimizer_copy_param_offload_enabled=lambda: True,
+        _preserve_hdo_optimizer_residency=lambda: False,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="EU_DERPO_SELECTIVE_COPY_PARAM_OFFLOAD_REQUIRES_PRESERVED_PARTIAL_HDO",
+    ):
         MethodType(namespace["_validate_hdo_optimizer_residency_config"], worker)()
 
 

@@ -76,8 +76,10 @@ class TestActorConfig(unittest.TestCase):
             RouterShiftWeightingConfig(gamma_min=0.0)
 
     def test_eu_derpo_is_disabled_by_default_and_requires_explicit_hyperparameters(self):
-        self.assertFalse(EUDERPOConfig().enabled)
-        self.assertFalse(EUDERPOConfig().route_attribution)
+        defaults = EUDERPOConfig()
+        self.assertFalse(defaults.enabled)
+        self.assertFalse(defaults.route_attribution)
+        self.assertFalse(defaults.offload_optimizer_copy_params_for_rollout)
         with self.assertRaisesRegex(ValueError, "delta_e"):
             EUDERPOConfig(
                 enabled=True,
