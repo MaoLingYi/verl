@@ -15,9 +15,12 @@
 The main entry point to run the PPO algorithm
 """
 
+import ctypes
 import datetime
+import gc
 import logging
 import os
+import sys
 import time
 
 import psutil
@@ -98,6 +101,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _GIB = 1024**3
 _RESUME_MAX_HOST_MEMORY_PERCENT = 80.0
 _RESUME_MIN_HOST_AVAILABLE_BYTES = 200 * _GIB
+
+
+def _best_effort_release_host_allocator_after_copy_param_restore():
+    collected = gc.collect()
+    attempted = sys.platform.startswith("linux")
+    rc = None
+    if attempted:
+        try:
+            malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+            rc = int(malloc_trim(0))
+        except (AttributeError, OSError) as error:
+            logger.warning("EU-DERPO malloc_trim unavailable after copy-param restore: %r", error)
+    return {"gc_collected": collected, "malloc_trim_attempted": int(attempted), "malloc_trim_rc": rc}
+
+
 _CHECKPOINT_MIN_CUDA_FREE_BYTES = 16 * _GIB
 _CHECKPOINT_MAX_CUDA_RESERVED_BYTES = 64 * _GIB
 
@@ -1136,6 +1156,43 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         self._complete_optimizer_copy_param_transition("restore_sanity", failure, sanity_error, moved)
         self._optimizer_copy_params_offloaded_for_rollout = False
+        reclaim_before_rss = psutil.Process().memory_info().rss / _GIB
+        reclaim_before_available = psutil.virtual_memory().available / _GIB
+        reclaim_common = {
+            "copy_param_offload_active": 0,
+            "optimizer_residency": self._actor_optimizer_residency(),
+        }
+        log_eu_derpo_memory(
+            "before_optimizer_copy_param_host_reclaim",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                **reclaim_common,
+                "gc_collected": 0,
+                "malloc_trim_attempted": 0,
+                "malloc_trim_rc": None,
+                "host_reclaim_elapsed_s": 0.0,
+                "mem_available_gain_gib": 0.0,
+                "rss_drop_gib": 0.0,
+            },
+        )
+        reclaim_started = time.perf_counter()
+        reclaim = _best_effort_release_host_allocator_after_copy_param_restore()
+        reclaim_elapsed = time.perf_counter() - reclaim_started
+        reclaim_after_rss = psutil.Process().memory_info().rss / _GIB
+        reclaim_after_available = psutil.virtual_memory().available / _GIB
+        log_eu_derpo_memory(
+            "after_optimizer_copy_param_host_reclaim",
+            self.actor_optimizer,
+            megatron_model_cpu_data_bytes(self.actor_module),
+            extra={
+                **reclaim_common,
+                **reclaim,
+                "host_reclaim_elapsed_s": reclaim_elapsed,
+                "mem_available_gain_gib": reclaim_after_available - reclaim_before_available,
+                "rss_drop_gib": reclaim_before_rss - reclaim_after_rss,
+            },
+        )
         log_eu_derpo_memory(
             "after_optimizer_copy_param_restore",
             self.actor_optimizer,
