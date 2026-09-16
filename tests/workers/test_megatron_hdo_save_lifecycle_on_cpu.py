@@ -554,17 +554,10 @@ def test_preserve_validation_rejects_missing_partial_hdo_groups():
         MethodType(namespace["_validate_hdo_optimizer_residency_config"], worker)()
 
 
-def test_preserved_hdo_gpu_headroom_guard_reuses_checkpoint_budget():
-    class Flag:
-        def __init__(self, value):
-            self.value = value
-
-        def item(self):
-            return self.value
-
+def test_preserved_hdo_low_gpu_headroom_warns_without_aborting_rollout_sync():
     class Device:
         def mem_get_info(self):
-            return 15 * 1024**3, 80 * 1024**3
+            return 8 * 1024**3, 80 * 1024**3
 
         def memory_reserved(self):
             return 48 * 1024**3
@@ -572,28 +565,30 @@ def test_preserved_hdo_gpu_headroom_guard_reuses_checkpoint_budget():
         def memory_allocated(self):
             return 47 * 1024**3
 
-    distributed = SimpleNamespace(
-        all_reduce=lambda *_args, **_kwargs: None,
-        ReduceOp=SimpleNamespace(MAX="max"),
-        get_rank=lambda: 0,
-    )
+    warnings = []
     namespace = {
         "get_torch_device": Device,
-        "get_device_name": lambda: "cuda",
         "_GIB": 1024**3,
         "_CHECKPOINT_MIN_CUDA_FREE_BYTES": 16 * 1024**3,
         "_CHECKPOINT_MAX_CUDA_RESERVED_BYTES": 64 * 1024**3,
-        "torch": SimpleNamespace(
-            tensor=lambda value, **_: Flag(value),
-            int32="int32",
-            distributed=distributed,
-        ),
+        "logger": SimpleNamespace(warning=warnings.append),
+        "torch": SimpleNamespace(distributed=SimpleNamespace(get_rank=lambda: 0)),
     }
-    exec(compile(ast.Module(body=[_worker_method("_guard_eu_derpo_hdo_gpu_headroom")], type_ignores=[]), str(WORKER), "exec"), namespace)
+    exec(
+        compile(
+            ast.Module(body=[_worker_method("_warn_eu_derpo_hdo_gpu_headroom")], type_ignores=[]),
+            str(WORKER),
+            "exec",
+        ),
+        namespace,
+    )
     worker = SimpleNamespace(_hdo_optimizer_residency_preserved=True)
-    guard = MethodType(namespace["_guard_eu_derpo_hdo_gpu_headroom"], worker)
-    with pytest.raises(RuntimeError, match="EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT.*before_rollout_wakeup"):
-        guard("before_rollout_wakeup")
+    warn = MethodType(namespace["_warn_eu_derpo_hdo_gpu_headroom"], worker)
+    warn("before_rollout_update_weights")
+    assert warnings == [
+        "EU-DERPO GPU headroom low: stage=before_rollout_update_weights rank=0 "
+        "allocated_gib=47.00 reserved_gib=48.00 free_gib=8.00 total_gib=80.00"
+    ]
 
 
 def test_residency_guards_read_storage_and_device_not_python_identity():

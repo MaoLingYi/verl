@@ -50,3 +50,5 @@ def test_rollout_memory_stage_precedes_weight_update():
     start = source.index("    async def rollout_mode(self):")
     rollout = source[start:source.index("    @register", start)]
     assert rollout.index('"before_rollout_update_weights"') < rollout.index("await self.rollout.update_weights")
+    assert '"before_rollout_wakeup"' in rollout
+    assert "EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT" not in rollout

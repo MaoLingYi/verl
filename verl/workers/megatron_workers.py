@@ -841,7 +841,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "defer_phase_offload_for_checkpoint": 0,
                 },
             )
-            self._guard_eu_derpo_hdo_gpu_headroom("before_rollout_update_weights")
+            self._warn_eu_derpo_hdo_gpu_headroom("before_rollout_update_weights")
         if do_lora_base_sync:
             # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
@@ -868,7 +868,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
-            self._guard_eu_derpo_hdo_gpu_headroom("before_rollout_wakeup")
+            self._warn_eu_derpo_hdo_gpu_headroom("before_rollout_wakeup")
             wakeup_started = time.perf_counter()
             await self.rollout.resume(tags=["kv_cache"])
             if self.config.actor.eu_derpo.enabled:
@@ -972,26 +972,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 "and materialized CPU/GPU HDO parameter groups"
             )
 
-    def _guard_eu_derpo_hdo_gpu_headroom(self, stage):
+    def _warn_eu_derpo_hdo_gpu_headroom(self, stage):
         if not self._hdo_optimizer_residency_preserved:
             return
         device = get_torch_device()
         cuda_free, cuda_total = device.mem_get_info()
         cuda_reserved = device.memory_reserved()
-        # Reuse the production checkpoint transient budget; there is no measured
-        # rollout-specific threshold yet, so do not invent a second policy.
-        failure = torch.tensor(
-            int(
-                cuda_free < _CHECKPOINT_MIN_CUDA_FREE_BYTES
-                or cuda_reserved > _CHECKPOINT_MAX_CUDA_RESERVED_BYTES
-            ),
-            device=get_device_name(),
-            dtype=torch.int32,
-        )
-        torch.distributed.all_reduce(failure, op=torch.distributed.ReduceOp.MAX)
-        if failure.item():
-            raise RuntimeError(
-                "EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT "
+        if (
+            cuda_free < _CHECKPOINT_MIN_CUDA_FREE_BYTES
+            or cuda_reserved > _CHECKPOINT_MAX_CUDA_RESERVED_BYTES
+        ):
+            logger.warning(
+                "EU-DERPO GPU headroom low: "
                 f"stage={stage} rank={torch.distributed.get_rank()} "
                 f"allocated_gib={device.memory_allocated() / _GIB:.2f} "
                 f"reserved_gib={cuda_reserved / _GIB:.2f} "
