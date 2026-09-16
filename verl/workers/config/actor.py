@@ -75,6 +75,7 @@ class EUDERPOConfig(BaseConfig):
     enabled: bool = False
     version: str = "1.2.1"
     skip_post_checkpoint_optimizer_offload: bool = False
+    preserve_hdo_optimizer_residency_between_steps: bool = False
     route_attribution: bool = False
     step_e_implementation: str = "actual_f_router_only"
     hidden_source: str = "actual_f"

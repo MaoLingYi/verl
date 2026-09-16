@@ -40,6 +40,7 @@ def _load_memory_utils():
 memory_utils = _load_memory_utils()
 _parse_proc_kib = memory_utils._parse_proc_kib
 estimate_hdo_memory = memory_utils.estimate_hdo_memory
+estimate_optimizer_phase_offload_memory = memory_utils.estimate_optimizer_phase_offload_memory
 
 
 def test_parse_proc_kib_and_missing_fields():
@@ -119,6 +120,27 @@ def test_hdo_estimate_counts_shared_storage_once():
 
     assert estimate["hdo_cpu_master_bytes"] == 8 * 4
     assert estimate["hdo_cpu_other_bytes"] == 0
+
+
+def test_phase_offload_estimate_counts_exact_cuda_sources_without_copying():
+    cpu = torch.zeros(3)
+    outer = SimpleNamespace(
+        shard_fp32_from_float16_groups=[[cpu]],
+        optimizer=SimpleNamespace(sub_optimizers=[SimpleNamespace(state={cpu: {"exp_avg": cpu}})]),
+    )
+    estimate = estimate_optimizer_phase_offload_memory(outer)
+    assert estimate == {
+        "optimizer_phase_cuda_copy_param_bytes": 0,
+        "optimizer_phase_cuda_state_bytes": 0,
+        "optimizer_phase_cuda_total_bytes": 0,
+    }
+    source = Path(memory_utils.__file__).read_text(encoding="utf-8")
+    start = source.index("def estimate_optimizer_phase_offload_memory(")
+    end = source.index("\ndef log_eu_derpo_memory", start)
+    instrumentation = source[start:end]
+    assert ".to(" not in instrumentation
+    assert ".cpu(" not in instrumentation
+    assert ".clone(" not in instrumentation
 
 
 def test_hdo_logical_fraction_survives_phase_move_to_cpu():

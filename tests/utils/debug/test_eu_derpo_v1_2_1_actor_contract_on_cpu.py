@@ -45,6 +45,14 @@ class TestEUDERPOV121ActorContract(unittest.TestCase):
             "skip_post_checkpoint_optimizer_offload: false",
             ACTOR_YAML.read_text(encoding="utf-8"),
         )
+        self.assertIn(
+            "preserve_hdo_optimizer_residency_between_steps: bool = False",
+            CONFIG.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "preserve_hdo_optimizer_residency_between_steps: false",
+            ACTOR_YAML.read_text(encoding="utf-8"),
+        )
 
     def test_optimizer_override_is_passed_to_mcore_optimizer_config(self):
         source = function_source(OPTIMIZER, "init_megatron_optim_config")

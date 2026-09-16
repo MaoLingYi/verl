@@ -19,9 +19,12 @@ def _worker_method(namespace):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "load_checkpoint")
+    offload_actor = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_optimizer"
+    )
     method.decorator_list = []
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(WORKER), "exec"), namespace)
-    return namespace["load_checkpoint"]
+    exec(compile(ast.Module(body=[offload_actor, method], type_ignores=[]), str(WORKER), "exec"), namespace)
+    return namespace["load_checkpoint"], namespace["_offload_actor_optimizer"]
 
 
 def _module_function(name, namespace, *, strip_imports=False):
@@ -117,8 +120,11 @@ def _staged_worker(
         actor_module=object(),
         actor_optimizer=object(),
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
+        _hdo_optimizer_residency_preserved=True,
     )
-    worker.load_checkpoint = MethodType(_worker_method(namespace), worker)
+    load_checkpoint, offload_actor = _worker_method(namespace)
+    worker._offload_actor_optimizer = MethodType(offload_actor, worker)
+    worker.load_checkpoint = MethodType(load_checkpoint, worker)
     return worker, residency
 
 
@@ -131,6 +137,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
 
         self.assertEqual(residency, {"model": False, "optimizer": False})
         self.assertEqual(events, ["model_offload", "optimizer_offload"])
+        self.assertFalse(worker._hdo_optimizer_residency_preserved)
 
     def test_model_and_optimizer_restore_in_separate_residency_stages(self):
         events = []

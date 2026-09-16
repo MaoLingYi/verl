@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 from pathlib import Path
+import time
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -29,7 +31,14 @@ def _residency_helpers():
 
 
 def _save_checkpoint_method(
-    events, residency, *, held=False, fail=False, cuda_free_gib=32, skip_post_checkpoint_optimizer_offload=False
+    events,
+    residency,
+    *,
+    held=False,
+    fail=False,
+    cuda_free_gib=32,
+    skip_post_checkpoint_optimizer_offload=False,
+    preserve_hdo_optimizer_residency_between_steps=False,
 ):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(
@@ -38,6 +47,9 @@ def _save_checkpoint_method(
     )
     release = next(
         node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_release_checkpoint_residency_hold"
+    )
+    offload_actor = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_optimizer"
     )
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "save_checkpoint")
     method.decorator_list = []
@@ -101,14 +113,16 @@ def _save_checkpoint_method(
         "offload_megatron_model_to_cpu": offload_model,
         "offload_megatron_optimizer": offload_optimizer,
         "megatron_model_cpu_data_bytes": lambda _: 0,
-        "log_eu_derpo_memory": lambda stage, *_, **__: events.append(stage),
+        "log_eu_derpo_memory": lambda stage, *_, **__: (
+            events.append(stage) or {"mem_available_gib": 400.0, "rss_gib": 100.0}
+        ),
         "aggressive_empty_cache": lambda **_: events.append("empty_cache"),
         "get_torch_device": Device,
         "get_device_name": lambda: "cpu",
         "logger": SimpleNamespace(warning=lambda message: events.append(message)),
         "torch": fake_torch,
     }
-    exec(compile(ast.Module(body=[release, method], type_ignores=[]), str(WORKER), "exec"), namespace)
+    exec(compile(ast.Module(body=[offload_actor, release, method], type_ignores=[]), str(WORKER), "exec"), namespace)
 
     class CheckpointManager:
         def save_checkpoint(self, stage_callback=None, **_):
@@ -129,12 +143,24 @@ def _save_checkpoint_method(
                 eu_derpo=SimpleNamespace(
                     enabled=True,
                     skip_post_checkpoint_optimizer_offload=skip_post_checkpoint_optimizer_offload,
+                    preserve_hdo_optimizer_residency_between_steps=(
+                        preserve_hdo_optimizer_residency_between_steps
+                    ),
                 )
             )
         ),
         checkpoint_mananager=CheckpointManager(),
         _checkpoint_training_residency_held=held,
+        _hdo_optimizer_residency_preserved=False,
     )
+    worker._preserve_hdo_optimizer_residency = MethodType(
+        lambda self: bool(
+            self.config.actor.eu_derpo.enabled
+            and self.config.actor.eu_derpo.preserve_hdo_optimizer_residency_between_steps
+        ),
+        worker,
+    )
+    worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
     worker._release_checkpoint_residency_hold = MethodType(
         namespace["_release_checkpoint_residency_hold"], worker
     )
@@ -147,6 +173,9 @@ def _finish_update_method(events, residency):
     method = next(
         node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_finish_actor_update_residency"
     )
+    offload_actor = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_optimizer"
+    )
 
     namespace = {
         "offload_megatron_model_to_cpu": lambda _: (events.append("offload_model"), residency.update(model=False)),
@@ -154,18 +183,31 @@ def _finish_update_method(events, residency):
             events.append("offload_optimizer"), residency.update(optimizer=False)
         ),
         "log_gpu_memory_usage": lambda message, **_: events.append(message),
-        "log_eu_derpo_memory": lambda stage, *_, **__: events.append(stage),
+        "log_eu_derpo_memory": lambda stage, *_, **__: (
+            events.append(stage) or {"mem_available_gib": 400.0, "rss_gib": 100.0}
+        ),
         "megatron_model_cpu_data_bytes": lambda _: 0,
-        "logger": object(),
+        "estimate_optimizer_phase_offload_memory": lambda _: {
+            "optimizer_phase_cuda_total_bytes": 8 * 1024**3
+        },
+        "psutil": SimpleNamespace(
+            virtual_memory=lambda: SimpleNamespace(available=400 * 1024**3),
+            Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=100 * 1024**3)),
+        ),
+        "time": time,
+        "_GIB": 1024**3,
+        "logger": SimpleNamespace(warning=lambda message: events.append(message)),
     }
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(WORKER), "exec"), namespace)
+    exec(compile(ast.Module(body=[offload_actor, method], type_ignores=[]), str(WORKER), "exec"), namespace)
     worker = SimpleNamespace(
         _is_offload_param=True,
         _is_offload_optimizer=True,
         _checkpoint_training_residency_held=False,
         actor_module=object(),
         actor_optimizer=object(),
+        _hdo_optimizer_residency_preserved=False,
     )
+    worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
     return MethodType(namespace["_finish_actor_update_residency"], worker), worker
 
 
@@ -177,8 +219,27 @@ def test_non_save_update_phase_offloads_exactly_once():
     assert residency == {"model": False, "optimizer": False}
     assert events.count("offload_model") == 1
     assert events.count("offload_optimizer") == 1
-    assert events[-1] == "after_actor_phase_offload"
+    assert events[-1] == "after_optimizer_residency_decision"
     assert worker._checkpoint_training_residency_held is False
+
+
+def test_non_save_update_preserves_partial_hdo_but_offloads_model():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    finish, worker = _finish_update_method(events, residency)
+    finish(False, True, True)
+    assert residency == {"model": False, "optimizer": True}
+    assert events.count("offload_model") == 1
+    assert "offload_optimizer" not in events
+    assert worker._hdo_optimizer_residency_preserved is True
+    assert events == [
+        "before_actor_residency_transition",
+        "offload_model",
+        "After offload actor params and grad during update_actor",
+        "after_model_offload",
+        "optimizer phase offload skipped to preserve native partial HDO residency",
+        "after_optimizer_residency_decision",
+    ]
 
 
 def test_save_update_holds_training_residency_without_offload():
@@ -279,6 +340,21 @@ def test_checkpoint_hold_experiment_offloads_param_but_keeps_hdo_gpu_residency()
     assert [event for event in events if event in stages] == stages
 
 
+def test_checkpoint_hold_preserve_flag_keeps_partial_hdo_residency():
+    events = []
+    residency = {"model": True, "optimizer": True}
+    save = _save_checkpoint_method(
+        events,
+        residency,
+        held=True,
+        preserve_hdo_optimizer_residency_between_steps=True,
+    )
+    save("/checkpoint", global_step=1)
+    assert residency == {"model": False, "optimizer": True}
+    assert "offload_optimizer" not in events
+    assert save.__self__._hdo_optimizer_residency_preserved is True
+
+
 def test_checkpoint_hold_experiment_save_failure_still_releases_hold():
     events = []
     residency = {"model": True, "optimizer": True}
@@ -344,8 +420,13 @@ def test_checkpoint_hold_release_is_idempotent():
     assert events == after_first
 
 
-def test_experiment_flag_is_read_only_by_checkpoint_hold_release():
+def test_experiment_flags_only_change_intended_optimizer_lifecycle_calls():
     source = WORKER.read_text(encoding="utf-8")
+    actor_worker = source[
+        source.index("class ActorRolloutRefWorker") : source.index("class AsyncActorRolloutRefWorker")
+    ]
+    assert actor_worker.count("offload_megatron_optimizer(self.actor_optimizer)") == 1
+    assert "def _offload_actor_optimizer" in actor_worker
     assert source.count("skip_post_checkpoint_optimizer_offload") == 1
     release = source[source.index("    def _release_checkpoint_residency_hold") :]
     assert "skip_post_checkpoint_optimizer_offload" in release
@@ -356,11 +437,163 @@ def test_experiment_flag_is_read_only_by_checkpoint_hold_release():
     ]
     generate = source[source.index("    def generate_sequences") : source.index("    def compute_log_prob")]
     assert "if self._is_offload_optimizer:" in init
-    assert "if self._is_offload_optimizer:" in normal_update
-    assert "if self._is_offload_optimizer:" in generate
+    assert "if self._is_offload_optimizer and not preserve_hdo:" in normal_update
+    assert "if self._is_offload_optimizer and not preserve_hdo:" in generate
     load = source[source.index("    def load_checkpoint") : source.index("    def load_pretrained_model")]
     assert "self._is_offload_optimizer" in load
     assert "optimizer_offload=true" in load
+
+
+def _worker_method(name):
+    tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    method = next(node for node in cls.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
+    method.decorator_list = []
+    return method
+
+
+def test_next_actor_update_does_not_double_load_preserved_optimizer():
+    events = []
+    namespace = {"load_megatron_optimizer": lambda _: events.append("load_optimizer")}
+    exec(compile(ast.Module(body=[_worker_method("_load_actor_optimizer_for_update")], type_ignores=[]), str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        _is_offload_optimizer=True,
+        _hdo_optimizer_residency_preserved=True,
+        actor_optimizer=object(),
+    )
+    load = MethodType(namespace["_load_actor_optimizer_for_update"], worker)
+    assert load() is False
+    assert events == []
+    worker._hdo_optimizer_residency_preserved = False
+    assert load() is True
+    assert events == ["load_optimizer"]
+
+
+def test_generate_sequences_preserve_flag_never_full_offloads_optimizer():
+    events = []
+
+    @contextlib.contextmanager
+    def simple_timer(_, timing):
+        yield
+        timing["generate_sequences"] = 1.25
+
+    class Output:
+        def __init__(self):
+            self.meta_info = {}
+
+        def to(self, _):
+            return self
+
+    namespace = {
+        "get_device_name": lambda: "cpu",
+        "log_eu_derpo_memory": lambda stage, *_, **__: events.append(stage),
+        "megatron_model_cpu_data_bytes": lambda _: 0,
+        "offload_megatron_optimizer": lambda _: events.append("offload_optimizer"),
+        "simple_timer": simple_timer,
+        "topk_reduce_ratio_min_max": lambda _: (1.0, 1.0, 1.0),
+        "reduce_timing": lambda timing: timing,
+        "aggressive_empty_cache": lambda **_: None,
+        "log_gpu_memory_usage": lambda *_, **__: None,
+        "get_event_loop": lambda: None,
+        "logger": object(),
+    }
+    exec(
+        compile(
+            ast.Module(
+                body=[_worker_method("_offload_actor_optimizer"), _worker_method("generate_sequences")],
+                type_ignores=[],
+            ),
+            str(WORKER),
+            "exec",
+        ),
+        namespace,
+    )
+    prompts = SimpleNamespace(to=lambda _: prompts, meta_info={})
+    worker = SimpleNamespace(
+        _is_rollout=True,
+        _is_actor=False,
+        _is_offload_optimizer=True,
+        actor_optimizer=object(),
+        actor_module=object(),
+        generation_config=None,
+        tokenizer=SimpleNamespace(eos_token_id=1, pad_token_id=0),
+        config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=SimpleNamespace(enabled=True))),
+        rollout=SimpleNamespace(generate_sequences=lambda prompts: Output()),
+        _preserve_hdo_optimizer_residency=lambda: True,
+    )
+    worker._hdo_optimizer_residency_preserved = True
+    worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
+    output = MethodType(namespace["generate_sequences"], worker)(prompts)
+    assert "offload_optimizer" not in events
+    assert events == ["before_generate_sequences", "after_generate_sequences"]
+    assert output.meta_info["timing"]["generate_sequences"] == 1.25
+    events.clear()
+    worker._preserve_hdo_optimizer_residency = lambda: False
+    MethodType(namespace["generate_sequences"], worker)(prompts)
+    assert events == ["before_generate_sequences", "offload_optimizer", "after_generate_sequences"]
+    assert worker._hdo_optimizer_residency_preserved is False
+
+
+def test_preserve_validation_rejects_missing_partial_hdo_groups():
+    namespace = {"estimate_hdo_memory": lambda _: {"hdo_cpu_param_numel": 1, "hdo_gpu_param_numel": 0}}
+    exec(compile(ast.Module(body=[_worker_method("_validate_hdo_optimizer_residency_config")], type_ignores=[]), str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        _is_actor=True,
+        _is_offload_optimizer=True,
+        actor_optimizer=object(),
+        config=SimpleNamespace(
+            actor=SimpleNamespace(
+                optim=SimpleNamespace(
+                    override_optimizer_config={"optimizer_cpu_offload": True, "optimizer_offload_fraction": 0.75}
+                )
+            )
+        ),
+        _preserve_hdo_optimizer_residency=lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="EU_DERPO_PRESERVE_HDO_REQUIRES_PARTIAL_HDO"):
+        MethodType(namespace["_validate_hdo_optimizer_residency_config"], worker)()
+
+
+def test_preserved_hdo_gpu_headroom_guard_reuses_checkpoint_budget():
+    class Flag:
+        def __init__(self, value):
+            self.value = value
+
+        def item(self):
+            return self.value
+
+    class Device:
+        def mem_get_info(self):
+            return 15 * 1024**3, 80 * 1024**3
+
+        def memory_reserved(self):
+            return 48 * 1024**3
+
+        def memory_allocated(self):
+            return 47 * 1024**3
+
+    distributed = SimpleNamespace(
+        all_reduce=lambda *_args, **_kwargs: None,
+        ReduceOp=SimpleNamespace(MAX="max"),
+        get_rank=lambda: 0,
+    )
+    namespace = {
+        "get_torch_device": Device,
+        "get_device_name": lambda: "cuda",
+        "_GIB": 1024**3,
+        "_CHECKPOINT_MIN_CUDA_FREE_BYTES": 16 * 1024**3,
+        "_CHECKPOINT_MAX_CUDA_RESERVED_BYTES": 64 * 1024**3,
+        "torch": SimpleNamespace(
+            tensor=lambda value, **_: Flag(value),
+            int32="int32",
+            distributed=distributed,
+        ),
+    }
+    exec(compile(ast.Module(body=[_worker_method("_guard_eu_derpo_hdo_gpu_headroom")], type_ignores=[]), str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(_hdo_optimizer_residency_preserved=True)
+    guard = MethodType(namespace["_guard_eu_derpo_hdo_gpu_headroom"], worker)
+    with pytest.raises(RuntimeError, match="EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT.*before_rollout_wakeup"):
+        guard("before_rollout_wakeup")
 
 
 def test_residency_guards_read_storage_and_device_not_python_identity():

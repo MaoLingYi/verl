@@ -78,6 +78,10 @@ def _load_checkpoint_method(load_optimizer, offload_optimizer):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "load_checkpoint")
+    helpers = [
+        next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        for name in ("_offload_actor_optimizer", "_load_actor_optimizer_for_update")
+    ]
     method.decorator_list = []
     namespace = {
         "load_megatron_optimizer": load_optimizer,
@@ -87,8 +91,14 @@ def _load_checkpoint_method(load_optimizer, offload_optimizer):
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
         "logger": None,
     }
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(WORKER), "exec"), namespace)
-    return namespace["load_checkpoint"]
+    exec(compile(ast.Module(body=[*helpers, method], type_ignores=[]), str(WORKER), "exec"), namespace)
+
+    def load_checkpoint(self, *args, **kwargs):
+        self._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], self)
+        self._load_actor_optimizer_for_update = MethodType(namespace["_load_actor_optimizer_for_update"], self)
+        return namespace["load_checkpoint"](self, *args, **kwargs)
+
+    return load_checkpoint
 
 
 class TestMegatronHDOResumeLifecycle(unittest.TestCase):
@@ -162,6 +172,7 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             actor_module=object(),
             actor_optimizer=object(),
             checkpoint_mananager=manager,
+            _hdo_optimizer_residency_preserved=True,
         )
         worker.load_checkpoint = MethodType(
             _load_checkpoint_method(
@@ -174,6 +185,9 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
         worker.load_checkpoint(None)
 
         self.assertEqual(events, ["offload"])
+        self.assertFalse(worker._hdo_optimizer_residency_preserved)
+        self.assertTrue(worker._load_actor_optimizer_for_update())
+        self.assertEqual(events, ["offload", "load"])
 
     def test_non_offloaded_optimizer_is_not_moved(self):
         events = []

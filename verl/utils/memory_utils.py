@@ -83,6 +83,7 @@ def estimate_hdo_memory(optimizer) -> dict[str, int]:
         "hdo_gpu_exp_avg_bytes": 0,
         "hdo_gpu_exp_avg_sq_bytes": 0,
         "hdo_gpu_other_bytes": 0,
+        "hdo_gpu_materialized_bytes": 0,
         "hdo_cpu_estimated_bytes": 0,
         "hdo_gpu_estimated_bytes": 0,
         "hdo_full_cpu_estimated_bytes": 0,
@@ -137,6 +138,52 @@ def estimate_hdo_memory(optimizer) -> dict[str, int]:
         result["hdo_full_cpu_estimated_bytes"] = total_numel * 16
         result["hdo_partial_cpu_savings_estimated_bytes"] = result["hdo_gpu_param_numel"] * 16
         result["hdo_gpu_incremental_state_estimated_bytes"] = result["hdo_gpu_param_numel"] * 8
+    result["hdo_gpu_materialized_bytes"] = sum(
+        result[name]
+        for name in (
+            "hdo_gpu_master_bytes",
+            "hdo_gpu_exp_avg_bytes",
+            "hdo_gpu_exp_avg_sq_bytes",
+            "hdo_gpu_other_bytes",
+        )
+    )
+    return result
+
+
+def estimate_optimizer_phase_offload_memory(optimizer) -> dict[str, int]:
+    """Count materialized CUDA storages moved by offload_megatron_optimizer()."""
+    result = {
+        "optimizer_phase_cuda_copy_param_bytes": 0,
+        "optimizer_phase_cuda_state_bytes": 0,
+        "optimizer_phase_cuda_total_bytes": 0,
+    }
+    outers = getattr(optimizer, "chained_optimizers", (optimizer,))
+    seen: set[tuple] = set()
+
+    def add(name, tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cuda":
+            return
+        key, size = _storage_key_and_bytes(tensor)
+        if key not in seen:
+            seen.add(key)
+            result[name] += size
+
+    for outer in outers:
+        for group in getattr(outer, "shard_fp32_from_float16_groups", ()):
+            for tensor in group:
+                add("optimizer_phase_cuda_copy_param_bytes", tensor)
+        inner = getattr(outer, "optimizer", None)
+        optimizers = getattr(inner, "sub_optimizers", (inner,))
+        for sub_optimizer in optimizers:
+            if sub_optimizer is None:
+                continue
+            for state in getattr(sub_optimizer, "state", {}).values():
+                for tensor in state.values():
+                    add("optimizer_phase_cuda_state_bytes", tensor)
+    result["optimizer_phase_cuda_total_bytes"] = (
+        result["optimizer_phase_cuda_copy_param_bytes"]
+        + result["optimizer_phase_cuda_state_bytes"]
+    )
     return result
 
 
@@ -178,6 +225,10 @@ def log_eu_derpo_memory(
     values.update(
         {key.replace("_bytes", "_gib"): value / _GIB if key.endswith("_bytes") else value
          for key, value in estimate_hdo_memory(optimizer).items()}
+    )
+    values.update(
+        {key.replace("_bytes", "_gib"): value / _GIB
+         for key, value in estimate_optimizer_phase_offload_memory(optimizer).items()}
     )
     if extra:
         values.update(extra)

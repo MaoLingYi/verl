@@ -66,7 +66,12 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
-from verl.utils.memory_utils import aggressive_empty_cache, log_eu_derpo_memory
+from verl.utils.memory_utils import (
+    aggressive_empty_cache,
+    estimate_hdo_memory,
+    estimate_optimizer_phase_offload_memory,
+    log_eu_derpo_memory,
+)
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
     DistProfiler,
@@ -441,6 +446,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_offload_grad = False
         self._is_offload_optimizer = False
         self._checkpoint_training_residency_held = False
+        self._hdo_optimizer_residency_preserved = False
 
         # Initialize LoRA-related attributes (will be updated in _build_rollout if needed)
         self.base_sync_done = False
@@ -691,13 +697,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 override_transformer_config=override_transformer_config,
                 override_ddp_config=override_ddp_config,
             )
+            self._validate_hdo_optimizer_residency_config()
             if self.config.actor.eu_derpo.enabled:
                 log_eu_derpo_memory("after_optimizer_construction", self.actor_optimizer)
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
             if self._is_offload_optimizer:
-                offload_megatron_optimizer(self.actor_optimizer)
+                self._offload_actor_optimizer()
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
             if self.config.actor.eu_derpo.enabled:
                 log_eu_derpo_memory(
@@ -821,6 +828,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.layer_name_mapping,
             )
 
+        update_weights_started = time.perf_counter()
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         if self.config.actor.eu_derpo.enabled:
@@ -833,6 +841,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "defer_phase_offload_for_checkpoint": 0,
                 },
             )
+            self._guard_eu_derpo_hdo_gpu_headroom("before_rollout_update_weights")
         if do_lora_base_sync:
             # Base layer sync
             per_tensor_param_lora_base = self.bridge.export_hf_weights(
@@ -848,11 +857,27 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.base_sync_done = True
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        if self.config.actor.eu_derpo.enabled:
+            log_eu_derpo_memory(
+                "after_rollout_update_weights",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+                extra={"update_weights_elapsed_s": time.perf_counter() - update_weights_started},
+            )
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
+            self._guard_eu_derpo_hdo_gpu_headroom("before_rollout_wakeup")
+            wakeup_started = time.perf_counter()
             await self.rollout.resume(tags=["kv_cache"])
+            if self.config.actor.eu_derpo.enabled:
+                log_eu_derpo_memory(
+                    "after_rollout_wakeup",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={"rollout_wakeup_elapsed_s": time.perf_counter() - wakeup_started},
+                )
 
         set_expandable_segments(True)
 
@@ -872,8 +897,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
-        if self._is_offload_optimizer:
-            load_megatron_optimizer(self.actor_optimizer)
+        preserve_hdo = self._preserve_hdo_optimizer_residency()
+        if self._load_actor_optimizer_for_update():
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
         if eu_enabled:
             log_eu_derpo_memory(
@@ -908,12 +933,72 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        self._finish_actor_update_residency(defer_phase_offload, eu_enabled)
+        self._finish_actor_update_residency(defer_phase_offload, eu_enabled, preserve_hdo)
 
         aggressive_empty_cache(force_sync=True)
         return output
 
-    def _finish_actor_update_residency(self, defer_phase_offload, eu_enabled):
+    def _preserve_hdo_optimizer_residency(self):
+        return bool(
+            self.config.actor.eu_derpo.enabled
+            and self.config.actor.eu_derpo.preserve_hdo_optimizer_residency_between_steps
+        )
+
+    def _load_actor_optimizer_for_update(self):
+        if not self._is_offload_optimizer or self._hdo_optimizer_residency_preserved:
+            return False
+        load_megatron_optimizer(self.actor_optimizer)
+        return True
+
+    def _offload_actor_optimizer(self):
+        offload_megatron_optimizer(self.actor_optimizer)
+        self._hdo_optimizer_residency_preserved = False
+
+    def _validate_hdo_optimizer_residency_config(self):
+        if not self._is_actor or not self._preserve_hdo_optimizer_residency():
+            return
+        optimizer_override = self.config.actor.optim.override_optimizer_config or {}
+        estimate = estimate_hdo_memory(self.actor_optimizer)
+        if (
+            optimizer_override.get("optimizer_cpu_offload") is not True
+            or optimizer_override.get("optimizer_offload_fraction") != 0.75
+            or not self._is_offload_optimizer
+            or estimate["hdo_cpu_param_numel"] <= 0
+            or estimate["hdo_gpu_param_numel"] <= 0
+        ):
+            raise RuntimeError(
+                "EU_DERPO_PRESERVE_HDO_REQUIRES_PARTIAL_HDO "
+                "optimizer_cpu_offload=true optimizer_offload_fraction=0.75 "
+                "and materialized CPU/GPU HDO parameter groups"
+            )
+
+    def _guard_eu_derpo_hdo_gpu_headroom(self, stage):
+        if not self._hdo_optimizer_residency_preserved:
+            return
+        device = get_torch_device()
+        cuda_free, cuda_total = device.mem_get_info()
+        cuda_reserved = device.memory_reserved()
+        # Reuse the production checkpoint transient budget; there is no measured
+        # rollout-specific threshold yet, so do not invent a second policy.
+        failure = torch.tensor(
+            int(
+                cuda_free < _CHECKPOINT_MIN_CUDA_FREE_BYTES
+                or cuda_reserved > _CHECKPOINT_MAX_CUDA_RESERVED_BYTES
+            ),
+            device=get_device_name(),
+            dtype=torch.int32,
+        )
+        torch.distributed.all_reduce(failure, op=torch.distributed.ReduceOp.MAX)
+        if failure.item():
+            raise RuntimeError(
+                "EU_DERPO_HDO_GPU_HEADROOM_INSUFFICIENT "
+                f"stage={stage} rank={torch.distributed.get_rank()} "
+                f"allocated_gib={device.memory_allocated() / _GIB:.2f} "
+                f"reserved_gib={cuda_reserved / _GIB:.2f} "
+                f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f}"
+            )
+
+    def _finish_actor_update_residency(self, defer_phase_offload, eu_enabled, preserve_hdo=False):
         if defer_phase_offload:
             if self._checkpoint_training_residency_held:
                 raise RuntimeError("checkpoint training residency hold is already active")
@@ -929,21 +1014,50 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     },
                 )
         else:
+            transition_started = time.perf_counter()
+            before = None
+            predicted_host_increment = 0
+            if eu_enabled:
+                estimate = estimate_optimizer_phase_offload_memory(self.actor_optimizer)
+                predicted_host_increment = estimate["optimizer_phase_cuda_total_bytes"]
+                before = log_eu_derpo_memory(
+                    "before_actor_residency_transition",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                    extra={"predicted_optimizer_host_increment_gib": predicted_host_increment / _GIB},
+                )
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
-            if self._is_offload_optimizer:
-                offload_megatron_optimizer(self.actor_optimizer)
-                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
             if eu_enabled:
                 log_eu_derpo_memory(
-                    "after_actor_phase_offload",
+                    "after_model_offload",
+                    self.actor_optimizer,
+                    megatron_model_cpu_data_bytes(self.actor_module),
+                )
+            if self._is_offload_optimizer and not preserve_hdo:
+                self._offload_actor_optimizer()
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            elif preserve_hdo:
+                self._hdo_optimizer_residency_preserved = True
+                logger.warning("optimizer phase offload skipped to preserve native partial HDO residency")
+
+            if eu_enabled:
+                after_available = psutil.virtual_memory().available / _GIB
+                log_eu_derpo_memory(
+                    "after_optimizer_residency_decision",
                     self.actor_optimizer,
                     megatron_model_cpu_data_bytes(self.actor_module),
                     extra={
                         "checkpoint_hold_active": 0,
                         "defer_phase_offload_for_checkpoint": 0,
+                        "optimizer_phase_offload_skipped": int(preserve_hdo),
+                        "predicted_optimizer_host_increment_gib": predicted_host_increment / _GIB,
+                        "actual_rss_increment_gib": (
+                            psutil.Process().memory_info().rss / _GIB - before["rss_gib"]
+                        ),
+                        "actual_mem_available_drop_gib": before["mem_available_gib"] - after_available,
+                        "optimizer_residency_transition_elapsed_s": time.perf_counter() - transition_started,
                     },
                 )
 
@@ -968,7 +1082,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         skip_optimizer_offload = bool(
             self.config.actor.eu_derpo.enabled
             and self.config.actor.eu_derpo.skip_post_checkpoint_optimizer_offload
-        )
+        ) or self._preserve_hdo_optimizer_residency()
         try:
             log_reoffload("post_ckpt_reoffload_before")
             if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
@@ -984,11 +1098,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 and not is_megatron_optimizer_offloaded(self.actor_optimizer)
             ):
                 try:
-                    offload_megatron_optimizer(self.actor_optimizer)
+                    self._offload_actor_optimizer()
                 except Exception as error:
                     if first_error is None:
                         first_error = error
             elif skip_optimizer_offload:
+                if self._preserve_hdo_optimizer_residency():
+                    self._hdo_optimizer_residency_preserved = True
                 logger.warning("optimizer phase offload skipped by experiment")
             skipped = int(skip_optimizer_offload)
             log_reoffload("post_ckpt_after_optimizer_offload", optimizer_phase_offload_skipped=skipped)
@@ -1030,8 +1146,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
+        preserve_hdo = self._preserve_hdo_optimizer_residency()
+        if self.config.actor.eu_derpo.enabled:
+            log_eu_derpo_memory(
+                "before_generate_sequences",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+            )
+        if self._is_offload_optimizer and not preserve_hdo:
+            self._offload_actor_optimizer()
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
@@ -1041,6 +1164,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
+        if self.config.actor.eu_derpo.enabled:
+            log_eu_derpo_memory(
+                "after_generate_sequences",
+                self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+                extra={"generate_sequences_elapsed_s": timing_generate["generate_sequences"]},
+            )
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -1153,7 +1283,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
             if self._is_offload_optimizer:
-                offload_megatron_optimizer(self.actor_optimizer)
+                self._offload_actor_optimizer()
             log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint", logger=logger)
             return
 
@@ -1217,7 +1347,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 )
                 optimizer_loaded_memory = _log_resume_memory("after_optimizer_load")
             finally:
-                offload_megatron_optimizer(self.actor_optimizer)
+                self._offload_actor_optimizer()
                 aggressive_empty_cache(force_sync=True)
                 optimizer_offloaded_memory = _log_resume_memory("after_optimizer_offload")
                 if (
@@ -1248,7 +1378,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
             if self._is_offload_optimizer:
-                offload_megatron_optimizer(self.actor_optimizer)
+                self._offload_actor_optimizer()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
@@ -1327,7 +1457,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 if model_loaded:
                     offload_megatron_model_to_cpu(self.actor_module)
                 if optimizer_loaded:
-                    offload_megatron_optimizer(self.actor_optimizer)
+                    self._offload_actor_optimizer()
                 log_checkpoint_memory("after_checkpoint_reoffload")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
