@@ -577,7 +577,9 @@ def offload_megatron_optimizer_copy_params_to_cpu(optimizers):
                 continue
             storage = tensor.untyped_storage()
             storage_key = (tensor.device.type, tensor.device.index, storage.data_ptr())
-            tensor.data = tensor.data.to("cpu", non_blocking=True)
+            cpu_data = torch.empty_like(tensor.data, device="cpu", pin_memory=False)
+            cpu_data.copy_(tensor.data, non_blocking=False)
+            tensor.data = cpu_data
             moved_tensors += 1
             if storage_key not in seen_storages:
                 seen_storages.add(storage_key)
@@ -611,12 +613,86 @@ def load_megatron_optimizer_copy_params_to_gpu(optimizers):
     return {"moved_tensors": moved_tensors, "moved_bytes": moved_bytes}
 
 
+@torch.no_grad()
 def offload_megatron_copy_params(optimizers):
-    return offload_megatron_optimizer_copy_params_to_cpu(optimizers)
+    """
+    Offload optimizer parameters to CPU. Supports both Megatron optimizers
+    and `ChainedOptimizer`, which wraps a list of underlying optimizers.
+
+    Args:
+        optimizers: The optimizer or ChainedOptimizer instance.
+    """
+
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    def offload_tensor_to_cpu(tensor):
+        if tensor is None:
+            return
+        tensor.data = tensor.data.to("cpu", non_blocking=True)
+
+    def offload_group_to_cpu(group):
+        if group is None:
+            return
+
+        if isinstance(group, list):
+            for param_group in group:
+                if isinstance(param_group, list):
+                    for param in param_group:
+                        offload_tensor_to_cpu(param)
+                else:
+                    offload_tensor_to_cpu(param_group)
+        else:
+            offload_tensor_to_cpu(group)
+
+    # Offload all parameter groups to CPU for each underlying optimizer
+
+    for _opt in _iter_opts(optimizers):
+        if hasattr(_opt, "shard_fp32_from_float16_groups"):
+            offload_group_to_cpu(_opt.shard_fp32_from_float16_groups)
 
 
+@torch.no_grad()
 def load_megatron_copy_params(optimizers):
-    return load_megatron_optimizer_copy_params_to_gpu(optimizers)
+    """
+    Load optimizer parameters back to GPU. Handles ChainedOptimizer.
+
+    Args:
+        optimizers: Optimizer or ChainedOptimizer instance.
+    """
+
+    def _iter_opts(opt):
+        if isinstance(opt, ChainedOptimizer):
+            return opt.chained_optimizers
+        return [opt]
+
+    def load_tensor_to_gpu(tensor):
+        if tensor is None:
+            return
+        device_id = get_device_id()
+        tensor.data = tensor.data.to(device_id, non_blocking=True)
+
+    def load_group_to_gpu(group):
+        if group is None:
+            return
+
+        if isinstance(group, list):
+            for param_group in group:
+                if isinstance(param_group, list):
+                    for param in param_group:
+                        load_tensor_to_gpu(param)
+                else:
+                    load_tensor_to_gpu(param_group)
+        else:
+            load_tensor_to_gpu(group)
+
+    # Load all parameter groups to GPU for each underlying optimizer
+
+    for _opt in _iter_opts(optimizers):
+        if hasattr(_opt, "shard_fp32_from_float16_groups"):
+            load_group_to_gpu(_opt.shard_fp32_from_float16_groups)
 
 
 @torch.no_grad()

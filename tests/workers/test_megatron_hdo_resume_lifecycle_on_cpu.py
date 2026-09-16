@@ -86,6 +86,12 @@ def _load_checkpoint_method(load_optimizer, offload_optimizer):
     namespace = {
         "load_megatron_optimizer": load_optimizer,
         "offload_megatron_optimizer": offload_optimizer,
+        "load_megatron_optimizer_copy_params_to_gpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called during resume")
+        ),
+        "offload_megatron_optimizer_copy_params_to_cpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called during resume")
+        ),
         "load_megatron_model_to_gpu": lambda model: None,
         "offload_megatron_model_to_cpu": lambda model: None,
         "log_gpu_memory_usage": lambda *args, **kwargs: None,

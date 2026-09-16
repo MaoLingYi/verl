@@ -104,6 +104,12 @@ def _staged_worker(
         "offload_megatron_model_to_cpu": model_offload,
         "load_megatron_optimizer": optimizer_onload,
         "offload_megatron_optimizer": optimizer_offload,
+        "load_megatron_optimizer_copy_params_to_gpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called during staged resume")
+        ),
+        "offload_megatron_optimizer_copy_params_to_cpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called during staged resume")
+        ),
         "aggressive_empty_cache": lambda **kwargs: events.append("empty_cache"),
         "_is_gpu_adam_distributed_optimizer": lambda optimizer: True,
         "_log_resume_memory": log_memory,

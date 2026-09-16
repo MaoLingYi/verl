@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,7 +53,19 @@ class FakeTensor:
         target = "cuda" if str(device).startswith("cuda") else str(device)
         if target == self._fail_target:
             raise RuntimeError(f"failed moving to {target}")
-        return FakeTensor(target, self._storage.nbytes(), pinned=False, fail_target=self._fail_target)
+        return FakeTensor(
+            target,
+            self._storage.nbytes(),
+            pinned=target == "cpu" and non_blocking,
+            fail_target=self._fail_target,
+        )
+
+    def copy_(self, other, non_blocking=False):
+        assert not non_blocking
+        if other._fail_target == "cpu":
+            raise RuntimeError("failed copying to cpu")
+        assert self._storage.nbytes() == other._storage.nbytes()
+        return self
 
     def untyped_storage(self):
         return self._storage
@@ -76,7 +89,16 @@ def _selective_helpers():
         elif isinstance(node, ast.FunctionDef) and node.name in names:
             node.decorator_list = []
             definitions.append(node)
-    namespace = {"ChainedOptimizer": ChainedOptimizer, "get_device_id": lambda: "cuda:0"}
+    fake_torch = SimpleNamespace(
+        empty_like=lambda tensor, *, device, pin_memory: FakeTensor(
+            device, tensor.untyped_storage().nbytes(), pinned=pin_memory
+        )
+    )
+    namespace = {
+        "ChainedOptimizer": ChainedOptimizer,
+        "get_device_id": lambda: "cuda:0",
+        "torch": fake_torch,
+    }
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(UTILS), "exec"), namespace)
     return namespace
 
@@ -215,3 +237,61 @@ def test_selective_transition_telemetry_stays_out_of_actor_scalar_metrics():
     assert "copy_param_offload_active" in transition
     assert "copy_param_transition_elapsed_s" in transition
     assert "metrics[" not in transition
+
+
+def test_generic_helpers_keep_276d331_behavior_and_never_call_selective_helpers():
+    tree = ast.parse(UTILS.read_text(encoding="utf-8"), filename=str(UTILS))
+    names = {
+        "offload_megatron_copy_params",
+        "load_megatron_copy_params",
+        "offload_megatron_optimizer",
+        "load_megatron_optimizer",
+    }
+    definitions = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            node.decorator_list = []
+            definitions.append(node)
+
+    events = []
+    device = SimpleNamespace(empty_cache=lambda: events.append("empty_cache"))
+    namespace = {
+        "ChainedOptimizer": ChainedOptimizer,
+        "gc": gc,
+        "get_device_id": lambda: "cuda:0",
+        "get_global_memory_buffer": lambda: SimpleNamespace(buffer={}),
+        "get_torch_device": lambda: device,
+        "torch": SimpleNamespace(Tensor=FakeTensor),
+        "offload_megatron_optimizer_copy_params_to_cpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called")
+        ),
+        "load_megatron_optimizer_copy_params_to_gpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called")
+        ),
+    }
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(UTILS), "exec"), namespace)
+
+    param = FakeTensor("cuda", 32)
+    outer = SimpleNamespace(shard_fp32_from_float16_groups=[[param]], optimizer=None)
+    namespace["offload_megatron_optimizer"](outer)
+    assert param.device.type == "cpu"
+    assert param.is_pinned()  # exact generic non_blocking behavior is intentionally unchanged
+    namespace["load_megatron_optimizer"](outer)
+    assert param.device.type == "cuda"
+    assert events == ["empty_cache", "empty_cache"]
+
+
+def test_selective_source_explicitly_allocates_pageable_cpu_storage():
+    source = UTILS.read_text(encoding="utf-8")
+    start = source.index("def offload_megatron_optimizer_copy_params_to_cpu")
+    end = source.index("def load_megatron_optimizer_copy_params_to_gpu", start)
+    selective = source[start:end]
+    assert 'torch.empty_like(tensor.data, device="cpu", pin_memory=False)' in selective
+    assert "cpu_data.copy_(tensor.data, non_blocking=False)" in selective
+    assert '.to("cpu", non_blocking=True)' not in selective
+
+    start = source.index("def offload_megatron_copy_params")
+    end = source.index("def load_megatron_copy_params", start)
+    generic = source[start:end]
+    assert 'tensor.data = tensor.data.to("cpu", non_blocking=True)' in generic
+    assert "offload_megatron_optimizer_copy_params_to_cpu" not in generic

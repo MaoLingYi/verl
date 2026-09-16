@@ -533,6 +533,34 @@ def _worker_method(name):
     return method
 
 
+def test_init_generic_optimizer_offload_is_isolated_from_selective_helper():
+    events = []
+    namespace = {
+        "offload_megatron_optimizer": lambda _: events.append("generic_offload"),
+        "offload_megatron_optimizer_copy_params_to_cpu": lambda *_: (_ for _ in ()).throw(
+            AssertionError("selective helper must not be called")
+        ),
+    }
+    exec(
+        compile(
+            ast.Module(body=[_worker_method("_offload_actor_optimizer")], type_ignores=[]),
+            str(WORKER),
+            "exec",
+        ),
+        namespace,
+    )
+    worker = SimpleNamespace(
+        actor_optimizer=object(),
+        _hdo_optimizer_residency_preserved=True,
+        _optimizer_copy_params_offloaded_for_rollout=True,
+        _optimizer_copy_params_cuda_bytes_before_rollout_offload=123,
+    )
+    MethodType(namespace["_offload_actor_optimizer"], worker)()
+    assert events == ["generic_offload"]
+    assert worker._hdo_optimizer_residency_preserved is False
+    assert worker._optimizer_copy_params_offloaded_for_rollout is False
+
+
 def test_next_actor_update_does_not_double_load_preserved_optimizer():
     events = []
     namespace = {"load_megatron_optimizer": lambda _: events.append("load_optimizer")}
