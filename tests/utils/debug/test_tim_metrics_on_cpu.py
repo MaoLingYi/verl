@@ -690,7 +690,7 @@ class TestRouterShiftContract(unittest.TestCase):
         self.assertIn("def record_indices", replay_source)
         self.assertNotIn("def record_log_probs", replay_source)
         self.assertIn('self.enable_routing_replay = self.router_replay.mode != "disabled"', worker_source)
-        self.assertIn('tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}', worker_source)
+        self.assertIn("policy_prepass_tensors(output, entropys, self.config.actor.eu_derpo.enabled)", worker_source)
         self.assertNotIn('output.batch["old_router_log_probs"]', worker_source)
 
 

@@ -25,6 +25,7 @@ from verl.workers.config import (
     FSDPActorConfig,
     McoreActorConfig,
     OptimizerConfig,
+    RouterReplayConfig,
     RouterShiftWeightingConfig,
 )
 
@@ -101,6 +102,36 @@ class TestActorConfig(unittest.TestCase):
                 behavior_expert_is=BehaviorExpertISConfig(enabled=True),
                 expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.07),
                 routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.0),
+            )
+
+    def test_eu_derpo_v13_partial_alignment_contract(self):
+        config = EUDERPOConfig(
+            enabled=True,
+            version="1.3",
+            partial_rollout_old_alignment=True,
+            behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
+            expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
+            routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+        )
+        self.assertEqual(config.current_route_mode, "natural")
+        self.assertEqual(RouterReplayConfig(mode="R3_OLD_ONLY").mode, "R3_OLD_ONLY")
+        with self.assertRaisesRegex(ValueError, "delta_e=0.02"):
+            EUDERPOConfig(
+                enabled=True,
+                version="1.3",
+                partial_rollout_old_alignment=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.05),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+            )
+        with self.assertRaisesRegex(ValueError, "live DPPO mask"):
+            EUDERPOConfig(
+                enabled=True,
+                version="1.3",
+                partial_rollout_old_alignment=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02, diagnostics_only=True),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
             )
 
     def test_actor_config_from_yaml(self):

@@ -74,6 +74,8 @@ class RoutingUtilityConfig(BaseConfig):
 class EUDERPOConfig(BaseConfig):
     enabled: bool = False
     version: str = "1.2.1"
+    partial_rollout_old_alignment: bool = False
+    current_route_mode: str = "natural"
     skip_post_checkpoint_optimizer_offload: bool = False
     preserve_hdo_optimizer_residency_between_steps: bool = False
     release_actor_cuda_cache_before_rollout_wakeup: bool = False
@@ -93,8 +95,12 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version != "1.2.1":
-            raise ValueError("EU-DERPO production implementation requires version 1.2.1")
+        if self.version not in {"1.2.1", "1.3"}:
+            raise ValueError("EU-DERPO production implementation requires version 1.2.1 or 1.3")
+        if self.current_route_mode != "natural":
+            raise ValueError("EU-DERPO current route mode must remain natural")
+        if self.partial_rollout_old_alignment != (self.version == "1.3"):
+            raise ValueError("EU-DERPO V1.3 alone requires rollout-to-old partial alignment")
         step_e_contract = (
             self.step_e_implementation,
             self.hidden_source,
@@ -110,8 +116,9 @@ class EUDERPOConfig(BaseConfig):
             raise ValueError("EU-DERPO V1.2.1 Step E contract is frozen to actual-F Router-only replay")
         if not self.behavior_expert_is.enabled or not self.expert_cluster_dppo.enabled or not self.routing_utility.enabled:
             raise ValueError("EU-DERPO requires behavior ExpertIS, Expert-cluster DPPO, and Routing Utility")
-        if self.behavior_expert_is.behavior_source != "rollout" or not self.behavior_expert_is.require_rollout_logprob:
-            raise ValueError("EU-DERPO requires true rollout sampled-token log probabilities")
+        expected_source = "aligned_old" if self.version == "1.3" else "rollout"
+        if self.behavior_expert_is.behavior_source != expected_source or not self.behavior_expert_is.require_rollout_logprob:
+            raise ValueError(f"EU-DERPO {self.version} requires behavior_source={expected_source} and raw rollout logprob")
         dppo = self.expert_cluster_dppo
         if dppo.divergence_type != "binary_tv":
             raise ValueError("EU-DERPO V1.2.1 requires binary_tv")
@@ -124,6 +131,11 @@ class EUDERPOConfig(BaseConfig):
         utility = self.routing_utility
         if utility.lambda_u is None or utility.lambda_u <= 0:
             raise ValueError("EU-DERPO requires explicit positive lambda_u")
+        if self.version == "1.3":
+            if dppo.diagnostics_only or not utility.diagnostics:
+                raise ValueError("EU-DERPO V1.3 requires the live DPPO mask and mandatory diagnostics")
+            if dppo.delta_e != 0.02 or utility.lambda_u != 0.10:
+                raise ValueError("EU-DERPO V1.3 freezes delta_e=0.02 and lambda_u=0.10")
         if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
             raise ValueError("invalid Routing Utility normalization configuration")
 
@@ -171,7 +183,7 @@ class RouterReplayConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate router replay configuration."""
-        valid_modes = ["disabled", "R2", "R3"]
+        valid_modes = ["disabled", "R2", "R3", "R3_OLD_ONLY"]
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
 

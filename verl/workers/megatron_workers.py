@@ -949,9 +949,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        dataloader = self.actor.make_minibatch_iterator(data=data)
-        with Timer(name="update_policy", logger=None) as timer:
-            metrics = self.actor.update_policy(dataloader=dataloader)
+        v13_route_diagnostic = None
+        try:
+            if eu_enabled and self.config.actor.eu_derpo.version == "1.3":
+                if "eu_derpo_rollout_routes" not in data.batch:
+                    raise RuntimeError("EU-DERPO V1.3 rollout/current route diagnostic payload is missing")
+                v13_route_diagnostic = data.batch.pop("eu_derpo_rollout_routes").cpu()
+                self.actor.set_eu_derpo_rollout_route_diagnostic(
+                    v13_route_diagnostic, data.batch["response_mask"].cpu()
+                )
+            dataloader = self.actor.make_minibatch_iterator(data=data)
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(dataloader=dataloader)
+        finally:
+            if v13_route_diagnostic is not None:
+                self.actor.clear_eu_derpo_rollout_route_diagnostic()
         delta_time = timer.last
         global_num_tokens = data.meta_info["global_token_num"]
         images_seqlens = data.meta_info.get("images_seqlens", None)
@@ -1559,28 +1571,39 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+        if self.enable_routing_replay and self.config.actor.router_replay.mode in {"R3", "R3_OLD_ONLY"}:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-        with adapter_ctx:
-            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
-        if is_lora:
-            tensors = {"ref_log_prob": output}
-        else:
-            # Preserve the three-logprob plumbing; EU current-policy authority is captured by actual F.
-            tensors = policy_prepass_tensors(output, entropys, self.config.actor.eu_derpo.enabled)
-        output = DataProto.from_dict(
-            tensors=tensors,
-            meta_info={"temperature": self.config.rollout.temperature},
-        )
-        if self.config.actor.router_replay.mode == "R2":
-            output.batch["routed_experts"] = layers_topk_idx
-
-        if self.config.actor.router_replay.mode in ["R2", "R3"]:
-            RouterReplay.clear_global_indices()
-            RouterReplay.clear_global_router_replay_action()
-
-        output = output.to("cpu")
+        try:
+            with adapter_ctx:
+                output, entropys, layers_topk_idx = self.actor.compute_log_prob(
+                    data=data, calculate_entropy=not is_lora
+                )
+            if is_lora:
+                tensors = {"ref_log_prob": output}
+            else:
+                # Preserve the three-logprob plumbing; EU current-policy authority is captured by actual F.
+                tensors = policy_prepass_tensors(output, entropys, self.config.actor.eu_derpo.enabled)
+                if self.config.actor.router_replay.mode == "R3_OLD_ONLY":
+                    matched, compared = RouterReplay.replay_match_counts()
+                    if compared <= 0 or matched != compared:
+                        raise RuntimeError(
+                            f"EU-DERPO V1.3 rollout/old-aligned route mismatch: {matched}/{compared}"
+                        )
+                    tensors["route_match_rollout_old_aligned"] = torch.ones(
+                        output.shape[0], dtype=torch.float32, device=output.device
+                    )
+            output = DataProto.from_dict(
+                tensors=tensors,
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+            if self.config.actor.router_replay.mode == "R2":
+                output.batch["routed_experts"] = layers_topk_idx
+            output = output.to("cpu")
+        finally:
+            if self.config.actor.router_replay.mode in ["R2", "R3", "R3_OLD_ONLY"]:
+                RouterReplay.clear_global_indices()
+                RouterReplay.clear_global_router_replay_action()
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)

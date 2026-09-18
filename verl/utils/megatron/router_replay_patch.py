@@ -81,18 +81,55 @@ class RouterReplay:
         for router in RouterReplay.router_instances:
             router.clear_indices()
 
+    @staticmethod
+    def replay_match_counts() -> tuple[int, int]:
+        """Return exact Top-K support matches for the token scope consumed by replay."""
+        matches = total = expected = None
+        for router in RouterReplay.router_instances:
+            if router.replay_matched is None:
+                continue
+            matches = router.replay_matched if matches is None else matches + router.replay_matched
+            total = router.replay_compared if total is None else total + router.replay_compared
+            expected = router.replay_expected if expected is None else expected + router.replay_expected
+        if matches is None:
+            return 0, 0
+        matched_count, total_count, expected_count = (int(value.item()) for value in (matches, total, expected))
+        if total_count != expected_count:
+            raise RuntimeError(
+                f"router replay coverage mismatch: consumed={total_count}, installed={expected_count}"
+            )
+        return matched_count, total_count
+
     def __init__(self):
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx = None  # For replay
+        self.target_token_mask = None  # Optional token scope for partial replay
+        self.replayed_topk_idx = None
+        self.replay_matched = None
+        self.replay_compared = None
+        self.replay_expected = None
         self.recorded_topk_idx = None  # For recording
         self.router_replay_action = None  # Router replay action for this layer
         self.replay_backward_list = []  # List of tensors for backward pass replay
         RouterReplay.router_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor):
+    def set_target_indices(
+        self,
+        topk_indices: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+        *,
+        retain_for_backward: bool = True,
+    ):
         """Sets the target topk indices for replay."""
+        if token_mask is not None and token_mask.shape != topk_indices.shape[:-1]:
+            raise ValueError("router replay token mask must match target indices without the top-k dimension")
         self.target_topk_idx = topk_indices
-        self.replay_backward_list.append(topk_indices)
+        self.target_token_mask = token_mask
+        if token_mask is not None:
+            expected = token_mask.sum()
+            self.replay_expected = expected if self.replay_expected is None else self.replay_expected + expected
+        if retain_for_backward:
+            self.replay_backward_list.append(topk_indices)
 
     def get_recorded_indices(self):
         """Returns the recorded topk indices."""
@@ -106,6 +143,11 @@ class RouterReplay:
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
         self.target_topk_idx = None
+        self.target_token_mask = None
+        self.replayed_topk_idx = None
+        self.replay_matched = None
+        self.replay_compared = None
+        self.replay_expected = None
         self.replay_backward_list = []
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
@@ -178,10 +220,27 @@ def _patched_topk_routing_with_score_function(
                 # Fallback if replay data is not available
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
-            # Use the provided indices for replay
-            top_indices = router_replay.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
+            target = router_replay.target_topk_idx.to(scores.device)
+            token_mask = router_replay.target_token_mask
+            if token_mask is None:
+                top_indices = target
+            else:
+                _, natural_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+                token_mask = token_mask.to(scores.device).bool()
+                top_indices = torch.where(token_mask.unsqueeze(-1), target, natural_indices)
+            router_replay.replayed_topk_idx = top_indices.detach()
+            match_mask = token_mask
+            if match_mask is None:
+                match_mask = torch.ones(target.shape[:-1], dtype=torch.bool, device=scores.device)
+            equal = target.sort(-1).values.eq(top_indices.sort(-1).values).all(-1)
+            matched = equal[match_mask].sum()
+            compared = match_mask.sum()
+            router_replay.replay_matched = (
+                matched if router_replay.replay_matched is None else router_replay.replay_matched + matched
+            )
+            router_replay.replay_compared = (
+                compared if router_replay.replay_compared is None else router_replay.replay_compared + compared
+            )
             # Gather the scores for the replayed indices to get the probabilities
             probs = scores.gather(1, top_indices)
             return probs, top_indices

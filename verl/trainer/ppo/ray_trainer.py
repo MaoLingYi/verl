@@ -1496,6 +1496,20 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
+                            if actor_config.eu_derpo.enabled and actor_config.eu_derpo.version == "1.3":
+                                route_match = old_log_prob.batch.pop("route_match_rollout_old_aligned")
+                                if not torch.equal(route_match, torch.ones_like(route_match)):
+                                    raise RuntimeError("EU-DERPO V1.3 old-aligned route probe did not pass")
+                                metrics["actor/eu_derpo/route_match_rollout_old_aligned"] = 1.0
+                                from verl.trainer.ppo.eu_derpo import prepare_v13_rollout_routes
+
+                                routes, route_metrics = prepare_v13_rollout_routes(
+                                    batch.batch.pop("routed_experts"),
+                                    batch.batch["response_mask"],
+                                    batch.batch["responses"].shape[1],
+                                )
+                                batch.batch["eu_derpo_rollout_routes"] = routes
+                                metrics.update({f"actor/eu_derpo/{key}": value for key, value in route_metrics.items()})
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "

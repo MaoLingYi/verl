@@ -45,6 +45,7 @@ from verl.trainer.ppo.eu_derpo import (
     distribution_stats,
     edppo_token_coefficients,
     normalize_group_utility,
+    route_match_fraction,
     validate_prompt_groups,
 )
 from verl.utils.device import get_device_id, get_torch_device
@@ -245,13 +246,16 @@ class MegatronPPOActor(BasePPOActor):
                 [unwrap_model(model) for model in self.actor_module], self.tf_config
             )
         self.eu_derpo_observer = None
+        self._eu_derpo_rollout_routes = None
+        self._eu_derpo_rollout_route_mask = None
         self._eu_derpo_optimizer_generation = 0
         if self.config.eu_derpo.enabled:
             if float(self.actor_optimizer.get_loss_scale().item()) != 1.0:
                 raise ValueError("EU-DERPO V1.2.1 alpha sensitivity requires unit BF16 loss scale")
             optimizer_override = self.config.optim.override_optimizer_config or {}
+            expected_replay = "R3_OLD_ONLY" if self.config.eu_derpo.version == "1.3" else "disabled"
             conflicts = {
-                "router_replay": self.config.router_replay.mode != "disabled",
+                "router_replay": self.config.router_replay.mode != expected_replay,
                 "router_shift_diagnostics": self.config.router_shift_diagnostics.enabled,
                 "router_shift_weighting": self.config.router_shift_weighting.enabled,
                 "entropy": self.config.entropy_coeff != 0 or self.config.calculate_entropy,
@@ -289,6 +293,20 @@ class MegatronPPOActor(BasePPOActor):
         config = get_model_config(self.actor_module[0])
         print(config)
         config.finalize_model_grads_func = finalize_model_grads
+
+    def set_eu_derpo_rollout_route_diagnostic(self, routes: torch.Tensor, response_mask: torch.Tensor) -> None:
+        if self.config.eu_derpo.version != "1.3":
+            raise RuntimeError("rollout/current route diagnostic is V1.3-only")
+        if routes.device.type != "cpu" or routes.dtype != torch.uint8:
+            raise RuntimeError("V1.3 rollout route diagnostic must be a CPU uint8 tensor")
+        if routes.ndim != 4 or response_mask.shape != routes.shape[:2]:
+            raise RuntimeError("V1.3 rollout route diagnostic shape contract failed")
+        self._eu_derpo_rollout_routes = routes
+        self._eu_derpo_rollout_route_mask = response_mask.detach().cpu().bool()
+
+    def clear_eu_derpo_rollout_route_diagnostic(self) -> None:
+        self._eu_derpo_rollout_routes = None
+        self._eu_derpo_rollout_route_mask = None
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -352,9 +370,11 @@ class MegatronPPOActor(BasePPOActor):
             if self.router_shift_observer is not None:
                 select_keys.append("router_shift_sample_ids")
 
-            if self.enable_routing_replay and self.config.router_replay.mode == "R3":
+            if self.enable_routing_replay and self.config.router_replay.mode in {"R3", "R3_OLD_ONLY"}:
                 assert "routed_experts" in data.batch.keys(), "routed_experts must be in data.batch.keys()"
                 select_keys.append("routed_experts")
+                if self.config.router_replay.mode == "R3_OLD_ONLY":
+                    select_keys.append("response_mask")
 
             batch = data.select(batch_keys=select_keys).batch
             input_ids = batch["input_ids"]
@@ -478,7 +498,7 @@ class MegatronPPOActor(BasePPOActor):
             "position_ids",
             "advantages",
         ]
-        if self.eu_derpo_observer is None:
+        if self.eu_derpo_observer is None or self.config.eu_derpo.version == "1.3":
             select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -495,7 +515,7 @@ class MegatronPPOActor(BasePPOActor):
             select_keys.extend(["eu_derpo_sample_ids", "eu_derpo_prompt_group"])
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
-        if self.enable_routing_replay:
+        if self.config.router_replay.mode in {"R2", "R3"}:
             select_keys.append("routed_experts")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -656,6 +676,7 @@ class MegatronPPOActor(BasePPOActor):
                         self.eu_derpo_observer.num_experts,
                         dppo.delta_e,
                         dppo.diagnostics_only,
+                        aligned_old_logp=data.get("old_log_probs") if self.config.eu_derpo.version == "1.3" else None,
                     )
                     active_total = eu_stats.active.sum((1, 2)).float()
                     coefficient, _ = edppo_token_coefficients(
@@ -827,7 +848,17 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 layers_topk_idx = batch["routed_experts"]
-                set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config, vp_rank)
+                replay_token_mask = None
+                if self.config.router_replay.mode == "R3_OLD_ONLY":
+                    replay_token_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+                    replay_token_mask[:, -response_length - 1 : -1] = batch["response_mask"].bool()
+                set_router_replay_data(
+                    layers_topk_idx,
+                    attention_mask,
+                    self.tf_config,
+                    vp_rank,
+                    replay_token_mask=replay_token_mask,
+                )
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn
 
@@ -1143,7 +1174,20 @@ class MegatronPPOActor(BasePPOActor):
                         self.eu_derpo_observer.num_experts,
                         dppo.delta_e,
                         dppo.diagnostics_only,
+                        aligned_old_logp=(
+                            data.batch["old_log_probs"].cpu()
+                            if self.config.eu_derpo.version == "1.3"
+                            else None
+                        ),
                     )
+                    if self.config.eu_derpo.version == "1.3":
+                        if self._eu_derpo_rollout_routes is None or self._eu_derpo_rollout_route_mask is None:
+                            raise RuntimeError("EU-DERPO V1.3 current-route diagnostic payload is missing")
+                        eu_metrics["route_match_rollout_current"] = route_match_fraction(
+                            self._eu_derpo_rollout_routes,
+                            routes,
+                            self._eu_derpo_rollout_route_mask,
+                        )
                     active_total = stats_eu.active.sum((1, 2)).float()
                     _, objective = edppo_token_coefficients(
                         stats_eu, routes, data.batch["response_mask"].cpu(), active_total
@@ -1199,6 +1243,9 @@ class MegatronPPOActor(BasePPOActor):
                     auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
                     metrics["actor/eu_derpo/objective_edppo"] = [objective_log]
                     metrics["actor/eu_derpo/objective_utility"] = [auxiliary_metrics["utility_objective"]]
+                    metrics["actor/eu_derpo/objective_utility_weighted"] = [
+                        utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
+                    ]
                     metrics["actor/eu_derpo/objective_total"] = [
                         objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
                     ]
@@ -1216,6 +1263,22 @@ class MegatronPPOActor(BasePPOActor):
                             values = _gather_diagnostic_values(values)
                             for key, value in distribution_stats(values, tuple(dppo.log_quantiles)).items():
                                 metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
+                        if self.config.eu_derpo.version == "1.3":
+                            for prefix, values in (
+                                ("rho_e_upd", stats_eu.rho[active]),
+                                ("rho_e_raw", stats_eu.rho_raw[active]),
+                                ("d_eng", stats_eu.divergence_engine[active]),
+                                ("d_upd", stats_eu.divergence[active]),
+                                ("d_raw", stats_eu.divergence_raw[active]),
+                                ("delta_eng", stats_eu.delta_engine[active]),
+                                ("abs_delta_eng", stats_eu.delta_engine[active].abs()),
+                                ("delta_upd", stats_eu.delta_update[active]),
+                                ("abs_delta_upd", stats_eu.delta_update[active].abs()),
+                                ("delta_tot", stats_eu.delta_total[active]),
+                            ):
+                                values = _gather_diagnostic_values(values)
+                                for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
+                                    metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
                         outward = active & ~stats_eu.mask
                         positive = active & (stats_eu.advantage[:, None, None] > 0)
                         negative = active & (stats_eu.advantage[:, None, None] < 0)

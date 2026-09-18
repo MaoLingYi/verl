@@ -647,6 +647,11 @@ class AgentLoopWorker:
                 experts_tensor = output.routed_experts
             else:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+            if experts_tensor.ndim != 3 or tuple(experts_tensor.shape) != (length, layer_num, topk_num):
+                raise ValueError("routed_experts must have shape [token, layer, topk]")
+            if experts_tensor.numel() and (experts_tensor.min() < 0 or experts_tensor.max() > 255):
+                raise ValueError("routed_experts must contain global expert ids in uint8 range")
+            experts_tensor = experts_tensor.to(torch.uint8)
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end

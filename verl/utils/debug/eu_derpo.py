@@ -991,6 +991,9 @@ class EUDERPOObserver:
             "forward_recompute_equal_fraction": (
                 (compared - forward_recompute_mismatch) / compared if compared else 0.0
             ),
+            "route_match_currentF_checkpointR": (
+                (compared - forward_recompute_mismatch) / compared if compared else 0.0
+            ),
             "forward_recompute_layer_mismatch_count": forward_recompute_layer_mismatch.cpu().tolist(),
             "first_route_mismatch": self._first_route_metrics(),
             "route_phase_execution": self._phase_execution.copy(),
@@ -1272,6 +1275,7 @@ class EUDERPOObserver:
             "utility_objective": objective_total,
             "native_router_grad_norm": native_norm,
             "utility_router_grad_norm": utility_norm,
+            "utility_to_main_router_grad_ratio": utility_norm / (native_norm + 1.0e-12),
             "router_grad_cosine": router_grad_dot / denominator if denominator else 0.0,
             "full_auxiliary_transformer_forward_count": self._full_auxiliary_transformer_forward_count,
             "step_e_natural_topk_call_count": self._step_e_natural_topk_call_count,
@@ -1541,6 +1545,7 @@ class EUDERPOObserver:
             metrics.update({
                 "native_router_grad_norm": native_norm,
                 "utility_router_grad_norm": utility_norm,
+                "utility_to_main_router_grad_ratio": utility_norm / (native_norm + 1.0e-12),
                 "router_grad_cosine": grad_stats[2].item() / denominator if denominator else 0.0,
             })
         self.mode = None

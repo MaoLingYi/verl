@@ -27,6 +27,12 @@ class ClusterStatistics:
     divergence: torch.Tensor
     mask: torch.Tensor
     advantage: torch.Tensor
+    rho_raw: torch.Tensor | None = None
+    divergence_engine: torch.Tensor | None = None
+    divergence_raw: torch.Tensor | None = None
+    delta_engine: torch.Tensor | None = None
+    delta_update: torch.Tensor | None = None
+    delta_total: torch.Tensor | None = None
 
     @property
     def active(self) -> torch.Tensor:
@@ -62,6 +68,7 @@ def cluster_statistics(
     num_experts: int,
     delta_e: float | None,
     diagnostics_only: bool = False,
+    aligned_old_logp: torch.Tensor | None = None,
 ) -> ClusterStatistics:
     if behavior_logp is None:
         raise ValueError("EU-DERPO requires rollout_log_probs; old-policy recompute is not a behavior fallback")
@@ -69,6 +76,11 @@ def cluster_statistics(
     behavior = _finite("rollout behavior sampled-token logprob", behavior_logp)
     if current.shape != behavior.shape or current.shape != response_mask.shape:
         raise ValueError("current, rollout behavior, and response mask shapes must match")
+    aligned_old = None
+    if aligned_old_logp is not None:
+        aligned_old = _finite("aligned-old sampled-token logprob", aligned_old_logp)
+        if aligned_old.shape != current.shape:
+            raise ValueError("aligned-old, current, and rollout behavior logprob shapes must match")
     if routes.ndim != 4 or routes.shape[:2] != current.shape:
         raise ValueError("routes must have shape [batch, response, local_layers, topk]")
     routes = routes.detach()
@@ -94,31 +106,92 @@ def cluster_statistics(
     batch, tokens, layers, topk = routes.shape
     advantage = response_advantage(advantages, mask)
     count = torch.zeros((batch, layers, num_experts), dtype=torch.float32, device=current.device)
-    log_sum = torch.zeros_like(count)
-    divergence_sum = torch.zeros_like(count)
-    log_ratio = current - behavior
-    binary_tv = (behavior.exp() - current.exp()).abs()
+    update_log_sum = torch.zeros_like(count)
+    update_divergence_sum = torch.zeros_like(count)
+    engine_log_sum = raw_log_sum = None
+    engine_divergence_sum = raw_divergence_sum = None
+    if aligned_old is not None:
+        engine_log_sum = torch.zeros_like(count)
+        raw_log_sum = torch.zeros_like(count)
+        engine_divergence_sum = torch.zeros_like(count)
+        raw_divergence_sum = torch.zeros_like(count)
+    anchor = behavior if aligned_old is None else aligned_old
+    update_log_ratio = current - anchor
+    update_binary_tv = (anchor.exp() - current.exp()).abs()
+    engine_log_ratio = raw_log_ratio = None
+    engine_binary_tv = raw_binary_tv = None
+    if aligned_old is not None:
+        engine_log_ratio = anchor - behavior
+        raw_log_ratio = current - behavior
+        engine_binary_tv = (behavior.exp() - anchor.exp()).abs()
+        raw_binary_tv = (behavior.exp() - current.exp()).abs()
     valid = mask[:, :, None].expand(batch, tokens, topk).reshape(batch, -1).float()
     for layer in range(layers):
         edge = routes[:, :, layer, :].long()
         index = edge.reshape(batch, -1)
         count[:, layer].scatter_add_(1, index, valid)
-        log_values = log_ratio[:, :, None].expand_as(edge).reshape(batch, -1) * valid
-        div_values = binary_tv[:, :, None].expand_as(edge).reshape(batch, -1) * valid
-        log_sum[:, layer].scatter_add_(1, index, log_values)
-        divergence_sum[:, layer].scatter_add_(1, index, div_values)
+        accumulators = [
+            (update_log_sum, update_log_ratio),
+            (update_divergence_sum, update_binary_tv),
+        ]
+        if aligned_old is not None:
+            accumulators.extend((
+                (engine_log_sum, engine_log_ratio),
+                (raw_log_sum, raw_log_ratio),
+                (engine_divergence_sum, engine_binary_tv),
+                (raw_divergence_sum, raw_binary_tv),
+            ))
+        for target, values in accumulators:
+            edge_values = values[:, :, None].expand_as(edge).reshape(batch, -1) * valid
+            target[:, layer].scatter_add_(1, index, edge_values)
 
     active = count > 0
     safe_count = count.masked_fill(~active, 1.0)
-    rho = (log_sum / safe_count).exp().masked_fill(~active, 0.0)
-    divergence = (divergence_sum / safe_count).masked_fill(~active, 0.0)
+    delta_update = (update_log_sum / safe_count).masked_fill(~active, 0.0)
+    rho = delta_update.exp().masked_fill(~active, 0.0)
+    divergence = (update_divergence_sum / safe_count).masked_fill(~active, 0.0)
+    if aligned_old is None:
+        if diagnostics_only:
+            dppo_mask = active
+        else:
+            adv = advantage[:, None, None]
+            outward = (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1))) & (divergence > delta_e)
+            dppo_mask = active & ~outward
+        # Keep the V1.2.1/default-off path allocation- and return-compatible.
+        return ClusterStatistics(
+            count,
+            _finite("rho_E", rho),
+            _finite("D_E", divergence),
+            dppo_mask.detach(),
+            advantage,
+        )
+    else:
+        delta_engine = (engine_log_sum / safe_count).masked_fill(~active, 0.0)
+        delta_total = (raw_log_sum / safe_count).masked_fill(~active, 0.0)
+        if not torch.allclose(delta_total[active], (delta_update + delta_engine)[active], rtol=2e-6, atol=2e-6):
+            raise RuntimeError("EU-DERPO V1.3 delta decomposition failed")
+        rho_raw = delta_total.exp().masked_fill(~active, 0.0)
+        divergence_engine = (engine_divergence_sum / safe_count).masked_fill(~active, 0.0)
+        divergence_raw = (raw_divergence_sum / safe_count).masked_fill(~active, 0.0)
     if diagnostics_only:
         dppo_mask = active
     else:
         adv = advantage[:, None, None]
         outward = (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1))) & (divergence > delta_e)
         dppo_mask = active & ~outward
-    return ClusterStatistics(count, _finite("rho_E", rho), _finite("D_E", divergence), dppo_mask.detach(), advantage)
+    return ClusterStatistics(
+        count,
+        _finite("rho_E", rho),
+        _finite("D_E", divergence),
+        dppo_mask.detach(),
+        advantage,
+        _finite("rho_E_raw", rho_raw),
+        _finite("D_eng", divergence_engine),
+        _finite("D_raw", divergence_raw),
+        _finite("Delta_eng", delta_engine),
+        _finite("Delta_upd", delta_update),
+        _finite("Delta_tot", delta_total),
+    )
 
 
 def edppo_token_coefficients(
@@ -253,6 +326,54 @@ def assert_same_routes(prepass: torch.Tensor, main: torch.Tensor, valid: torch.T
     if metrics["route_mismatch_count"]:
         raise RuntimeError(f"EU-DERPO prepass/main natural route mismatch: {metrics}")
     return metrics
+
+
+def route_match_fraction(expected: torch.Tensor, actual: torch.Tensor, valid: torch.Tensor) -> float:
+    """Set-wise Top-K route match on valid response/action positions without asserting equality."""
+    if expected.shape != actual.shape or valid.shape != expected.shape[:2]:
+        raise RuntimeError("EU-DERPO route-match shape contract failed")
+    selected = valid.detach().bool()[:, :, None].expand(expected.shape[:-1])
+    equal = expected.detach().sort(-1).values.eq(actual.detach().sort(-1).values).all(-1)
+    if not selected.any():
+        raise RuntimeError("EU-DERPO route-match probe has no valid response/action position")
+    return equal[selected].float().mean().item()
+
+
+def prepare_v13_rollout_routes(
+    routes: torch.Tensor,
+    response_mask: torch.Tensor,
+    response_length: int,
+    *,
+    num_layers: int = 48,
+    topk: int = 8,
+    num_experts: int = 128,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Release the full R3 payload in favor of one response-only uint8 diagnostic copy."""
+    # A sampled-token logprob at response offset t is produced by the router at
+    # the preceding input position (last prompt token for t=0).
+    response_routes = routes[:, -response_length - 1 : -1]
+    if response_routes.ndim != 4 or response_routes.shape[2:] != (num_layers, topk):
+        raise RuntimeError(
+            f"EU-DERPO V1.3 rollout route shape must be [batch,response,{num_layers},{topk}], "
+            f"got {response_routes.shape}"
+        )
+    valid = response_mask.detach().bool()
+    if valid.shape != response_routes.shape[:2]:
+        raise RuntimeError("EU-DERPO V1.3 rollout route mask shape mismatch")
+    selected = response_routes[valid]
+    if selected.numel() == 0 or selected.min() < 0 or selected.max() >= num_experts:
+        raise RuntimeError(f"EU-DERPO V1.3 rollout routes require valid global expert ids in [0,{num_experts - 1}]")
+    if selected.sort(-1).values.diff(dim=-1).eq(0).any():
+        raise RuntimeError("EU-DERPO V1.3 rollout Top-K contains duplicate expert ids")
+    compact = response_routes.to(torch.uint8).contiguous()
+    return compact, {
+        "rollout_route_min_expert_id": int(selected.min().item()),
+        "rollout_route_max_expert_id": int(selected.max().item()),
+        "rollout_route_topk_width": compact.shape[-1],
+        "rollout_route_layer_count": compact.shape[-2],
+        "rollout_route_valid_count": int(valid.sum().item()),
+        "rollout_route_host_bytes": compact.numel() * compact.element_size(),
+    }
 
 
 def aggregate_edge_utility(

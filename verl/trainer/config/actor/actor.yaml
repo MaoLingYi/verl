@@ -246,7 +246,7 @@ router_replay:
   # Target dataclass for this configuration
   _target_: verl.workers.config.RouterReplayConfig
 
-  # Router replay mode: disabled, R2, R3
+  # Router replay mode: disabled, R2, R3, R3_OLD_ONLY
   # - R2: Use R2 routing strategy (record mode)
   # - R3: Use R3 routing strategy (record mode)
   mode: disabled
@@ -277,6 +277,8 @@ eu_derpo:
 
   enabled: false
   version: "1.2.1"
+  partial_rollout_old_alignment: false
+  current_route_mode: natural
   skip_post_checkpoint_optimizer_offload: false
   preserve_hdo_optimizer_residency_between_steps: false
   release_actor_cuda_cache_before_rollout_wakeup: false

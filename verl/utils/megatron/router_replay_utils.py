@@ -258,7 +258,7 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
+def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None, replay_token_mask=None):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -278,16 +278,33 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         None: The function updates internal RouterReplay instances in-place.
     """
     with torch.no_grad():
+        if replay_token_mask is not None and replay_token_mask.shape != attention_mask.shape:
+            raise ValueError("router replay token mask must match attention_mask")
         if layers_topk_idx.is_nested:
             layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
+            token_mask_rmpad = None
+            if replay_token_mask is not None:
+                token_mask_rmpad, _, _ = preprocess_thd_no_padding(
+                    replay_token_mask.unsqueeze(-1), pre_process=True
+                )
         else:
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+            token_mask_rmpad = None
+            if replay_token_mask is not None:
+                token_mask_rmpad, _ = preprocess_packed_seqs(
+                    replay_token_mask.unsqueeze(-1), attention_mask, pre_process=True
+                )
         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
         # 1, dynamic_bs_split, layer_num, topk
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
         ).unsqueeze(dim=0)
+        token_mask_split = None
+        if token_mask_rmpad is not None:
+            token_mask_split = scatter_to_sequence_parallel_region(
+                token_mask_rmpad.to(device_name).squeeze(dim=0)
+            ).squeeze(-1)
 
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
@@ -311,7 +328,11 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
                 continue
             router = router_instances_list[router_offset]
             idx = layer_idx if index_by_layer else moe_idx
-            router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
+            router.set_target_indices(
+                layers_topk_idx_reshape[idx].to(torch.int64),
+                None if token_mask_split is None else token_mask_split,
+                retain_for_backward=token_mask_split is None,
+            )
             router_offset += 1
             moe_idx += 1
 
