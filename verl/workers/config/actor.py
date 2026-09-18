@@ -95,12 +95,12 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version not in {"1.2.1", "1.3"}:
-            raise ValueError("EU-DERPO production implementation requires version 1.2.1 or 1.3")
+        if self.version not in {"1.2.1", "1.3", "1.4"}:
+            raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, or 1.4")
         if self.current_route_mode != "natural":
             raise ValueError("EU-DERPO current route mode must remain natural")
-        if self.partial_rollout_old_alignment != (self.version == "1.3"):
-            raise ValueError("EU-DERPO V1.3 alone requires rollout-to-old partial alignment")
+        if self.partial_rollout_old_alignment != (self.version in {"1.3", "1.4"}):
+            raise ValueError("EU-DERPO V1.3/V1.4 require rollout-to-old partial alignment")
         step_e_contract = (
             self.step_e_implementation,
             self.hidden_source,
@@ -131,11 +131,11 @@ class EUDERPOConfig(BaseConfig):
         utility = self.routing_utility
         if utility.lambda_u is None or utility.lambda_u <= 0:
             raise ValueError("EU-DERPO requires explicit positive lambda_u")
-        if self.version == "1.3":
+        if self.version in {"1.3", "1.4"}:
             if dppo.diagnostics_only or not utility.diagnostics:
-                raise ValueError("EU-DERPO V1.3 requires the live DPPO mask and mandatory diagnostics")
+                raise ValueError("EU-DERPO V1.3/V1.4 require the live DPPO mask and mandatory diagnostics")
             if dppo.delta_e != 0.02 or utility.lambda_u != 0.10:
-                raise ValueError("EU-DERPO V1.3 freezes delta_e=0.02 and lambda_u=0.10")
+                raise ValueError("EU-DERPO V1.3/V1.4 freeze delta_e=0.02 and lambda_u=0.10")
         if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
             raise ValueError("invalid Routing Utility normalization configuration")
 

@@ -25,6 +25,7 @@ def test_v13_uses_aligned_old_for_optimization_and_keeps_raw_diagnostics():
         128,
         0.02,
         aligned_old_logp=aligned_old,
+        optimization_anchor="aligned_old",
     )
     active = stats.active
     expected_update = (current - aligned_old).mean().exp()

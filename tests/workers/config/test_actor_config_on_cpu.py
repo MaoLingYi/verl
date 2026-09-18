@@ -124,6 +124,26 @@ class TestActorConfig(unittest.TestCase):
                 expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.05),
                 routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
             )
+
+    def test_eu_derpo_v14_restores_rollout_anchor_and_keeps_partial_alignment(self):
+        config = EUDERPOConfig(
+            enabled=True,
+            version="1.4",
+            partial_rollout_old_alignment=True,
+            behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="rollout"),
+            expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
+            routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+        )
+        self.assertEqual(config.behavior_expert_is.behavior_source, "rollout")
+        with self.assertRaisesRegex(ValueError, "behavior_source=rollout"):
+            EUDERPOConfig(
+                enabled=True,
+                version="1.4",
+                partial_rollout_old_alignment=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+            )
         with self.assertRaisesRegex(ValueError, "live DPPO mask"):
             EUDERPOConfig(
                 enabled=True,

@@ -951,7 +951,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = micro_batch_size
         v13_route_diagnostic = None
         try:
-            if eu_enabled and self.config.actor.eu_derpo.version == "1.3":
+            if eu_enabled and self.config.actor.eu_derpo.version in {"1.3", "1.4"}:
                 if "eu_derpo_rollout_routes" not in data.batch:
                     raise RuntimeError("EU-DERPO V1.3 rollout/current route diagnostic payload is missing")
                 v13_route_diagnostic = data.batch.pop("eu_derpo_rollout_routes").cpu()

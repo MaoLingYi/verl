@@ -33,6 +33,8 @@ class ClusterStatistics:
     delta_engine: torch.Tensor | None = None
     delta_update: torch.Tensor | None = None
     delta_total: torch.Tensor | None = None
+    rho_align: torch.Tensor | None = None
+    divergence_align: torch.Tensor | None = None
 
     @property
     def active(self) -> torch.Tensor:
@@ -69,6 +71,7 @@ def cluster_statistics(
     delta_e: float | None,
     diagnostics_only: bool = False,
     aligned_old_logp: torch.Tensor | None = None,
+    optimization_anchor: str = "rollout",
 ) -> ClusterStatistics:
     if behavior_logp is None:
         raise ValueError("EU-DERPO requires rollout_log_probs; old-policy recompute is not a behavior fallback")
@@ -81,6 +84,10 @@ def cluster_statistics(
         aligned_old = _finite("aligned-old sampled-token logprob", aligned_old_logp)
         if aligned_old.shape != current.shape:
             raise ValueError("aligned-old, current, and rollout behavior logprob shapes must match")
+    if optimization_anchor not in {"rollout", "aligned_old"}:
+        raise ValueError("EU-DERPO optimization_anchor must be rollout or aligned_old")
+    if optimization_anchor == "aligned_old" and aligned_old is None:
+        raise ValueError("EU-DERPO aligned-old optimization requires aligned_old_logp")
     if routes.ndim != 4 or routes.shape[:2] != current.shape:
         raise ValueError("routes must have shape [batch, response, local_layers, topk]")
     routes = routes.detach()
@@ -106,40 +113,39 @@ def cluster_statistics(
     batch, tokens, layers, topk = routes.shape
     advantage = response_advantage(advantages, mask)
     count = torch.zeros((batch, layers, num_experts), dtype=torch.float32, device=current.device)
-    update_log_sum = torch.zeros_like(count)
-    update_divergence_sum = torch.zeros_like(count)
-    engine_log_sum = raw_log_sum = None
-    engine_divergence_sum = raw_divergence_sum = None
+    behavior_log_sum = torch.zeros_like(count)
+    behavior_divergence_sum = torch.zeros_like(count)
+    engine_log_sum = align_log_sum = None
+    engine_divergence_sum = align_divergence_sum = None
     if aligned_old is not None:
         engine_log_sum = torch.zeros_like(count)
-        raw_log_sum = torch.zeros_like(count)
+        align_log_sum = torch.zeros_like(count)
         engine_divergence_sum = torch.zeros_like(count)
-        raw_divergence_sum = torch.zeros_like(count)
-    anchor = behavior if aligned_old is None else aligned_old
-    update_log_ratio = current - anchor
-    update_binary_tv = (anchor.exp() - current.exp()).abs()
-    engine_log_ratio = raw_log_ratio = None
-    engine_binary_tv = raw_binary_tv = None
+        align_divergence_sum = torch.zeros_like(count)
+    behavior_log_ratio = current - behavior
+    behavior_binary_tv = (behavior.exp() - current.exp()).abs()
+    engine_log_ratio = align_log_ratio = None
+    engine_binary_tv = align_binary_tv = None
     if aligned_old is not None:
-        engine_log_ratio = anchor - behavior
-        raw_log_ratio = current - behavior
-        engine_binary_tv = (behavior.exp() - anchor.exp()).abs()
-        raw_binary_tv = (behavior.exp() - current.exp()).abs()
+        engine_log_ratio = aligned_old - behavior
+        align_log_ratio = current - aligned_old
+        engine_binary_tv = (behavior.exp() - aligned_old.exp()).abs()
+        align_binary_tv = (aligned_old.exp() - current.exp()).abs()
     valid = mask[:, :, None].expand(batch, tokens, topk).reshape(batch, -1).float()
     for layer in range(layers):
         edge = routes[:, :, layer, :].long()
         index = edge.reshape(batch, -1)
         count[:, layer].scatter_add_(1, index, valid)
         accumulators = [
-            (update_log_sum, update_log_ratio),
-            (update_divergence_sum, update_binary_tv),
+            (behavior_log_sum, behavior_log_ratio),
+            (behavior_divergence_sum, behavior_binary_tv),
         ]
         if aligned_old is not None:
             accumulators.extend((
                 (engine_log_sum, engine_log_ratio),
-                (raw_log_sum, raw_log_ratio),
+                (align_log_sum, align_log_ratio),
                 (engine_divergence_sum, engine_binary_tv),
-                (raw_divergence_sum, raw_binary_tv),
+                (align_divergence_sum, align_binary_tv),
             ))
         for target, values in accumulators:
             edge_values = values[:, :, None].expand_as(edge).reshape(batch, -1) * valid
@@ -147,10 +153,12 @@ def cluster_statistics(
 
     active = count > 0
     safe_count = count.masked_fill(~active, 1.0)
-    delta_update = (update_log_sum / safe_count).masked_fill(~active, 0.0)
-    rho = delta_update.exp().masked_fill(~active, 0.0)
-    divergence = (update_divergence_sum / safe_count).masked_fill(~active, 0.0)
+    delta_behavior = (behavior_log_sum / safe_count).masked_fill(~active, 0.0)
+    rho_behavior = delta_behavior.exp().masked_fill(~active, 0.0)
+    divergence_behavior = (behavior_divergence_sum / safe_count).masked_fill(~active, 0.0)
     if aligned_old is None:
+        rho = rho_behavior
+        divergence = divergence_behavior
         if diagnostics_only:
             dppo_mask = active
         else:
@@ -167,12 +175,16 @@ def cluster_statistics(
         )
     else:
         delta_engine = (engine_log_sum / safe_count).masked_fill(~active, 0.0)
-        delta_total = (raw_log_sum / safe_count).masked_fill(~active, 0.0)
-        if not torch.allclose(delta_total[active], (delta_update + delta_engine)[active], rtol=2e-6, atol=2e-6):
-            raise RuntimeError("EU-DERPO V1.3 delta decomposition failed")
-        rho_raw = delta_total.exp().masked_fill(~active, 0.0)
+        delta_align = (align_log_sum / safe_count).masked_fill(~active, 0.0)
+        if not torch.allclose(delta_behavior[active], (delta_align + delta_engine)[active], rtol=2e-6, atol=2e-6):
+            raise RuntimeError("EU-DERPO delta decomposition failed")
+        rho_align = delta_align.exp().masked_fill(~active, 0.0)
         divergence_engine = (engine_divergence_sum / safe_count).masked_fill(~active, 0.0)
-        divergence_raw = (raw_divergence_sum / safe_count).masked_fill(~active, 0.0)
+        divergence_align = (align_divergence_sum / safe_count).masked_fill(~active, 0.0)
+        if optimization_anchor == "aligned_old":
+            rho, divergence = rho_align, divergence_align
+        else:
+            rho, divergence = rho_behavior, divergence_behavior
     if diagnostics_only:
         dppo_mask = active
     else:
@@ -185,12 +197,14 @@ def cluster_statistics(
         _finite("D_E", divergence),
         dppo_mask.detach(),
         advantage,
-        _finite("rho_E_raw", rho_raw),
+        _finite("rho_E_beh", rho_behavior),
         _finite("D_eng", divergence_engine),
-        _finite("D_raw", divergence_raw),
+        _finite("D_beh", divergence_behavior),
         _finite("Delta_eng", delta_engine),
-        _finite("Delta_upd", delta_update),
-        _finite("Delta_tot", delta_total),
+        _finite("Delta_align", delta_align),
+        _finite("Delta_beh", delta_behavior),
+        _finite("rho_E_align", rho_align),
+        _finite("D_align", divergence_align),
     )
 
 

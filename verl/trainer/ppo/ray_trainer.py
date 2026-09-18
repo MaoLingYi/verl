@@ -1496,7 +1496,10 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
-                            if actor_config.eu_derpo.enabled and actor_config.eu_derpo.version == "1.3":
+                            if (
+                                actor_config.eu_derpo.enabled
+                                and actor_config.eu_derpo.version in {"1.3", "1.4"}
+                            ):
                                 route_match = old_log_prob.batch.pop("route_match_rollout_old_aligned")
                                 if not torch.equal(route_match, torch.ones_like(route_match)):
                                     raise RuntimeError("EU-DERPO V1.3 old-aligned route probe did not pass")
