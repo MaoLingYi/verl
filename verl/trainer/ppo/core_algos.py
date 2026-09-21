@@ -30,7 +30,7 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
-from verl.trainer.ppo.eu_derpo import dppo_tv_valid_mask
+from verl.trainer.ppo.eu_derpo import dppo_tv_importance_ratio, dppo_tv_valid_mask
 from verl.trainer.ppo.router_shift_weighting import adjust_log_ratio_with_router_shift
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
@@ -1415,18 +1415,15 @@ def compute_policy_loss_dppo_tv(
     clip_divergence_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_divergence
     clip_divergence_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_divergence
 
-    negative_approx_kl = log_prob - old_log_prob
-    # Clamp negative_approx_kl for stability
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
+    negative_approx_kl, ratio, truncated_ratio = dppo_tv_importance_ratio(
+        old_log_prob, log_prob, config.get("clip_ratio_c", 20.0)
+    )
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     # Instead of dual-clip PPO, we use truncated importance sampling (TIS) to clip the policy loss.
     # However, a large threshold is recommended to avoid performance degradation due to the truncation bias.
     # See Section 5.4 in https://arxiv.org/pdf/2602.04879 for more details.
     clip_ratio_c = config.get("clip_ratio_c", 20.0)
-    truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
-    truncated_ratio = truncated_ratio.detach()
 
     valid_mask = dppo_tv_valid_mask(
         old_log_prob,

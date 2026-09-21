@@ -88,3 +88,27 @@ def test_v15_valid_credit_excludes_masked_and_zero_advantage_tokens():
     dppo = eu.dppo_tv_valid_mask(behavior, current, advantage, 0.2, 0.2)
     valid = dppo & action_mask & advantage.ne(0)
     assert torch.equal(valid, torch.tensor([[True, False, False, False]]))
+
+
+def test_v15_ratio_above_three_has_unclipped_gradient_and_zero_tis_fraction():
+    behavior = torch.log(torch.tensor([[0.01]]))
+    current = torch.log(torch.tensor([[0.05]])).requires_grad_()
+    _, ratio, v15_weight = eu.dppo_tv_importance_ratio(behavior, current, 1.0e9)
+    loss = -(v15_weight * current).mean()
+    loss.backward()
+
+    assert torch.allclose(ratio, torch.tensor([[5.0]]))
+    assert torch.allclose(-current.grad, torch.tensor([[5.0]]))
+    assert (ratio > 1.0e9).float().mean().item() == 0.0
+
+
+def test_generic_finite_dppo_tis_remains_available():
+    behavior = torch.log(torch.tensor([[0.01]]))
+    current = torch.log(torch.tensor([[0.05]])).requires_grad_()
+    _, ratio, finite_weight = eu.dppo_tv_importance_ratio(behavior, current, 3.0)
+    loss = -(finite_weight * current).mean()
+    loss.backward()
+
+    assert torch.allclose(ratio, torch.tensor([[5.0]]))
+    assert torch.allclose(-current.grad, torch.tensor([[3.0]]))
+    assert (ratio > 3.0).float().mean().item() == 1.0

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+DPPO_MAX_LOG_RATIO = 20.0
+
 
 def policy_prepass_tensors(
     log_probs: torch.Tensor, entropys: torch.Tensor, eu_derpo_enabled: bool
@@ -75,6 +77,22 @@ def dppo_tv_valid_mask(
     valid_positive = (probability - behavior_probability) <= delta_high
     valid_negative = (probability - behavior_probability) >= -delta_low
     return torch.where(advantages > 0, valid_positive, valid_negative).detach()
+
+
+def dppo_tv_importance_ratio(
+    behavior_log_prob: torch.Tensor,
+    current_log_prob: torch.Tensor,
+    clip_ratio_c: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return protected log-ratio, ratio, and detached TIS weight used by DPPO-TV."""
+
+    log_ratio = torch.clamp(
+        current_log_prob - behavior_log_prob,
+        min=-DPPO_MAX_LOG_RATIO,
+        max=DPPO_MAX_LOG_RATIO,
+    )
+    ratio = torch.exp(log_ratio)
+    return log_ratio, ratio, torch.clamp(ratio, max=clip_ratio_c).detach()
 
 
 def cluster_statistics(

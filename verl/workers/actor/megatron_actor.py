@@ -270,9 +270,6 @@ class MegatronPPOActor(BasePPOActor):
             )
             v15 = self.config.eu_derpo.version == "1.5"
             native_hdo_mismatch = (
-                optimizer_override.get("optimizer_cpu_offload") is not False
-                or optimizer_override.get("optimizer_offload_fraction") != 0.0
-            ) if v15 else (
                 optimizer_override.get("optimizer_cpu_offload") is not True
                 or optimizer_override.get("optimizer_offload_fraction") != 0.75
             )
@@ -298,10 +295,7 @@ class MegatronPPOActor(BasePPOActor):
             enabled_conflicts = [name for name, enabled in conflicts.items() if enabled]
             if enabled_conflicts:
                 raise ValueError(f"EU-DERPO V1.2.1 incompatible actor settings: {enabled_conflicts}")
-            if v15:
-                print_rank_0("EU-DERPO optimizer_cpu_offload_enabled=0 optimizer_offload_fraction=0.0")
-            else:
-                print_rank_0("EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75")
+            print_rank_0("EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75")
             self.eu_derpo_observer = EUDERPOObserver(
                 [unwrap_model(model) for model in self.actor_module],
                 self.tf_config,
