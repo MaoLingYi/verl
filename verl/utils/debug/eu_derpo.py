@@ -1339,8 +1339,8 @@ class EUDERPOObserver:
             raise RuntimeError("EU-DERPO Router auxiliary reduce/add ledger is incomplete")
 
     @torch.no_grad()
-    def v15_router_grad_norm(self) -> float:
-        """Return the global Router-gradient L2 norm and reject a frozen V1.5 Router."""
+    def v15_router_grad_norm(self, require_nonzero: bool = False) -> float:
+        """Return the global Router-gradient L2 norm; smoke may require it nonzero."""
 
         if not self.v15:
             raise RuntimeError("V1.5 Router-gradient audit called for a legacy EU-DERPO version")
@@ -1353,8 +1353,10 @@ class EUDERPOObserver:
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(grad_sq)
         norm = grad_sq.sqrt().item()
-        if not math.isfinite(norm) or norm <= 0:
-            raise RuntimeError("EU-DERPO V1.5 Router gradient must be finite and nonzero")
+        if not math.isfinite(norm):
+            raise RuntimeError("EU-DERPO V1.5 Router gradient must be finite")
+        if require_nonzero and norm <= 0:
+            raise RuntimeError("EU-DERPO V1.5 smoke requires a nonzero Router gradient")
         return norm
 
     def finish_optimizer_step(self, optimizer_generation):

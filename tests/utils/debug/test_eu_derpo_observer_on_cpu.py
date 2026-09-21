@@ -179,8 +179,9 @@ class TestEUDERPOObserver(unittest.TestCase):
         self.assertAlmostEqual(self.observer.v15_router_grad_norm(), expected, places=5)
         for router in self.model.routers:
             router.weight.main_grad.zero_()
-        with self.assertRaisesRegex(RuntimeError, "finite and nonzero"):
-            self.observer.v15_router_grad_norm()
+        self.assertEqual(self.observer.v15_router_grad_norm(), 0.0)
+        with self.assertRaisesRegex(RuntimeError, "smoke requires a nonzero"):
+            self.observer.v15_router_grad_norm(require_nonzero=True)
 
     def tearDown(self):
         self.observer.close()

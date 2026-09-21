@@ -89,6 +89,7 @@ class EUDERPOConfig(BaseConfig):
     natural_topk_step_e: bool = False
     full_aux_forward: bool = False
     utility_history_eps: float = 1.0e-6
+    require_nonzero_router_grad: bool = False
     behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
     expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
     routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)

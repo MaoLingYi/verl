@@ -292,6 +292,7 @@ eu_derpo:
   natural_topk_step_e: false
   full_aux_forward: false
   utility_history_eps: 1.0e-6
+  require_nonzero_router_grad: false
 
   behavior_expert_is:
     _target_: verl.workers.config.BehaviorExpertISConfig

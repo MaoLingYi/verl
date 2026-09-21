@@ -1488,7 +1488,9 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 if self.config.eu_derpo.version == "1.5":
                     metrics["actor/eu_derpo/router_grad_norm"] = [
-                        self.eu_derpo_observer.v15_router_grad_norm()
+                        self.eu_derpo_observer.v15_router_grad_norm(
+                            self.config.eu_derpo.require_nonzero_router_grad
+                        )
                     ]
                 log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
