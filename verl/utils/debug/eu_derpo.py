@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from functools import wraps
+import math
 import os
 import time
 from types import MethodType
@@ -12,6 +13,7 @@ import torch
 
 from verl.trainer.ppo.eu_derpo import (
     centered_routing_utility,
+    local_rms_routing_utility,
     validate_recompute_edge_counts,
     validate_recompute_hook_count,
 )
@@ -239,7 +241,7 @@ def _route_attribution_summary(valid, order_only, set_mismatch):
 class EUDERPOObserver:
     """Capture actual-F state and apply deferred Router-only utility gradients."""
 
-    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64):
+    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64, version="1.2.1", eps_u=1.0e-6):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -275,6 +277,9 @@ class EUDERPOObserver:
             raise ValueError("EU-DERPO PP1 integration requires dense DP=4 and Expert DP=1")
 
         self.tf_config = tf_config
+        self.version = str(version)
+        self.v15 = self.version == "1.5"
+        self.eps_u = float(eps_u)
         self.diagnostics = bool(diagnostics)
         self.route_attribution = bool(route_attribution)
         self.routers = [
@@ -304,6 +309,7 @@ class EUDERPOObserver:
         self._ordered_route_cache = {}
         self._route_metadata_cache = {}
         self.current_logprob_cache = {}
+        self._credit_mask = None
         self._prepass_route_cache = {}
         self._handles = []
         self._pending_alpha = {}
@@ -642,17 +648,21 @@ class EUDERPOObserver:
             mpu.get_tensor_model_parallel_rank(),
         )
         byte_plan = _cache_byte_plan(plan["rows"], len(self.routers), self.hidden_size, self.topk)
-        ram = self._coordinated_ram_preflight(sum(byte_plan.values()))
-        self._hidden_cache = [
+        ram = {"node_required": 0, "mem_available": 0, "safety_margin": 0}
+        if not self.v15:
+            ram = self._coordinated_ram_preflight(sum(byte_plan.values()))
+        self._hidden_cache = None if self.v15 else [
             torch.empty((plan["rows"], self.hidden_size), dtype=torch.bfloat16)
             for _ in self.routers
         ]
-        self._support_cache = [
+        self._support_cache = None if self.v15 else [
             torch.empty((plan["rows"], self.topk), dtype=torch.uint8)
             for _ in self.routers
         ]
-        if any(tensor.is_pinned() for tensor in self._hidden_cache + self._support_cache):
+        if not self.v15 and any(tensor.is_pinned() for tensor in self._hidden_cache + self._support_cache):
             raise RuntimeError("EU-DERPO full cache must use pageable CPU memory")
+        if self.v15:
+            byte_plan = {"hidden": 0, "support": 0, "metadata": 0}
         self._provenance = {
             key: plan[key] for key in ("sample_row", "sample_id", "response_position")
         }
@@ -693,6 +703,11 @@ class EUDERPOObserver:
         self._step_e_routing_call_count = 0
         self._step_e_dispatch_count = 0
         self._sample_ids_by_row = sample_ids.to(device)
+        self._credit_mask = (
+            torch.zeros((len(ids), response_length), dtype=torch.bool, device=device)
+            if self.v15
+            else None
+        )
         shape = (len(ids), len(self.routers), self.num_experts)
         self._utility_sum = torch.zeros(shape, dtype=torch.float32, device=device)
         self._utility_sum_sq = torch.zeros_like(self._utility_sum) if self.diagnostics else None
@@ -785,7 +800,7 @@ class EUDERPOObserver:
         return routes
 
     @torch.no_grad()
-    def record_main_logprobs(self, sample_ids, routes, current_logprobs):
+    def record_main_logprobs(self, sample_ids, routes, current_logprobs, credit_mask=None):
         ids = self._ids(sample_ids, current_logprobs.shape[0])
         cached = self.routes_for(sample_ids)
         if not torch.equal(cached.long().sort(-1).values, routes.detach().cpu().long().sort(-1).values):
@@ -796,6 +811,11 @@ class EUDERPOObserver:
             if sample_id in self.current_logprob_cache:
                 raise RuntimeError(f"duplicate EU-DERPO actual-F current logprob: {sample_id}")
             self.current_logprob_cache[sample_id] = current_logprobs[row].detach().float().cpu()
+        if self.v15:
+            if credit_mask is None or credit_mask.shape != current_logprobs.shape:
+                raise RuntimeError("EU-DERPO V1.5 requires an aligned token credit mask")
+            rows = torch.tensor([self._sample_row[item] for item in ids], dtype=torch.long, device=credit_mask.device)
+            self._credit_mask[rows] = credit_mask.detach().bool()
 
     def _observe_main(self, index, module, hidden, output):
         actual_set = self._selected(output[1], self.topk)
@@ -817,7 +837,7 @@ class EUDERPOObserver:
                 self._alpha_min.copy_(torch.minimum(self._alpha_min, selected.detach().min()))
                 if self.diagnostics:
                     self._alpha_summary.append(selected.reshape(-1, self.topk)[:32].detach().clone())
-            record.update(layer=index, rows=rows, valid=valid, ready=True)
+            record.update(layer=index, rows=rows, tokens=tokens, valid=valid, ready=True)
         else:
             self._record_execution("F", module)
             if self._active is None:
@@ -830,7 +850,7 @@ class EUDERPOObserver:
                 )
             if end - start != int(valid.sum().item()):
                 raise RuntimeError("EU-DERPO actual-F cache span cardinality mismatch")
-            if self._cache_cursor_by_layer[index] != start:
+            if not self.v15 and self._cache_cursor_by_layer[index] != start:
                 raise RuntimeError("EU-DERPO actual-F hidden cache write cursor mismatch")
             selected_support = actual_set[valid]
             if selected_support.numel() and (
@@ -839,15 +859,16 @@ class EUDERPOObserver:
                 or not (selected_support.sort(-1).values.diff(dim=-1) > 0).all()
             ):
                 raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
-            copy_started = time.perf_counter()
-            self._hidden_cache[index][start:end].copy_(
-                flat_hidden[valid].to(device="cpu", dtype=torch.bfloat16), non_blocking=False
-            )
-            self._support_cache[index][start:end].copy_(
-                selected_support.to(device="cpu", dtype=torch.uint8), non_blocking=False
-            )
-            self._d2h_seconds += time.perf_counter() - copy_started
-            self._cache_cursor_by_layer[index] = end
+            if not self.v15:
+                copy_started = time.perf_counter()
+                self._hidden_cache[index][start:end].copy_(
+                    flat_hidden[valid].to(device="cpu", dtype=torch.bfloat16), non_blocking=False
+                )
+                self._support_cache[index][start:end].copy_(
+                    selected_support.to(device="cpu", dtype=torch.uint8), non_blocking=False
+                )
+                self._d2h_seconds += time.perf_counter() - copy_started
+                self._cache_cursor_by_layer[index] = end
             self._forward_routes[index] = actual_set.detach().to(torch.uint8)
             if self.route_attribution:
                 self._forward_ordered_routes[index] = self._ordered_selected(output[0], actual_set).to(torch.uint8)
@@ -937,11 +958,18 @@ class EUDERPOObserver:
             raise RuntimeError("EU-DERPO actual-alpha gradient fired before route metadata was ready")
         layer, routes, rows, valid = record["layer"], record["routes"], record["rows"], record["valid"]
         sensitivity = -grad.float()
-        utility = centered_routing_utility(record["alpha"], sensitivity)
+        utility = (
+            local_rms_routing_utility(record["alpha"], sensitivity, self.eps_u)
+            if self.v15
+            else centered_routing_utility(record["alpha"], sensitivity)
+        )
         center_residual = (record["alpha"].float() * utility).sum(-1).abs().max()
         self._center_residual_max.copy_(torch.maximum(self._center_residual_max, center_residual))
         self._invalid_flag.bitwise_or_((center_residual > 2.0e-5).to(torch.int32))
         self._invalid_flag.bitwise_or_((~torch.isfinite(utility).all()).to(torch.int32))
+        if self.v15:
+            credit = self._credit_mask.to(rows.device)[rows, record["tokens"]]
+            valid = valid & credit
         edge_valid = valid[:, None].expand_as(routes).reshape(-1)
         flat_rows = rows[:, None].expand_as(routes).reshape(-1)[edge_valid]
         flat_routes = routes.reshape(-1)[edge_valid]
@@ -1004,13 +1032,15 @@ class EUDERPOObserver:
             "weighted_center_max_abs": self._center_residual_max.item(),
             "native_finalize_count": self._native_finalize_count,
             "native_finalize_completed": float(self._native_finalize_completed),
-            "captured_valid_rows": self._cache_plan["hidden"] // (
+            "captured_valid_rows": 0 if self.v15 else self._cache_plan["hidden"] // (
                 len(self.routers) * self.hidden_size * 2
             ),
             "d2h_capture_seconds": self._d2h_seconds,
             **self._cache_metrics,
         }
-        if any(cursor != self._cache_metrics["planned_valid_rows"] for cursor in self._cache_cursor_by_layer):
+        if not self.v15 and any(
+            cursor != self._cache_metrics["planned_valid_rows"] for cursor in self._cache_cursor_by_layer
+        ):
             raise RuntimeError("EU-DERPO planned/captured/final hidden cache rows differ")
         if mismatch or forward_recompute_mismatch:
             raise RuntimeError(f"EU-DERPO actual-F/recompute natural route mismatch: {metrics}")
@@ -1301,10 +1331,31 @@ class EUDERPOObserver:
     def validate_before_optimizer_step(self, optimizer_generation):
         self._assert_native_finalize()
         self._assert_parameters_unchanged(optimizer_generation)
+        if self.v15:
+            return
         if not self._step_e_complete:
             raise RuntimeError("EU-DERPO optimizer step attempted before Router-only Step E completed")
         if any(value != 1 for value in self._aux_reduce_count + self._main_grad_add_count):
             raise RuntimeError("EU-DERPO Router auxiliary reduce/add ledger is incomplete")
+
+    @torch.no_grad()
+    def v15_router_grad_norm(self) -> float:
+        """Return the global Router-gradient L2 norm and reject a frozen V1.5 Router."""
+
+        if not self.v15:
+            raise RuntimeError("V1.5 Router-gradient audit called for a legacy EU-DERPO version")
+        grad_sq = torch.zeros((), dtype=torch.float64, device=self.routers[0].weight.device)
+        for router in self.routers:
+            main_grad = getattr(router.weight, "main_grad", None)
+            if main_grad is None or not torch.isfinite(main_grad).all():
+                raise RuntimeError("EU-DERPO V1.5 Router main_grad is missing or non-finite")
+            grad_sq.add_(main_grad.double().square().sum())
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(grad_sq)
+        norm = grad_sq.sqrt().item()
+        if not math.isfinite(norm) or norm <= 0:
+            raise RuntimeError("EU-DERPO V1.5 Router gradient must be finite and nonzero")
+        return norm
 
     def finish_optimizer_step(self, optimizer_generation):
         if int(optimizer_generation) != self._optimizer_generation + 1:
@@ -1554,6 +1605,7 @@ class EUDERPOObserver:
         self._ordered_route_cache.clear()
         self._route_metadata_cache.clear()
         self.current_logprob_cache.clear()
+        self._credit_mask = None
         self._prepass_route_cache.clear()
         self._sample_row.clear()
         self._prompt_group_by_sample.clear()

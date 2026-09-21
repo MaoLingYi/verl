@@ -88,6 +88,7 @@ class EUDERPOConfig(BaseConfig):
     staging_mib: int = 64
     natural_topk_step_e: bool = False
     full_aux_forward: bool = False
+    utility_history_eps: float = 1.0e-6
     behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
     expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
     routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)
@@ -95,10 +96,18 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version not in {"1.2.1", "1.3", "1.4"}:
-            raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, or 1.4")
+        if self.version not in {"1.2.1", "1.3", "1.4", "1.5"}:
+            raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, 1.4, or 1.5")
+        if self.version == "1.5":
+            if self.partial_rollout_old_alignment or self.current_route_mode != "replay":
+                raise ValueError("EU-DERPO V1.5 requires full rollout route replay")
+            if self.behavior_expert_is.enabled or self.expert_cluster_dppo.enabled or self.routing_utility.enabled:
+                raise ValueError("EU-DERPO V1.5 removes ExpertIS, Expert-level DPPO, and J_U")
+            if self.utility_history_eps <= 0:
+                raise ValueError("EU-DERPO V1.5 utility_history_eps must be positive")
+            return
         if self.current_route_mode != "natural":
-            raise ValueError("EU-DERPO current route mode must remain natural")
+            raise ValueError("EU-DERPO V1.2.1-V1.4 current route mode must remain natural")
         if self.partial_rollout_old_alignment != (self.version in {"1.3", "1.4"}):
             raise ValueError("EU-DERPO V1.3/V1.4 require rollout-to-old partial alignment")
         step_e_contract = (

@@ -30,6 +30,7 @@ from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo.eu_derpo import dppo_tv_valid_mask
 from verl.trainer.ppo.router_shift_weighting import adjust_log_ratio_with_router_shift
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
@@ -1427,13 +1428,13 @@ def compute_policy_loss_dppo_tv(
     truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
     truncated_ratio = truncated_ratio.detach()
 
-    # Compute valid mask for DPPO-Binary-TV
-    prob = torch.exp(log_prob)
-    old_prob = torch.exp(old_log_prob)
-    valid_positive_mask = (prob - old_prob) <= clip_divergence_high
-    valid_negative_mask = (prob - old_prob) >= -clip_divergence_low
-    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
-    valid_mask = valid_mask.detach().float()
+    valid_mask = dppo_tv_valid_mask(
+        old_log_prob,
+        log_prob,
+        advantages,
+        clip_divergence_low,
+        clip_divergence_high,
+    ).float()
 
     pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
 

@@ -125,9 +125,12 @@ class RouterReplay:
             raise ValueError("router replay token mask must match target indices without the top-k dimension")
         self.target_topk_idx = topk_indices
         self.target_token_mask = token_mask
-        if token_mask is not None:
-            expected = token_mask.sum()
-            self.replay_expected = expected if self.replay_expected is None else self.replay_expected + expected
+        expected = (
+            token_mask.sum()
+            if token_mask is not None
+            else topk_indices.new_tensor(topk_indices.numel() // topk_indices.shape[-1], dtype=torch.int64)
+        )
+        self.replay_expected = expected if self.replay_expected is None else self.replay_expected + expected
         if retain_for_backward:
             self.replay_backward_list.append(topk_indices)
 

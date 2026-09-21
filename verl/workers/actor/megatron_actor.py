@@ -42,10 +42,13 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.eu_derpo import (
     audit_optimizer_minibatches,
     cluster_statistics,
+    dppo_tv_valid_mask,
     distribution_stats,
     edppo_token_coefficients,
     normalize_group_utility,
     route_match_fraction,
+    UtilityHistoryState,
+    utility_history_from_moments,
     validate_prompt_groups,
 )
 from verl.utils.device import get_device_id, get_torch_device
@@ -97,6 +100,14 @@ def _gather_diagnostic_values(values: torch.Tensor) -> torch.Tensor:
         torch.distributed.all_gather(gathered, padded, group=group)
         values = torch.cat([item[: length.item()] for item, length in zip(gathered, sizes, strict=True)])
     return values.cpu()
+
+
+def _reduce_v15_history_moments(*moments: torch.Tensor) -> None:
+    """Sum response-level V1.5 moments once across dense data parallelism."""
+
+    if mpu.get_data_parallel_world_size() > 1:
+        for moment in moments:
+            torch.distributed.all_reduce(moment, group=mpu.get_data_parallel_group())
 
 
 def _append_eu_derpo_scalar_metrics(metrics, observer_metrics):
@@ -249,12 +260,21 @@ class MegatronPPOActor(BasePPOActor):
         self._eu_derpo_rollout_routes = None
         self._eu_derpo_rollout_route_mask = None
         self._eu_derpo_optimizer_generation = 0
+        self.eu_derpo_utility_state = None
         if self.config.eu_derpo.enabled:
             if float(self.actor_optimizer.get_loss_scale().item()) != 1.0:
                 raise ValueError("EU-DERPO V1.2.1 alpha sensitivity requires unit BF16 loss scale")
             optimizer_override = self.config.optim.override_optimizer_config or {}
-            expected_replay = (
+            expected_replay = "R3" if self.config.eu_derpo.version == "1.5" else (
                 "R3_OLD_ONLY" if self.config.eu_derpo.version in {"1.3", "1.4"} else "disabled"
+            )
+            v15 = self.config.eu_derpo.version == "1.5"
+            native_hdo_mismatch = (
+                optimizer_override.get("optimizer_cpu_offload") is not False
+                or optimizer_override.get("optimizer_offload_fraction") != 0.0
+            ) if v15 else (
+                optimizer_override.get("optimizer_cpu_offload") is not True
+                or optimizer_override.get("optimizer_offload_fraction") != 0.75
             )
             conflicts = {
                 "router_replay": self.config.router_replay.mode != expected_replay,
@@ -273,24 +293,29 @@ class MegatronPPOActor(BasePPOActor):
                     or not self.config.megatron.optimizer_offload
                     or self.config.megatron.grad_offload
                 ),
-                "native_hdo_cpu_offload": (
-                    optimizer_override.get("optimizer_cpu_offload") is not True
-                    or optimizer_override.get("optimizer_offload_fraction") != 0.75
-                ),
+                "native_hdo_cpu_offload": native_hdo_mismatch,
             }
             enabled_conflicts = [name for name, enabled in conflicts.items() if enabled]
             if enabled_conflicts:
                 raise ValueError(f"EU-DERPO V1.2.1 incompatible actor settings: {enabled_conflicts}")
-            print_rank_0(
-                "EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75"
-            )
+            if v15:
+                print_rank_0("EU-DERPO optimizer_cpu_offload_enabled=0 optimizer_offload_fraction=0.0")
+            else:
+                print_rank_0("EU-DERPO optimizer_cpu_offload_enabled=1 optimizer_offload_fraction=0.75")
             self.eu_derpo_observer = EUDERPOObserver(
                 [unwrap_model(model) for model in self.actor_module],
                 self.tf_config,
                 diagnostics=self.config.eu_derpo.routing_utility.diagnostics,
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
+                version=self.config.eu_derpo.version,
+                eps_u=self.config.eu_derpo.utility_history_eps,
             )
+            if v15:
+                zero = torch.zeros((48, 128), dtype=torch.float32)
+                self.eu_derpo_utility_state = UtilityHistoryState(
+                    zero.clone(), zero.clone(), zero.clone(), zero.clone(), torch.ones_like(zero), 0
+                )
 
         config = get_model_config(self.actor_module[0])
         print(config)
@@ -668,36 +693,62 @@ class MegatronPPOActor(BasePPOActor):
                     if eu_derpo_f_routes is None or eu_derpo_sample_ids is None:
                         raise RuntimeError("EU-DERPO loss closure is missing its actual-F route snapshot")
                     routes = eu_derpo_f_routes.to(device)
-                    dppo = self.config.eu_derpo.expert_cluster_dppo
-                    eu_stats = cluster_statistics(
-                        log_prob.detach(),
-                        data.get("rollout_log_probs"),
-                        advantages,
-                        response_mask,
-                        routes,
-                        self.eu_derpo_observer.num_experts,
-                        dppo.delta_e,
-                        dppo.diagnostics_only,
-                        aligned_old_logp=(
-                            data.get("old_log_probs")
-                            if self.config.eu_derpo.version in {"1.3", "1.4"}
-                            else None
-                        ),
-                        optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
-                    )
-                    active_total = eu_stats.active.sum((1, 2)).float()
-                    coefficient, _ = edppo_token_coefficients(
-                        eu_stats, routes, response_mask, active_total
-                    )
-                    if coefficient.shape != log_prob.shape or not torch.isfinite(coefficient).all():
-                        raise RuntimeError("EU-DERPO actual-F token coefficient is non-finite or misaligned")
-                    self.eu_derpo_observer.record_main_logprobs(
-                        eu_derpo_sample_ids, eu_derpo_f_routes, log_prob.detach()
-                    )
-                    # The schedule averages these per-microbatch surrogates. Its scalar value
-                    # differs from J_E-DPPO; its pure-math test checks the first-order gradient.
-                    pg_loss = -(coefficient * log_prob.float()).sum()
-                    pg_metrics = {"actor/eu_derpo/surrogate_loss": pg_loss.detach().item()}
+                    if self.config.eu_derpo.version == "1.5":
+                        behavior_log_prob = data.get("rollout_log_probs")
+                        if behavior_log_prob is None:
+                            raise RuntimeError("EU-DERPO V1.5 requires rollout behavior log-probabilities")
+                        credit_mask = dppo_tv_valid_mask(
+                            behavior_log_prob,
+                            log_prob.detach(),
+                            advantages,
+                            0.2,
+                            0.2,
+                        ) & response_mask & advantages.ne(0)
+                        self.eu_derpo_observer.record_main_logprobs(
+                            eu_derpo_sample_ids,
+                            eu_derpo_f_routes,
+                            log_prob.detach(),
+                            credit_mask,
+                        )
+                        pg_loss, pg_metrics = get_policy_loss_fn("dppo_tv")(
+                            old_log_prob=behavior_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                        )
+                    else:
+                        dppo = self.config.eu_derpo.expert_cluster_dppo
+                        eu_stats = cluster_statistics(
+                            log_prob.detach(),
+                            data.get("rollout_log_probs"),
+                            advantages,
+                            response_mask,
+                            routes,
+                            self.eu_derpo_observer.num_experts,
+                            dppo.delta_e,
+                            dppo.diagnostics_only,
+                            aligned_old_logp=(
+                                data.get("old_log_probs")
+                                if self.config.eu_derpo.version in {"1.3", "1.4"}
+                                else None
+                            ),
+                            optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
+                        )
+                        active_total = eu_stats.active.sum((1, 2)).float()
+                        coefficient, _ = edppo_token_coefficients(
+                            eu_stats, routes, response_mask, active_total
+                        )
+                        if coefficient.shape != log_prob.shape or not torch.isfinite(coefficient).all():
+                            raise RuntimeError("EU-DERPO actual-F token coefficient is non-finite or misaligned")
+                        self.eu_derpo_observer.record_main_logprobs(
+                            eu_derpo_sample_ids, eu_derpo_f_routes, log_prob.detach()
+                        )
+                        # The schedule averages these per-microbatch surrogates. Its scalar value
+                        # differs from J_E-DPPO; its pure-math test checks the first-order gradient.
+                        pg_loss = -(coefficient * log_prob.float()).sum()
+                        pg_metrics = {"actor/eu_derpo/surrogate_loss": pg_loss.detach().item()}
                 else:
                     old_log_prob = data["old_log_probs"]
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -1167,40 +1218,74 @@ class MegatronPPOActor(BasePPOActor):
                         log_eu_derpo_memory(memory_stage, self.actor_optimizer)
                     main_finished = time.perf_counter()
                     utility_sum, utility_sum_sq, utility_count, eu_metrics = self.eu_derpo_observer.finish_main_batch()
+                    if self.config.eu_derpo.version == "1.5":
+                        replay_matched, replay_compared = RouterReplay.replay_match_counts()
+                        if replay_compared == 0 or replay_matched != replay_compared:
+                            raise RuntimeError(
+                                "EU-DERPO V1.5 rollout/train replay mismatch: "
+                                f"matched={replay_matched} compared={replay_compared}"
+                            )
+                        eu_metrics["route_match_rollout_train"] = 1.0
                     aggregation_started = time.perf_counter()
                     sample_ids = eu_state
                     routes = self.eu_derpo_observer.routes_for(sample_ids)
-                    current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
-                    dppo = self.config.eu_derpo.expert_cluster_dppo
-                    stats_eu = cluster_statistics(
-                        current_log_probs,
-                        data.batch["rollout_log_probs"].cpu(),
-                        data.batch["advantages"].cpu(),
-                        data.batch["response_mask"].cpu(),
-                        routes,
-                        self.eu_derpo_observer.num_experts,
-                        dppo.delta_e,
-                        dppo.diagnostics_only,
-                        aligned_old_logp=(
-                            data.batch["old_log_probs"].cpu()
-                            if self.config.eu_derpo.version in {"1.3", "1.4"}
-                            else None
-                        ),
-                        optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
-                    )
-                    if self.config.eu_derpo.version in {"1.3", "1.4"}:
-                        if self._eu_derpo_rollout_routes is None or self._eu_derpo_rollout_route_mask is None:
-                            raise RuntimeError("EU-DERPO V1.3 current-route diagnostic payload is missing")
-                        eu_metrics["route_match_rollout_current"] = route_match_fraction(
-                            self._eu_derpo_rollout_routes,
-                            routes,
-                            self._eu_derpo_rollout_route_mask,
+                    utility_cfg = self.config.eu_derpo.routing_utility
+                    if self.config.eu_derpo.version == "1.5":
+                        observed = utility_count > 0
+                        response_utility = utility_sum / utility_count.clamp_min(1)
+                        n = observed.sum(0).float().to(get_device_id())
+                        s = (response_utility * observed).sum(0).to(get_device_id())
+                        q = (response_utility.square() * observed).sum(0).to(get_device_id())
+                        _reduce_v15_history_moments(n, s, q)
+                        next_version = self._eu_derpo_optimizer_generation + 1
+                        self.eu_derpo_utility_state = utility_history_from_moments(
+                            n.cpu(), s.cpu(), q.cpu(), version=next_version
                         )
-                    active_total = stats_eu.active.sum((1, 2)).float()
-                    _, objective = edppo_token_coefficients(
-                        stats_eu, routes, data.batch["response_mask"].cpu(), active_total
-                    )
-                    aggregation_seconds = time.perf_counter() - aggregation_started
+                        state = self.eu_derpo_utility_state
+                        eu_metrics.update(
+                            {
+                                "utility_state_version": state.version,
+                                "utility_observation_count": state.n.sum().item(),
+                                "utility_mu_abs_max": state.mu.abs().max().item(),
+                                "utility_sigma_max": state.sigma.max().item(),
+                                "utility_finite": 1.0,
+                                "timing_utility_aggregation_s": time.perf_counter() - aggregation_started,
+                                "timing_aux_router_s": 0.0,
+                            }
+                        )
+                        _append_eu_derpo_scalar_metrics(metrics, eu_metrics)
+                    else:
+                        current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
+                        dppo = self.config.eu_derpo.expert_cluster_dppo
+                        stats_eu = cluster_statistics(
+                            current_log_probs,
+                            data.batch["rollout_log_probs"].cpu(),
+                            data.batch["advantages"].cpu(),
+                            data.batch["response_mask"].cpu(),
+                            routes,
+                            self.eu_derpo_observer.num_experts,
+                            dppo.delta_e,
+                            dppo.diagnostics_only,
+                            aligned_old_logp=(
+                                data.batch["old_log_probs"].cpu()
+                                if self.config.eu_derpo.version in {"1.3", "1.4"}
+                                else None
+                            ),
+                            optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
+                        )
+                        if self.config.eu_derpo.version in {"1.3", "1.4"}:
+                            if self._eu_derpo_rollout_routes is None or self._eu_derpo_rollout_route_mask is None:
+                                raise RuntimeError("EU-DERPO V1.3 current-route diagnostic payload is missing")
+                            eu_metrics["route_match_rollout_current"] = route_match_fraction(
+                                self._eu_derpo_rollout_routes,
+                                routes,
+                                self._eu_derpo_rollout_route_mask,
+                            )
+                        active_total = stats_eu.active.sum((1, 2)).float()
+                        _, objective = edppo_token_coefficients(
+                            stats_eu, routes, data.batch["response_mask"].cpu(), active_total
+                        )
+                        aggregation_seconds = time.perf_counter() - aggregation_started
                     if "alpha_min" in eu_metrics:
                         alpha_min = torch.tensor(eu_metrics["alpha_min"], device=get_device_id())
                         if mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -1210,54 +1295,54 @@ class MegatronPPOActor(BasePPOActor):
                                 group=mpu.get_pipeline_model_parallel_group(),
                             )
                         eu_metrics["alpha_min"] = alpha_min.item()
-                    utility_cfg = self.config.eu_derpo.routing_utility
-                    normalized, skipped = normalize_group_utility(
-                        utility_sum,
-                        utility_count,
-                        data.batch["eu_derpo_prompt_group"].cpu(),
-                        utility_cfg.eps_u,
-                        utility_cfg.min_group_size,
-                        utility_cfg.min_std,
-                    )
-                    auxiliary_started = time.perf_counter()
-                    auxiliary_metrics = self.eu_derpo_observer.run_router_only_step_e(
-                        sample_ids,
-                        stats_eu,
-                        normalized,
-                        active_total,
-                        utility_cfg.lambda_u,
-                        self._eu_derpo_optimizer_generation,
-                    )
-                    log_eu_derpo_memory("after_step_e", self.actor_optimizer)
-                    auxiliary_objective = torch.tensor(
-                        auxiliary_metrics["utility_objective"], dtype=torch.float32, device=get_device_id()
-                    )
-                    if mpu.get_tensor_model_parallel_world_size() > 1:
-                        torch.distributed.all_reduce(
-                            auxiliary_objective, group=mpu.get_tensor_model_parallel_group()
+                    if self.config.eu_derpo.version != "1.5":
+                        normalized, skipped = normalize_group_utility(
+                            utility_sum,
+                            utility_count,
+                            data.batch["eu_derpo_prompt_group"].cpu(),
+                            utility_cfg.eps_u,
+                            utility_cfg.min_group_size,
+                            utility_cfg.min_std,
                         )
-                    if mpu.get_pipeline_model_parallel_world_size() > 1:
-                        torch.distributed.all_reduce(
-                            auxiliary_objective, group=mpu.get_pipeline_model_parallel_group()
+                        auxiliary_started = time.perf_counter()
+                        auxiliary_metrics = self.eu_derpo_observer.run_router_only_step_e(
+                            sample_ids,
+                            stats_eu,
+                            normalized,
+                            active_total,
+                            utility_cfg.lambda_u,
+                            self._eu_derpo_optimizer_generation,
                         )
-                    auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
-                    objective_device = objective.to(get_device_id())
-                    if mpu.get_data_parallel_world_size() > 1:
-                        torch.distributed.all_reduce(objective_device, group=mpu.get_data_parallel_group())
-                        objective_device /= mpu.get_data_parallel_world_size()
-                        torch.distributed.all_reduce(auxiliary_objective, group=mpu.get_data_parallel_group())
-                        auxiliary_objective /= mpu.get_data_parallel_world_size()
-                    objective_log = objective_device.item()
-                    auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
-                    metrics["actor/eu_derpo/objective_edppo"] = [objective_log]
-                    metrics["actor/eu_derpo/objective_utility"] = [auxiliary_metrics["utility_objective"]]
-                    metrics["actor/eu_derpo/objective_utility_weighted"] = [
-                        utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
-                    ]
-                    metrics["actor/eu_derpo/objective_total"] = [
-                        objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
-                    ]
-                    _append_eu_derpo_scalar_metrics(metrics, eu_metrics | auxiliary_metrics)
+                        log_eu_derpo_memory("after_step_e", self.actor_optimizer)
+                        auxiliary_objective = torch.tensor(
+                            auxiliary_metrics["utility_objective"], dtype=torch.float32, device=get_device_id()
+                        )
+                        if mpu.get_tensor_model_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(
+                                auxiliary_objective, group=mpu.get_tensor_model_parallel_group()
+                            )
+                        if mpu.get_pipeline_model_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(
+                                auxiliary_objective, group=mpu.get_pipeline_model_parallel_group()
+                            )
+                        auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
+                        objective_device = objective.to(get_device_id())
+                        if mpu.get_data_parallel_world_size() > 1:
+                            torch.distributed.all_reduce(objective_device, group=mpu.get_data_parallel_group())
+                            objective_device /= mpu.get_data_parallel_world_size()
+                            torch.distributed.all_reduce(auxiliary_objective, group=mpu.get_data_parallel_group())
+                            auxiliary_objective /= mpu.get_data_parallel_world_size()
+                        objective_log = objective_device.item()
+                        auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
+                        metrics["actor/eu_derpo/objective_edppo"] = [objective_log]
+                        metrics["actor/eu_derpo/objective_utility"] = [auxiliary_metrics["utility_objective"]]
+                        metrics["actor/eu_derpo/objective_utility_weighted"] = [
+                            utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
+                        ]
+                        metrics["actor/eu_derpo/objective_total"] = [
+                            objective_log + utility_cfg.lambda_u * auxiliary_metrics["utility_objective"]
+                        ]
+                        _append_eu_derpo_scalar_metrics(metrics, eu_metrics | auxiliary_metrics)
                     if utility_cfg.diagnostics:
                         active = stats_eu.active
                         cluster_utility = utility_sum / utility_count.masked_fill(utility_count == 0, 1)
@@ -1401,6 +1486,10 @@ class MegatronPPOActor(BasePPOActor):
                 self.eu_derpo_observer.validate_before_optimizer_step(
                     self._eu_derpo_optimizer_generation
                 )
+                if self.config.eu_derpo.version == "1.5":
+                    metrics["actor/eu_derpo/router_grad_norm"] = [
+                        self.eu_derpo_observer.v15_router_grad_norm()
+                    ]
                 log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             if self.eu_derpo_observer is not None:

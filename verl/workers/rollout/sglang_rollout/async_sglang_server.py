@@ -168,6 +168,13 @@ class SGLangHttpServer:
                 self._master_sock.close()
 
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
+        v15_config = (self.config.get("custom", None) or {}).get("eu_derpo_v15", {}) or {}
+        v15_enabled = bool(v15_config.get("enabled", False))
+        if v15_enabled:
+            base_seed = int(v15_config.get("seed", 1234))
+            os.environ["VERL_EU_DERPO_V15_ROLLOUT_SEED"] = str(
+                base_seed + 1_000_000_007 * self.replica_rank
+            )
         attention_backend = engine_kwargs.pop("attention_backend", None)
         quantization = self.config.get("quantization", None)
         if quantization is not None:
@@ -263,10 +270,15 @@ class SGLangHttpServer:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
+            scheduler_entrypoint = sglang.srt.entrypoints.engine.run_scheduler_process
+            if v15_enabled:
+                from verl.workers.rollout.sglang_rollout.eu_derpo_v15 import run_scheduler_process_v15
+
+                scheduler_entrypoint = run_scheduler_process_v15
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+                run_scheduler_process_func=scheduler_entrypoint,
                 run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
             )
         else:

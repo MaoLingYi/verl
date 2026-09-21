@@ -168,6 +168,20 @@ class TestEUDERPOObserver(unittest.TestCase):
             [self.model], observer_config(), diagnostics=True, route_attribution=True
         )
 
+    def test_v15_router_grad_norm_rejects_frozen_router(self):
+        self.observer.close()
+        self.observer = self.observer_class(
+            [self.model], observer_config(), version="1.5"
+        )
+        for router in self.model.routers:
+            router.weight.main_grad = torch.ones_like(router.weight)
+        expected = (48 * 128 * 4) ** 0.5
+        self.assertAlmostEqual(self.observer.v15_router_grad_norm(), expected, places=5)
+        for router in self.model.routers:
+            router.weight.main_grad.zero_()
+        with self.assertRaisesRegex(RuntimeError, "finite and nonzero"):
+            self.observer.v15_router_grad_norm()
+
     def tearDown(self):
         self.observer.close()
         self.all_reduce_patcher.stop()

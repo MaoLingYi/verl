@@ -502,6 +502,12 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
+        v15_validation = (
+            self.config.actor_rollout_ref.actor.eu_derpo.enabled
+            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.5"
+        )
+        if v15_validation:
+            self.actor_rollout_wg.set_eu_derpo_v15_validation_mode(True)
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -617,6 +623,8 @@ class RayPPOTrainer:
 
         if merged:
             print("_merge_validation_results validate result will be merged")
+            if v15_validation:
+                self.actor_rollout_wg.set_eu_derpo_v15_validation_mode(False)
             return {
                 "data_sources": data_source_lst,
                 "sample_uids": sample_uids,
@@ -654,6 +662,8 @@ class RayPPOTrainer:
                 "val-aime24/total": total,
                 "val-aime24/accuracy": accuracy,
             })
+        if v15_validation:
+            self.actor_rollout_wg.set_eu_derpo_v15_validation_mode(False)
         return metrics
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):

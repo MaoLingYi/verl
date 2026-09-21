@@ -61,6 +61,22 @@ def response_advantage(advantages: torch.Tensor, response_mask: torch.Tensor) ->
     return result.detach()
 
 
+def dppo_tv_valid_mask(
+    behavior_log_prob: torch.Tensor,
+    current_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    delta_low: float,
+    delta_high: float,
+) -> torch.Tensor:
+    """Return the detached token-level DPPO-Binary-TV credit mask."""
+
+    probability = current_log_prob.exp()
+    behavior_probability = behavior_log_prob.exp()
+    valid_positive = (probability - behavior_probability) <= delta_high
+    valid_negative = (probability - behavior_probability) >= -delta_low
+    return torch.where(advantages > 0, valid_positive, valid_negative).detach()
+
+
 def cluster_statistics(
     current_logp: torch.Tensor,
     behavior_logp: torch.Tensor | None,
@@ -249,6 +265,94 @@ def centered_routing_utility(actual_alpha: torch.Tensor, sensitivity: torch.Tens
         raise FloatingPointError("EU-DERPO actual selected-softmax alpha does not sum to one")
     baseline = (alpha * sensitivity).sum(-1, keepdim=True)
     return _finite("relative routing utility", sensitivity - baseline).detach()
+
+
+def local_rms_routing_utility(
+    actual_alpha: torch.Tensor, sensitivity: torch.Tensor, eps_u: float = 1.0e-6
+) -> torch.Tensor:
+    """V1.5 local RMS-normalized u^R on one selected support."""
+
+    utility = centered_routing_utility(actual_alpha, sensitivity)
+    alpha = actual_alpha.detach().float()
+    scale = (alpha * utility.square()).sum(-1, keepdim=True).add(float(eps_u)).sqrt()
+    return _finite("local RMS-normalized relative routing utility", utility / scale).detach()
+
+
+class UtilityHistoryState:
+    """Detached response-level utility state used by the next rollout."""
+
+    def __init__(self, n, s, q, mu, sigma, version):
+        self.n = n
+        self.s = s
+        self.q = q
+        self.mu = mu
+        self.sigma = sigma
+        self.version = int(version)
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "n": self.n.detach().cpu(),
+            "s": self.s.detach().cpu(),
+            "q": self.q.detach().cpu(),
+            "mu": self.mu.detach().cpu(),
+            "sigma": self.sigma.detach().cpu(),
+            "version": int(self.version),
+        }
+
+    @classmethod
+    def from_state_dict(cls, values: dict[str, object]) -> "UtilityHistoryState":
+        state = cls(
+            *(torch.as_tensor(values[name]).detach().float().cpu() for name in ("n", "s", "q", "mu", "sigma")),
+            version=int(values["version"]),
+        )
+        validate_utility_history_state(state)
+        return state
+
+
+def utility_history_from_response_observations(
+    response_sum: torch.Tensor,
+    response_count: torch.Tensor,
+    *,
+    version: int,
+) -> UtilityHistoryState:
+    """Reduce response×layer×expert token sums to frozen N/S/Q moments."""
+
+    if response_sum.shape != response_count.shape or response_sum.ndim != 3:
+        raise ValueError("V1.5 response utility tensors must share [response, layer, expert] shape")
+    observed = response_count > 0
+    response_utility = response_sum / response_count.clamp_min(1)
+    n = observed.sum(0).float()
+    s = (response_utility * observed).sum(0)
+    q = (response_utility.square() * observed).sum(0)
+    return utility_history_from_moments(n, s, q, version=version)
+
+
+def utility_history_from_moments(
+    n: torch.Tensor, s: torch.Tensor, q: torch.Tensor, *, version: int
+) -> UtilityHistoryState:
+    """Convert detached global N/S/Q moments to frozen mu/sigma state."""
+
+    if n.shape != s.shape or n.shape != q.shape or tuple(n.shape) != (48, 128):
+        raise ValueError("V1.5 N/S/Q moments must be [48, 128]")
+    n, s, q = n.float(), s.float(), q.float()
+    mu = torch.where(n > 0, s / n.clamp_min(1), torch.zeros_like(s))
+    numerator = (q - s.square() / n.clamp_min(1)).clamp_min(0)
+    variance = torch.where(n >= 2, numerator / (n - 1).clamp_min(1), torch.ones_like(numerator))
+    sigma = variance.sqrt()
+    state = UtilityHistoryState(
+        n.detach().cpu(), s.detach().cpu(), q.detach().cpu(), mu.detach().cpu(), sigma.detach().cpu(), int(version)
+    )
+    validate_utility_history_state(state)
+    return state
+
+
+def validate_utility_history_state(state: UtilityHistoryState) -> None:
+    for name in ("n", "s", "q", "mu", "sigma"):
+        value = getattr(state, name)
+        if tuple(value.shape) != (48, 128) or not torch.isfinite(value).all():
+            raise ValueError(f"V1.5 utility state {name} must be finite [48, 128]")
+    if (state.n < 0).any() or (state.sigma < 0).any() or state.version < 0:
+        raise ValueError("V1.5 utility state has invalid counts, dispersion, or version")
 
 
 def aime_accuracy_values(reward_extra_info: dict[str, list], scores: list[float]) -> list[float]:

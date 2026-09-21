@@ -18,6 +18,7 @@ The main entry point to run the PPO algorithm
 import ctypes
 import datetime
 import gc
+import itertools
 import logging
 import os
 import sys
@@ -60,6 +61,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
+    get_dist_checkpoint_path,
     is_megatron_model_offloaded,
     is_megatron_optimizer_offloaded,
     load_megatron_model_to_gpu,
@@ -864,6 +866,30 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+        if self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5":
+            from verl.workers.rollout.sglang_rollout.eu_derpo_v15 import (
+                ACTOR_VERSION,
+                STATE_MU,
+                STATE_SIGMA,
+                STATE_VERSION,
+            )
+
+            state = self.actor.eu_derpo_utility_state
+            if state is None or state.version != self.actor._eu_derpo_optimizer_generation:
+                raise RuntimeError(
+                    "EU-DERPO V1.5 actor/utility state version mismatch before rollout sync"
+                )
+            device = get_device_id()
+            state_tensors = (
+                (STATE_MU, state.mu.to(device)),
+                (STATE_SIGMA, state.sigma.to(device)),
+                (STATE_VERSION, torch.tensor(state.version, dtype=torch.int64, device=device)),
+                (
+                    ACTOR_VERSION,
+                    torch.tensor(self.actor._eu_derpo_optimizer_generation, dtype=torch.int64, device=device),
+                ),
+            )
+            per_tensor_param = itertools.chain(per_tensor_param, state_tensors)
 
         update_weights_started = time.perf_counter()
         if self.config.rollout.free_cache_engine:
@@ -1705,6 +1731,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     )
 
             _log_resume_memory("restore_complete")
+            self._load_eu_derpo_v15_state(checkpoint_path)
             return
 
         if self._is_offload_param:
@@ -1720,6 +1747,23 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 offload_megatron_model_to_cpu(self.actor_module)
             if self._is_offload_optimizer:
                 self._offload_actor_optimizer()
+
+        self._load_eu_derpo_v15_state(checkpoint_path)
+
+    def _load_eu_derpo_v15_state(self, checkpoint_path):
+        if not (self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5"):
+            return
+        from verl.trainer.ppo.eu_derpo import UtilityHistoryState
+
+        path = os.path.join(get_dist_checkpoint_path(checkpoint_path), "eu_derpo_v15_utility_state.pt")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"missing EU-DERPO V1.5 checkpoint state: {path}")
+        state = UtilityHistoryState.from_state_dict(
+            torch.load(path, map_location="cpu", weights_only=True)
+        )
+        self.actor.eu_derpo_utility_state = state
+        self.actor._eu_derpo_optimizer_generation = state.version
+        logger.info("EU_DERPO_V15_RESUME utility_state_version=%d", state.version)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
@@ -1786,6 +1830,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                         f"reserved_gib={cuda_reserved / _GIB:.2f} "
                         f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f}"
                     )
+            if self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5":
+                state = self.actor.eu_derpo_utility_state
+                if state is None or state.version != int(global_step):
+                    raise RuntimeError("EU-DERPO V1.5 checkpoint actor/state version mismatch")
+                if torch.distributed.get_rank() == 0:
+                    torch.save(
+                        state.state_dict(),
+                        os.path.join(get_dist_checkpoint_path(checkpoint_path), "eu_derpo_v15_utility_state.pt"),
+                    )
             self.checkpoint_mananager.save_checkpoint(
                 local_path=checkpoint_path,
                 hdfs_path=hdfs_path,
@@ -1805,6 +1858,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 elif copy_params_were_partial:
                     self._offload_actor_optimizer_copy_params_for_rollout()
                 log_checkpoint_memory("after_checkpoint_reoffload")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_eu_derpo_v15_validation_mode(self, enabled: bool):
+        if not (self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5"):
+            return
+        from verl.workers.rollout.sglang_rollout.eu_derpo_v15 import VALIDATION_MODE
+
+        payload = iter(
+            ((VALIDATION_MODE, torch.tensor(int(enabled), dtype=torch.int64, device=get_device_id())),)
+        )
+        get_event_loop().run_until_complete(self.rollout.update_weights(payload))
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):

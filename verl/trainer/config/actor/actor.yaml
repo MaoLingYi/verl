@@ -291,6 +291,7 @@ eu_derpo:
   staging_mib: 64
   natural_topk_step_e: false
   full_aux_forward: false
+  utility_history_eps: 1.0e-6
 
   behavior_expert_is:
     _target_: verl.workers.config.BehaviorExpertISConfig
