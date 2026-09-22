@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
 import torch
 
 
@@ -60,3 +61,54 @@ def test_full_and_partial_replay_expected_counts_and_clear(monkeypatch):
         assert router.target_topk_idx is None
         assert router.replay_expected is None
         assert router.replay_backward_list == []
+
+
+def _run_replay(module, target, mask):
+    replay = module.RouterReplay()
+    replay.set_target_indices(target, token_mask=mask, retain_for_backward=mask is None)
+    replay.set_router_replay_action(module.RouterReplayAction.REPLAY_FORWARD)
+    logits = torch.arange(target.shape[0] * 128, dtype=torch.float32).reshape(target.shape[0], 128)
+    _, routing_map = module._patched_topk_routing_with_score_function(
+        logits, 8, False, None, None, "softmax", None, False, replay, None
+    )
+    return replay, routing_map
+
+
+def test_valid_replay_padding_recompute_and_tp_replication(monkeypatch):
+    module = _load_router_replay(monkeypatch)
+    target = torch.tensor(
+        [[1, 2, 3, 4, 5, 6, 7, 8], [0, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.int64
+    )
+    mask = torch.tensor([True, False])
+    tp0, routing_map = _run_replay(module, target, mask)
+    tp1, _ = _run_replay(module, target.clone(), mask.clone())
+
+    assert torch.equal(tp0.replayed_topk_idx[mask], target[mask])
+    assert routing_map[mask].sum() == 8
+    assert torch.equal(tp0.replayed_topk_idx, tp1.replayed_topk_idx)
+    forward_ids = tp0.replayed_topk_idx.clone()
+    next_target = target.clone()
+    next_target[0] = torch.tensor([9, 10, 11, 12, 13, 14, 15, 16])
+    tp0.set_target_indices(next_target, token_mask=mask, retain_for_backward=False)
+    tp0.set_router_replay_action(module.RouterReplayAction.REPLAY_BACKWARD)
+    logits = torch.randn(2, 128)
+    module._patched_topk_routing_with_score_function(
+        logits, 8, False, None, None, "softmax", None, False, tp0, None
+    )
+    assert torch.equal(tp0.replayed_topk_idx, forward_ids)
+    assert torch.equal(tp0.replayed_target_topk_idx[mask], target[mask])
+    assert torch.equal(tp0.replayed_token_mask, mask)
+
+
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        ([1, 2, 3, 4, 5, 6, 7, 7], "invalid valid-replay route"),
+        ([1, 2, 3, 4, 5, 6, 7, 128], "invalid valid-replay route"),
+        ([-1, 2, 3, 4, 5, 6, 7, 8], "invalid valid-replay route"),
+    ],
+)
+def test_invalid_valid_replay_ids_hard_fail(monkeypatch, bad, message):
+    module = _load_router_replay(monkeypatch)
+    with pytest.raises(RuntimeError, match=message):
+        _run_replay(module, torch.tensor([bad]), torch.tensor([True]))

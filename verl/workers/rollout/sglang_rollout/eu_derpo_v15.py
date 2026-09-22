@@ -25,6 +25,34 @@ ACTOR_VERSION = f"{STATE_PREFIX}actor_version"
 VALIDATION_MODE = f"{STATE_PREFIX}validation_mode"
 
 
+def _validate_selector_support(anchors, candidates, explored, selected) -> None:
+    """Enforce the frozen V1.5 ID contract at the selector boundary."""
+    expected = (
+        (anchors, 4, "anchors"),
+        (candidates, 16, "candidates"),
+        (explored, 4, "explored"),
+        (selected, 8, "selected"),
+    )
+    for value, width, name in expected:
+        if value.ndim != 2 or value.shape[-1] != width:
+            raise RuntimeError(f"EU-DERPO V1.5 {name} must have shape [tokens, {width}]")
+        if value.numel() and ((value < 0).any() or (value >= 128).any()):
+            raise RuntimeError(f"EU-DERPO V1.5 {name} contains an out-of-range Expert ID")
+        if value.numel() and not (value.sort(-1).values.diff(dim=-1) > 0).all():
+            raise RuntimeError(f"EU-DERPO V1.5 {name} contains duplicate Expert IDs")
+    if (anchors.unsqueeze(-1) == candidates.unsqueeze(-2)).any():
+        raise RuntimeError("EU-DERPO V1.5 anchors and candidates overlap")
+    if not (explored.unsqueeze(-1) == candidates.unsqueeze(-2)).any(-1).all():
+        raise RuntimeError("EU-DERPO V1.5 explored Experts are not a subset of candidates")
+    if (anchors.unsqueeze(-1) == explored.unsqueeze(-2)).any():
+        raise RuntimeError("EU-DERPO V1.5 anchors and explored Experts overlap")
+
+
+def _capture_dispatched_routes(capturer, layer_id: int, dispatched_logical_ids: torch.Tensor) -> None:
+    """Capture the exact logical IDs that feed SGLang's physical dispatch mapping."""
+    capturer.capture(layer_id=layer_id, topk_ids=dispatched_logical_ids)
+
+
 def select_v15_routes(
     router_logits: torch.Tensor,
     *,
@@ -75,6 +103,7 @@ def select_v15_routes(
 
     explored = candidates.gather(-1, exploration_score.topk(4, dim=-1, sorted=True).indices)
     selected = torch.cat((anchors, explored), dim=-1)
+    _validate_selector_support(anchors, candidates, explored, selected)
     weights = logits.gather(-1, selected).softmax(-1)
     return selected.to(torch.int32), weights, mode
 
@@ -204,7 +233,7 @@ def install_sglang_patch(*, seed: int = 1234) -> None:
         topk_module._mask_topk_ids_padded_region(selected, num_token_non_padded)
         topk_module._mask_topk_ids_padded_region(logical_selected, num_token_non_padded)
         if (capturer := get_global_experts_capturer()) is not None:
-            capturer.capture(layer_id=int(self.layer_id), topk_ids=logical_selected)
+            _capture_dispatched_routes(capturer, int(self.layer_id), logical_selected)
         selector_log = (mode, state.actor_version, state.state_version)
         if int(self.layer_id) == 0 and state.last_selector_log != selector_log:
             logger.warning(

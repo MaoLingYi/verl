@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 
 import torch
+import pytest
 
 
 ROOT = Path(__file__).parents[3]
@@ -44,6 +45,31 @@ def test_v15_selector_transition_and_original_logit_weights():
     expected_alpha = logits.gather(-1, history_ids.long()).softmax(-1)
     assert torch.allclose(history_alpha, expected_alpha)
     assert not torch.equal(history_ids[:, 4:], bootstrap_ids[:, 4:])
+
+
+def test_v15_selector_id_contract_rejects_malformed_support():
+    anchors = torch.tensor([[1, 2, 3, 4]])
+    candidates = torch.arange(5, 21).reshape(1, 16)
+    explored = torch.tensor([[5, 6, 7, 8]])
+    selected = torch.cat((anchors, explored), -1)
+    selector._validate_selector_support(anchors, candidates, explored, selected)
+    with pytest.raises(RuntimeError, match="duplicate"):
+        selector._validate_selector_support(anchors, candidates, explored, torch.tensor([[1, 2, 3, 4, 5, 6, 7, 7]]))
+    with pytest.raises(RuntimeError, match="subset"):
+        selector._validate_selector_support(anchors, candidates, torch.tensor([[5, 6, 7, 30]]), selected)
+
+
+def test_v15_capture_receives_exact_dispatched_logical_ids():
+    class Capturer:
+        def capture(self, *, layer_id, topk_ids):
+            self.layer_id = layer_id
+            self.ids = topk_ids.clone()
+
+    ids = torch.tensor([[1, 2, 3, 4, 9, 10, 11, 12]], dtype=torch.int32)
+    capturer = Capturer()
+    selector._capture_dispatched_routes(capturer, 7, ids)
+    assert capturer.layer_id == 7
+    assert torch.equal(capturer.ids, ids)
 
 
 def test_v15_loss_sign_jacobian_and_local_rms():

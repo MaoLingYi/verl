@@ -42,7 +42,7 @@ from verl.models.mcore.util import (
     preprocess_thd_no_padding,
 )
 from verl.utils.device import get_device_name
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, validate_replay_indices
 
 device_name = get_device_name()
 
@@ -278,9 +278,12 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         None: The function updates internal RouterReplay instances in-place.
     """
     with torch.no_grad():
-        if replay_token_mask is not None and replay_token_mask.shape != attention_mask.shape:
-            raise ValueError("router replay token mask must match attention_mask")
         if layers_topk_idx.is_nested:
+            if replay_token_mask is not None and (
+                not replay_token_mask.is_nested
+                or not torch.equal(replay_token_mask.offsets(), layers_topk_idx.offsets())
+            ):
+                raise ValueError("nested router replay token mask must share routed_experts offsets")
             layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
             token_mask_rmpad = None
             if replay_token_mask is not None:
@@ -288,6 +291,8 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
                     replay_token_mask.unsqueeze(-1), pre_process=True
                 )
         else:
+            if replay_token_mask is not None and replay_token_mask.shape != attention_mask.shape:
+                raise ValueError("router replay token mask must match attention_mask")
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
             token_mask_rmpad = None
             if replay_token_mask is not None:
@@ -328,8 +333,16 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
                 continue
             router = router_instances_list[router_offset]
             idx = layer_idx if index_by_layer else moe_idx
+            target = layers_topk_idx_reshape[idx].to(torch.int64)
+            validate_replay_indices(
+                target,
+                token_mask_split,
+                topk=target.shape[-1],
+                num_experts=tf_config.num_moe_experts,
+                phase=f"R3 batch transport layer={layer_idx}",
+            )
             router.set_target_indices(
-                layers_topk_idx_reshape[idx].to(torch.int64),
+                target,
                 None if token_mask_split is None else token_mask_split,
                 retain_for_backward=token_mask_split is None,
             )

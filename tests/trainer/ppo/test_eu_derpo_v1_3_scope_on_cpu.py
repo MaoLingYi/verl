@@ -14,7 +14,8 @@ def test_partial_replay_is_old_only_and_full_r3_paths_are_unchanged():
     assert 'mode in {"R3", "R3_OLD_ONLY"}' in worker
     assert 'mode in {"R2", "R3"}' in actor
     assert 'mode in ["R2", "R3"]' in actor
-    assert 'replay_token_mask[:, -response_length - 1 : -1] = batch["response_mask"].bool()' in actor
+    assert 'response_replay_mask[:, -response_length - 1 : -1] = batch["response_mask"].bool()' in actor
+    assert "replay_token_mask = response_replay_mask & replay_token_mask.bool()" in actor
     replay_utils = source("verl/utils/megatron/router_replay_utils.py")
     assert "retain_for_backward=token_mask_split is None" in replay_utils
     assert 'select_keys.append("routed_experts")' in actor

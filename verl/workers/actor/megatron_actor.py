@@ -393,7 +393,8 @@ class MegatronPPOActor(BasePPOActor):
 
             if self.enable_routing_replay and self.config.router_replay.mode in {"R3", "R3_OLD_ONLY"}:
                 assert "routed_experts" in data.batch.keys(), "routed_experts must be in data.batch.keys()"
-                select_keys.append("routed_experts")
+                assert "routed_experts_mask" in data.batch.keys(), "routed_experts_mask must be in data.batch.keys()"
+                select_keys.extend(["routed_experts", "routed_experts_mask"])
                 if self.config.router_replay.mode == "R3_OLD_ONLY":
                     select_keys.append("response_mask")
 
@@ -538,6 +539,10 @@ class MegatronPPOActor(BasePPOActor):
         # router replay
         if self.config.router_replay.mode in {"R2", "R3"}:
             select_keys.append("routed_experts")
+            if self.config.router_replay.mode == "R3":
+                if "routed_experts_mask" not in data.batch.keys():
+                    raise RuntimeError("R3 requires routed_experts_mask from rollout capture")
+                select_keys.append("routed_experts_mask")
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
         else:
@@ -900,10 +905,11 @@ class MegatronPPOActor(BasePPOActor):
 
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 layers_topk_idx = batch["routed_experts"]
-                replay_token_mask = None
+                replay_token_mask = batch.get("routed_experts_mask")
                 if self.config.router_replay.mode == "R3_OLD_ONLY":
-                    replay_token_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
-                    replay_token_mask[:, -response_length - 1 : -1] = batch["response_mask"].bool()
+                    response_replay_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+                    response_replay_mask[:, -response_length - 1 : -1] = batch["response_mask"].bool()
+                    replay_token_mask = response_replay_mask & replay_token_mask.bool()
                 set_router_replay_data(
                     layers_topk_idx,
                     attention_mask,

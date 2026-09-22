@@ -41,6 +41,33 @@ class RouterReplayAction(Enum):
     REPLAY_BACKWARD = "replay_backward"
 
 
+def validate_replay_indices(topk_indices, token_mask, *, topk, num_experts, phase="router replay"):
+    """Validate ID-level replay support only on tokens covered by the replay mask."""
+    if topk_indices.ndim != 2 or topk_indices.shape[-1] != topk:
+        raise RuntimeError(f"{phase}: target_topk_idx must have shape [tokens, {topk}]")
+    if token_mask is None:
+        token_mask = torch.ones(topk_indices.shape[0], dtype=torch.bool, device=topk_indices.device)
+    else:
+        token_mask = token_mask.reshape(-1).to(device=topk_indices.device, dtype=torch.bool)
+        if token_mask.shape != topk_indices.shape[:-1]:
+            raise RuntimeError(f"{phase}: replay_mask must match target_topk_idx rows")
+    active = topk_indices[token_mask]
+    if not active.numel():
+        return token_mask
+    in_range = (active >= 0).all(-1) & (active < num_experts).all(-1)
+    unique = (active.sort(-1).values.diff(dim=-1) > 0).all(-1)
+    good = in_range & unique
+    if not good.all():
+        row = (~good).nonzero(as_tuple=False)[0, 0]
+        bad = active[row]
+        raise RuntimeError(
+            f"{phase}: invalid valid-replay route; ids={bad.tolist()}, "
+            f"min={int(bad.min())}, max={int(bad.max())}, unique={int(bad.unique().numel())}, "
+            f"topk={topk}, num_experts={num_experts}"
+        )
+    return token_mask
+
+
 class RouterReplay:
     """
     A class to manage the recording and replaying of MoE routing decisions.
@@ -105,6 +132,8 @@ class RouterReplay:
         self.target_topk_idx = None  # For replay
         self.target_token_mask = None  # Optional token scope for partial replay
         self.replayed_topk_idx = None
+        self.replayed_target_topk_idx = None
+        self.replayed_token_mask = None
         self.replay_matched = None
         self.replay_compared = None
         self.replay_expected = None
@@ -132,7 +161,7 @@ class RouterReplay:
         )
         self.replay_expected = expected if self.replay_expected is None else self.replay_expected + expected
         if retain_for_backward:
-            self.replay_backward_list.append(topk_indices)
+            self.replay_backward_list.append((topk_indices, topk_indices, token_mask))
 
     def get_recorded_indices(self):
         """Returns the recorded topk indices."""
@@ -148,6 +177,8 @@ class RouterReplay:
         self.target_topk_idx = None
         self.target_token_mask = None
         self.replayed_topk_idx = None
+        self.replayed_target_topk_idx = None
+        self.replayed_token_mask = None
         self.replay_matched = None
         self.replay_compared = None
         self.replay_expected = None
@@ -225,13 +256,23 @@ def _patched_topk_routing_with_score_function(
 
             target = router_replay.target_topk_idx.to(scores.device)
             token_mask = router_replay.target_token_mask
-            if token_mask is None:
+            token_mask = validate_replay_indices(
+                target, token_mask, topk=topk, num_experts=num_experts, phase="Megatron replay forward"
+            )
+            if router_replay.target_token_mask is None:
                 top_indices = target
             else:
                 _, natural_indices = _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
                 token_mask = token_mask.to(scores.device).bool()
                 top_indices = torch.where(token_mask.unsqueeze(-1), target, natural_indices)
+                router_replay.replay_backward_list.append(
+                    (top_indices.detach(), target.detach(), token_mask.detach())
+                )
             router_replay.replayed_topk_idx = top_indices.detach()
+            router_replay.replayed_target_topk_idx = target.detach()
+            router_replay.replayed_token_mask = (
+                None if router_replay.target_token_mask is None else token_mask.detach()
+            )
             match_mask = token_mask
             if match_mask is None:
                 match_mask = torch.ones(target.shape[:-1], dtype=torch.bool, device=scores.device)
@@ -253,9 +294,18 @@ def _patched_topk_routing_with_score_function(
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
             # Use the last recorded indices for backward replay
-            top_indices = router_replay.replay_backward_list.pop(0)
+            backward_entry = router_replay.replay_backward_list.pop(0)
+            if isinstance(backward_entry, tuple):
+                top_indices, replay_target, replay_mask = backward_entry
+            else:  # Compatibility with a queue installed before this patch was activated.
+                top_indices, replay_target, replay_mask = backward_entry, backward_entry, None
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
+            router_replay.replayed_topk_idx = top_indices.detach()
+            router_replay.replayed_target_topk_idx = replay_target.to(scores.device).detach()
+            router_replay.replayed_token_mask = (
+                None if replay_mask is None else replay_mask.to(scores.device).detach()
+            )
             # Gather the scores for the replayed indices to get the probabilities
             probs = scores.gather(1, top_indices)
             return probs, top_indices

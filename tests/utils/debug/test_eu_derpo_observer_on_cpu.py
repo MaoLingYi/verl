@@ -43,6 +43,14 @@ class TopKRouter(torch.nn.Module):
         self.route_shift = 0
         self.routing_map_shift = 0
         self.eval_route_shift = 0
+        self.router_replay = SimpleNamespace(
+            router_replay_action=None,
+            target_topk_idx=None,
+            target_token_mask=None,
+            replayed_topk_idx=None,
+            replayed_target_topk_idx=None,
+            replayed_token_mask=None,
+        )
 
     def gating(self, hidden):
         return torch.nn.functional.linear(hidden, self.weight)
@@ -461,6 +469,55 @@ class TestEUDERPOObserver(unittest.TestCase):
     def test_saved_tensor_and_routing_map_must_match_within_invocation(self):
         with self.assertRaisesRegex(RuntimeError, "saved-tensor Top-K differs from routing-map Top-K"):
             self.run_main_backward(recompute_map_shift=1)
+
+    def test_replay_support_uses_ids_and_ignores_non_replay_dense_rows(self):
+        router = self.model.routers[0]
+        target = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [0] * 8])
+        router.router_replay = SimpleNamespace(
+            router_replay_action=SimpleNamespace(name="REPLAY_FORWARD"),
+            target_topk_idx=target,
+            target_token_mask=torch.tensor([True, False]),
+            replayed_topk_idx=target.clone(),
+            replayed_target_topk_idx=target.clone(),
+            replayed_token_mask=torch.tensor([True, False]),
+        )
+        routing_map = torch.zeros((2, 128), dtype=torch.bool)
+        routing_map[0, target[0]] = True
+        actual, mask = self.observer._actual_support(router, routing_map)
+        self.assertTrue(torch.equal(actual, target))
+        self.assertTrue(torch.equal(mask, torch.tensor([True, False])))
+
+    def test_capture_target_or_dense_dispatch_mismatch_hard_fails(self):
+        router = self.model.routers[0]
+        target = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        router.router_replay = SimpleNamespace(
+            router_replay_action=SimpleNamespace(name="REPLAY_FORWARD"),
+            target_topk_idx=target,
+            target_token_mask=torch.tensor([True]),
+            replayed_topk_idx=torch.tensor([[1, 2, 3, 4, 5, 6, 7, 9]]),
+            replayed_target_topk_idx=target,
+            replayed_token_mask=torch.tensor([True]),
+        )
+        routing_map = torch.zeros((1, 128), dtype=torch.bool)
+        routing_map[0, router.router_replay.replayed_topk_idx[0]] = True
+        with self.assertRaisesRegex(RuntimeError, "rollout-captured target differs"):
+            self.observer._actual_support(router, routing_map)
+
+        router.router_replay.replayed_topk_idx = target.clone()
+        routing_map.zero_()
+        routing_map[0, torch.tensor([1, 2, 3, 4, 5, 6, 7, 9])] = True
+        with self.assertRaisesRegex(RuntimeError, "dense dispatch map"):
+            self.observer._actual_support(router, routing_map)
+
+    def test_natural_mode_retains_dense_topk_invariant(self):
+        routing_map = torch.zeros((1, 128), dtype=torch.bool)
+        routing_map[0, :8] = True
+        actual, mask = self.observer._actual_support(self.model.routers[0], routing_map)
+        self.assertIsNone(mask)
+        self.assertEqual(actual.shape, (1, 8))
+        routing_map[0, 7] = False
+        with self.assertRaisesRegex(RuntimeError, "invalid natural Top-K"):
+            self.observer._actual_support(self.model.routers[0], routing_map)
 
     def test_dp4_auxiliary_gradient_is_sum_divided_by_four_after_tp(self):
         local_gradients = [torch.tensor([value, value + 1.0]) for value in range(4)]

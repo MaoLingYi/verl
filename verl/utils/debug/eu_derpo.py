@@ -424,6 +424,45 @@ class EUDERPOObserver:
             raise RuntimeError("EU-DERPO received an invalid natural Top-K routing map")
         return selected.reshape(flat.shape[0], topk)
 
+    def _actual_support(self, module, routing_map):
+        """Use replayed Expert IDs in replay mode; dense maps remain a scoped diagnostic."""
+        replay = getattr(module, "router_replay", None)
+        action = getattr(getattr(replay, "router_replay_action", None), "name", "")
+        replayed = getattr(replay, "replayed_topk_idx", None)
+        if action not in {"REPLAY_FORWARD", "REPLAY_BACKWARD"} or replayed is None:
+            return self._selected(routing_map, self.topk), None
+
+        actual = replayed.detach().reshape(-1, self.topk)
+        flat_map = routing_map.detach().reshape(-1, routing_map.shape[-1])
+        if flat_map.dtype != torch.bool or flat_map.shape != (actual.shape[0], self.num_experts):
+            raise RuntimeError("EU-DERPO replay routing-map shape/dtype contract failed")
+        replay_mask = getattr(replay, "replayed_token_mask", None)
+        if replay_mask is None:
+            replay_mask = torch.ones(actual.shape[0], dtype=torch.bool, device=actual.device)
+        else:
+            replay_mask = replay_mask.detach().reshape(-1).to(device=actual.device, dtype=torch.bool)
+            if replay_mask.shape != actual.shape[:-1]:
+                raise RuntimeError("EU-DERPO replay_mask does not align with replayed_topk_idx")
+
+        active = actual[replay_mask]
+        if active.numel() and (
+            (active < 0).any()
+            or (active >= self.num_experts).any()
+            or not (active.sort(-1).values.diff(dim=-1) > 0).all()
+        ):
+            raise RuntimeError("EU-DERPO valid replay support IDs are invalid or duplicated")
+        if active.numel():
+            target = getattr(replay, "replayed_target_topk_idx", None)
+            if target is None or target.reshape(-1, self.topk).shape != actual.shape:
+                raise RuntimeError("EU-DERPO replay target is missing or misaligned")
+            target = target.detach().reshape_as(actual).to(actual.device)
+            if not torch.equal(target[replay_mask], active):
+                raise RuntimeError("EU-DERPO rollout-captured target differs from actually replayed IDs")
+            active_map = flat_map[replay_mask]
+            if not (active_map.sum(-1) == self.topk).all() or not active_map.gather(-1, active).all():
+                raise RuntimeError("EU-DERPO valid replay IDs disagree with the actual dense dispatch map")
+        return actual, replay_mask
+
     def _make_router_hook(self, index):
         def hook(module, inputs, output):
             if self.mode == "prepass":
@@ -818,7 +857,7 @@ class EUDERPOObserver:
             self._credit_mask[rows] = credit_mask.detach().bool()
 
     def _observe_main(self, index, module, hidden, output):
-        actual_set = self._selected(output[1], self.topk)
+        actual_set, replay_mask = self._actual_support(module, output[1])
         if torch.is_grad_enabled() and output[0].requires_grad:
             self._record_execution("R", module)
             if not self._pending_recompute[index]:
@@ -827,6 +866,8 @@ class EUDERPOObserver:
             record = self._pending_alpha.pop(index)
             actual = record["routes"]
             rows, valid, tokens = context
+            if self.v15 and replay_mask is not None and (valid & ~replay_mask).any():
+                raise RuntimeError("EU-DERPO valid DPPO token is outside the rollout replay mask")
             self._check_same_invocation(index, actual, actual_set, rows, tokens, valid)
             self._check_route("forward_recompute", index, forward_routes, actual_set, rows, tokens, valid)
             alpha = record["alpha"]
@@ -843,6 +884,8 @@ class EUDERPOObserver:
             if self._active is None:
                 raise RuntimeError("EU-DERPO original forward has no microbatch context")
             rows, valid, tokens, start, end = self._active
+            if self.v15 and replay_mask is not None and (valid & ~replay_mask).any():
+                raise RuntimeError("EU-DERPO valid DPPO token is outside the rollout replay mask")
             flat_hidden = hidden.detach().reshape(-1, hidden.shape[-1])
             if flat_hidden.shape != (actual_set.shape[0], self.hidden_size):
                 raise RuntimeError(

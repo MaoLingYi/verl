@@ -292,3 +292,7 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+    assert torch.equal(
+        internal.routed_experts_mask,
+        torch.tensor([[False, False, True, True, True, True, False, False]]),
+    )
