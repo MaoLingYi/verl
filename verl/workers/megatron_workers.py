@@ -1860,15 +1860,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 log_checkpoint_memory("after_checkpoint_reoffload")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def set_eu_derpo_v15_validation_mode(self, enabled: bool):
+    async def set_eu_derpo_v15_validation_mode(self, enabled: bool):
         if not (self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5"):
             return
-        from verl.workers.rollout.sglang_rollout.eu_derpo_v15 import VALIDATION_MODE
-
-        payload = iter(
-            ((VALIDATION_MODE, torch.tensor(int(enabled), dtype=torch.int64, device=get_device_id())),)
-        )
-        get_event_loop().run_until_complete(self.rollout.update_weights(payload))
+        state = self.actor.eu_derpo_utility_state
+        actor_version = self.actor._eu_derpo_optimizer_generation
+        if state is None or state.version != actor_version:
+            raise RuntimeError("EU-DERPO V1.5 validation actor/state version mismatch")
+        before = (actor_version, state.version)
+        await self.rollout.set_eu_derpo_v15_validation_mode(enabled, actor_version, state.version)
+        after = (self.actor._eu_derpo_optimizer_generation, self.actor.eu_derpo_utility_state.version)
+        if after != before:
+            raise RuntimeError("EU-DERPO V1.5 validation toggle mutated training versions")
+        if torch.distributed.get_rank() == 0:
+            logger.warning(
+                "EU_DERPO_V15_VALIDATION enabled=%d routing=%s actor_version=%d utility_state_version=%d",
+                int(enabled),
+                "natural" if enabled else "exploration",
+                actor_version,
+                state.version,
+            )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):

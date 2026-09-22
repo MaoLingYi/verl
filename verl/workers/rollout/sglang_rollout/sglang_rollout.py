@@ -180,6 +180,15 @@ class ServerAdapter(BaseRollout):
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
             await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
 
+    async def set_eu_derpo_v15_validation_mode(
+        self, enabled: bool, actor_version: int, utility_state_version: int
+    ):
+        await self._init_server_adapter()
+        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            await self.server_actor.set_eu_derpo_v15_validation_mode.remote(
+                bool(enabled), int(actor_version), int(utility_state_version)
+            )
+
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):

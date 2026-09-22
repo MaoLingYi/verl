@@ -131,11 +131,6 @@ class _RolloutUtilityState:
         return generator
 
     def update(self, values: dict[str, torch.Tensor]) -> None:
-        if VALIDATION_MODE in values:
-            self.validation_mode = bool(values.pop(VALIDATION_MODE).item())
-            logger.warning("EU_DERPO_V15_VALIDATION natural_routing=%d", int(self.validation_mode))
-        if not values:
-            return
         self._pending.update(values)
         required = {STATE_MU, STATE_SIGMA, STATE_VERSION, ACTOR_VERSION}
         if not required.issubset(self._pending):
@@ -163,6 +158,40 @@ class _RolloutUtilityState:
         self._rng_version = state_version
         self._generators.clear()
 
+    def set_validation_mode(self, enabled: bool, *, actor_version: int, utility_state_version: int) -> None:
+        """Toggle natural validation routing without mutating training state."""
+
+        if type(enabled) is not bool:
+            raise TypeError("EU-DERPO V1.5 validation mode must be a Python bool")
+        expected = (self.actor_version, self.state_version)
+        received = (int(actor_version), int(utility_state_version))
+        if received != expected:
+            raise RuntimeError(
+                "EU-DERPO V1.5 validation control version mismatch: "
+                f"rollout={expected}, actor={received}"
+            )
+        self.validation_mode = enabled
+
+
+def _apply_validation_control(state: _RolloutUtilityState, values: dict) -> dict | None:
+    """Apply the V1.5 control-plane payload, or decline unrelated SGLang state updates."""
+
+    if VALIDATION_MODE not in values:
+        return None
+    required = {VALIDATION_MODE, ACTOR_VERSION, STATE_VERSION}
+    if set(values) != required:
+        raise ValueError("EU-DERPO V1.5 validation control payload has unexpected fields")
+    state.set_validation_mode(
+        values[VALIDATION_MODE],
+        actor_version=values[ACTOR_VERSION],
+        utility_state_version=values[STATE_VERSION],
+    )
+    return {
+        VALIDATION_MODE: state.validation_mode,
+        ACTOR_VERSION: state.actor_version,
+        STATE_VERSION: state.state_version,
+    }
+
 
 def install_sglang_patch(*, seed: int = 1234) -> None:
     """Install the feature-scoped selector and state loader in one scheduler."""
@@ -171,12 +200,22 @@ def install_sglang_patch(*, seed: int = 1234) -> None:
     from sglang.srt.layers.moe import topk as topk_module
     from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
     from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
+    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 
     if getattr(TopK, "_verl_eu_derpo_v15_installed", False):
         return
     state = _RolloutUtilityState(seed)
     original_load_weights = Qwen3MoeForCausalLM.load_weights
+    original_set_internal_state = Scheduler.set_internal_state
+
+    def set_internal_state(scheduler, recv_req):
+        control_state = _apply_validation_control(state, recv_req.server_args)
+        if control_state is None:
+            return original_set_internal_state(scheduler, recv_req)
+        from sglang.srt.managers.io_struct import SetInternalStateReqOutput
+
+        return SetInternalStateReqOutput(updated=True, server_args=control_state)
 
     def load_weights(model, weights: Iterable[tuple[str, torch.Tensor]]):
         materialized = list(weights)
@@ -246,6 +285,7 @@ def install_sglang_patch(*, seed: int = 1234) -> None:
         return StandardTopKOutput(weights, selected, router_logits)
 
     Qwen3MoeForCausalLM.load_weights = load_weights
+    Scheduler.set_internal_state = set_internal_state
     TopK.forward_cuda = forward
     TopK.forward_native = forward
     TopK._verl_eu_derpo_v15_installed = True

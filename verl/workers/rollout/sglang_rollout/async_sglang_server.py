@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    SetInternalStateReq,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
@@ -350,6 +351,32 @@ class SGLangHttpServer:
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             await self.tokenizer_manager.flush_cache()
+
+    async def set_eu_derpo_v15_validation_mode(
+        self, enabled: bool, actor_version: int, utility_state_version: int
+    ):
+        """Switch V1.5 routing through SGLang's acknowledged control channel."""
+
+        if self.node_rank != 0:
+            return
+        from verl.workers.rollout.sglang_rollout.eu_derpo_v15 import (
+            ACTOR_VERSION,
+            STATE_VERSION,
+            VALIDATION_MODE,
+        )
+
+        updated = await self.tokenizer_manager.set_internal_state(
+            SetInternalStateReq(
+                server_args={
+                    VALIDATION_MODE: bool(enabled),
+                    ACTOR_VERSION: int(actor_version),
+                    STATE_VERSION: int(utility_state_version),
+                }
+            )
+        )
+        if not updated or not all(updated):
+            raise RuntimeError("EU-DERPO V1.5 validation control was rejected by SGLang")
+        logger.warning("EU_DERPO_V15_CONTROL validation_mode=%d", int(enabled))
 
     async def generate(
         self,
