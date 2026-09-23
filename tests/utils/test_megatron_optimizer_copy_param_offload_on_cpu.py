@@ -203,6 +203,36 @@ def test_copy_param_host_preflight_uses_node_sum_plus_existing_margin():
     assert not decide([10, 20], 61)["passed"]
 
 
+def test_low_copy_param_host_headroom_warns_without_blocking_transition():
+    tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
+    decision = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_optimizer_copy_param_host_decision"
+    )
+    worker = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker"
+    )
+    preflight = next(
+        node for node in worker.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_optimizer_copy_param_host_preflight"
+    )
+    warnings = []
+    namespace = {
+        "HOST_RAM_SAFETY_MARGIN_BYTES": 32,
+        "logger": SimpleNamespace(warning=warnings.append),
+        "psutil": SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=40)),
+        "torch": SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
+    }
+    exec(compile(ast.Module(body=[decision, preflight], type_ignores=[]), str(WORKER), "exec"), namespace)
+    result = MethodType(namespace["_optimizer_copy_param_host_preflight"], SimpleNamespace())(16)
+    assert not result["passed"]
+    assert warnings == [
+        "EU_DERPO_COPY_PARAM_HOST_HEADROOM_LOW "
+        "mem_available_bytes=40 node_copy_param_bytes=16 host_safety_margin_bytes=32 continuing=1"
+    ]
+
+
 def test_host_preflight_and_collective_failure_precede_rollout_transition():
     source = WORKER.read_text(encoding="utf-8")
     start = source.index("    def _offload_actor_optimizer_copy_params_for_rollout")

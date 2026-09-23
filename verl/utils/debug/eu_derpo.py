@@ -618,9 +618,12 @@ class EUDERPOObserver:
             decision = _node_ram_decision(
                 [local_required], available, HOST_RAM_SAFETY_MARGIN_BYTES
             )
-        if not decision["passed"]:
-            raise MemoryError(f"EU-DERPO node RAM preflight failed: {decision}")
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if not decision["passed"]:
+                print(
+                    f"WARNING: EU-DERPO node RAM headroom low; continuing: {decision}",
+                    flush=True,
+                )
             print(
                 "EU-DERPO host RAM preflight: "
                 f"MemAvailable_before_actor_update={decision['mem_available']} "

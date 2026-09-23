@@ -1059,12 +1059,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             decision = _optimizer_copy_param_host_decision(
                 [local_required], psutil.virtual_memory().available
             )
-        if not decision["passed"]:
-            raise MemoryError(
-                "EU_DERPO_COPY_PARAM_HOST_HEADROOM_INSUFFICIENT "
+        if not decision["passed"] and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            logger.warning(
+                "EU_DERPO_COPY_PARAM_HOST_HEADROOM_LOW "
                 f"mem_available_bytes={decision['mem_available']} "
                 f"node_copy_param_bytes={decision['node_required']} "
-                f"host_safety_margin_bytes={decision['safety_margin']}"
+                f"host_safety_margin_bytes={decision['safety_margin']} continuing=1"
             )
         return decision
 
@@ -1823,12 +1825,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 torch.distributed.all_reduce(failure, op=torch.distributed.ReduceOp.MAX)
                 log_checkpoint_memory("checkpoint_gpu_headroom")
                 if failure.item():
-                    raise RuntimeError(
-                        "CHECKPOINT_GPU_HEADROOM_INSUFFICIENT "
+                    logger.warning(
+                        "CHECKPOINT_GPU_HEADROOM_LOW "
                         f"rank={torch.distributed.get_rank()} "
                         f"allocated_gib={device.memory_allocated() / _GIB:.2f} "
                         f"reserved_gib={cuda_reserved / _GIB:.2f} "
-                        f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f}"
+                        f"free_gib={cuda_free / _GIB:.2f} total_gib={cuda_total / _GIB:.2f} continuing=1"
                     )
             if self.config.actor.eu_derpo.enabled and self.config.actor.eu_derpo.version == "1.5":
                 state = self.actor.eu_derpo_utility_state

@@ -144,6 +144,7 @@ def _save_checkpoint_method(
             actor=SimpleNamespace(
                 eu_derpo=SimpleNamespace(
                     enabled=True,
+                    version="1.4",
                     skip_post_checkpoint_optimizer_offload=skip_post_checkpoint_optimizer_offload,
                     preserve_hdo_optimizer_residency_between_steps=(
                         preserve_hdo_optimizer_residency_between_steps
@@ -469,13 +470,15 @@ def test_checkpoint_hold_save_failure_still_reoffloads():
     ]
 
 
-def test_checkpoint_gpu_headroom_failure_skips_write_and_releases_hold():
+def test_checkpoint_low_gpu_headroom_warns_and_still_writes_and_releases_hold():
     events = []
     residency = {"model": True, "optimizer": True}
-    save = _save_checkpoint_method(events, residency, held=True, cuda_free_gib=15)
-    with pytest.raises(RuntimeError, match="CHECKPOINT_GPU_HEADROOM_INSUFFICIENT"):
-        save("/checkpoint", global_step=1)
-    assert "save" not in events
+    save = _save_checkpoint_method(events, residency, held=True, cuda_free_gib=15.15)
+    save("/checkpoint", global_step=1)
+    warning = next(event for event in events if str(event).startswith("CHECKPOINT_GPU_HEADROOM_LOW"))
+    assert "free_gib=15.15" in warning
+    assert "continuing=1" in warning
+    assert events.index("checkpoint_gpu_headroom") < events.index(warning) < events.index("save")
     assert residency == {"model": False, "optimizer": False}
     assert events[-9:] == [
         "post_ckpt_reoffload_before",

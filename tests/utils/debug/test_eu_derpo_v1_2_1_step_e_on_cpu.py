@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -175,6 +178,22 @@ class TestEUDERPOV121StepE(unittest.TestCase):
         self.assertEqual(passed["node_required"], sum(required))
         failed = self.eu._node_ram_decision(required, mem_available=459, safety_margin=100)
         self.assertFalse(failed["passed"])
+
+    def test_low_node_ram_headroom_warns_without_blocking_cache_allocation(self):
+        observer = object.__new__(self.eu.EUDERPOObserver)
+        observer.routers = [types.SimpleNamespace(weight=torch.empty(0))]
+        output = io.StringIO()
+        with (
+            mock.patch.object(self.eu.torch.cuda, "is_available", return_value=False),
+            mock.patch.object(self.eu.torch.distributed, "is_initialized", return_value=False),
+            mock.patch.object(self.eu, "_read_mem_available", return_value=40),
+            mock.patch.object(self.eu, "HOST_RAM_SAFETY_MARGIN_BYTES", 32),
+            redirect_stdout(output),
+        ):
+            decision = observer._coordinated_ram_preflight(16)
+        self.assertFalse(decision["passed"])
+        self.assertIn("WARNING: EU-DERPO node RAM headroom low; continuing", output.getvalue())
+        self.assertIn("EU-DERPO host RAM preflight", output.getvalue())
 
     def test_error_decorator_releases_cache_references(self):
         class Observer:
