@@ -152,13 +152,13 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict) 
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
-    hdos = [
-        distributed_optimizer.optimizer
-        for distributed_optimizer in optimizers
+    hdo_optimizers = [
+        (index, distributed_optimizer, distributed_optimizer.optimizer)
+        for index, distributed_optimizer in enumerate(optimizers)
         if isinstance(distributed_optimizer, DistributedOptimizer)
         and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
     ]
-    if not hdos:
+    if not hdo_optimizers:
         optimizer.load_state_dict(state_dict)
         return False
 
@@ -166,7 +166,9 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict) 
     # hook assumes every state key has a separate FP32 master mapping, but native FP32
     # parameters are intentionally absent from that mapping. Backport the later MCore
     # behavior only on these HDO instances for this restore: retain every optimizer state
-    # entry and copy master weights only where a master mapping actually exists.
+    # entry and copy master weights only where a master mapping actually exists. The
+    # dp_reshardable payload also omits scalar step, which load_state_dict restores from
+    # optimizer param_groups before loading parameter-sized state.
     def update_fp32_params_by_new_state(hdo):
         if not hdo.param_update_in_fp32:
             return
@@ -175,15 +177,112 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict) 
             if fp32_param is not None:
                 fp32_param.data.copy_(value["master_param"])
 
+    def set_main_param_and_optimizer_states(
+        distributed_optimizer, model_param, tensors, original_method
+    ):
+        if distributed_optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return original_method(model_param, tensors)
+        group_index, group_order = distributed_optimizer.model_param_group_index_map[model_param]
+        main_param = distributed_optimizer.optimizer.param_groups[group_index]["params"][group_order]
+        optim_state = distributed_optimizer.optimizer.state[main_param]
+        dst_tensors = {"param": main_param, **optim_state}
+        missing_keys = set(dst_tensors).difference(tensors)
+        required_missing = missing_keys.difference({"step"})
+        if required_missing:
+            raise RuntimeError(
+                "MCore 0.16 HDO dp_reshardable parameter state is missing required keys: "
+                f"{sorted(required_missing)}"
+            )
+        if missing_keys != {"step"}:
+            return original_method(model_param, tensors)
+        for key, dst_tensor in dst_tensors.items():
+            if key != "step":
+                dst_tensor.copy_(tensors[key])
+
+    def scalar_step(value):
+        return value.item() if callable(getattr(value, "item", None)) else value
+
+    def checkpoint_states():
+        if isinstance(optimizer, ChainedOptimizer) and len(optimizers) > 1:
+            if isinstance(state_dict, dict):
+                return [value for _, value in sorted(state_dict.items())]
+            return list(state_dict)
+        return [state_dict]
+
+    child_states = checkpoint_states()
+    if len(child_states) != len(optimizers):
+        raise RuntimeError(
+            f"Expected {len(optimizers)} optimizer checkpoint entries, got {len(child_states)}"
+        )
+
     method_name = "_update_fp32_params_by_new_state"
+    set_method_name = "_set_main_param_and_optimizer_states"
     missing = object()
-    previous_methods = [(hdo, vars(hdo).get(method_name, missing)) for hdo in hdos]
-    for hdo in hdos:
-        setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+    previous_methods = [(hdo, vars(hdo).get(method_name, missing)) for _, _, hdo in hdo_optimizers]
+    patched_distributed_optimizers = []
+    patched_hdos = []
     try:
+        for _, distributed_optimizer, _ in hdo_optimizers:
+            original_method = getattr(distributed_optimizer, set_method_name, None)
+            if original_method is None:
+                continue
+            previous_method = vars(distributed_optimizer).get(set_method_name, missing)
+
+            def compatibility_method(instance, model_param, tensors, original_method=original_method):
+                return set_main_param_and_optimizer_states(
+                    instance, model_param, tensors, original_method
+                )
+
+            setattr(
+                distributed_optimizer,
+                set_method_name,
+                compatibility_method.__get__(distributed_optimizer, type(distributed_optimizer)),
+            )
+            patched_distributed_optimizers.append((distributed_optimizer, previous_method))
+        for _, _, hdo in hdo_optimizers:
+            setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+            patched_hdos.append(hdo)
         optimizer.load_state_dict(state_dict)
+        for index, distributed_optimizer, hdo in hdo_optimizers:
+            if not any(target is distributed_optimizer for target, _ in patched_distributed_optimizers):
+                continue
+            param_groups = child_states[index].get("optimizer", {}).get("param_groups", ())
+            checkpoint_steps = [scalar_step(group["step"]) for group in param_groups if "step" in group]
+            if not checkpoint_steps:
+                raise RuntimeError(f"HDO checkpoint child {index} has no optimizer param-group step")
+            checkpoint_step = checkpoint_steps[0]
+            if any(step != checkpoint_step for step in checkpoint_steps[1:]):
+                raise RuntimeError(f"HDO checkpoint child {index} has inconsistent param-group steps")
+            hdo_steps = [scalar_step(value["step"]) for value in hdo.state.values() if "step" in value]
+            sub_optimizer_steps = [
+                scalar_step(value["step"])
+                for sub_optimizer in hdo.sub_optimizers
+                for value in sub_optimizer.state.values()
+                if "step" in value
+            ]
+            restored_steps = hdo_steps + sub_optimizer_steps
+            if not restored_steps or any(step != checkpoint_step for step in restored_steps):
+                raise RuntimeError(
+                    f"HDO checkpoint child {index} step restore mismatch: "
+                    f"checkpoint={checkpoint_step!r}, restored={restored_steps[:8]!r}"
+                )
+            logger.warning(
+                "HDO_STAGED_RESTORE_STEP child=%d checkpoint_step=%r hdo_state_count=%d "
+                "sub_optimizer_state_count=%d",
+                index,
+                checkpoint_step,
+                len(hdo_steps),
+                len(sub_optimizer_steps),
+            )
     finally:
+        for distributed_optimizer, previous_method in patched_distributed_optimizers:
+            if previous_method is missing:
+                delattr(distributed_optimizer, set_method_name)
+            else:
+                setattr(distributed_optimizer, set_method_name, previous_method)
         for hdo, previous_method in previous_methods:
+            if hdo not in patched_hdos:
+                continue
             if previous_method is missing:
                 delattr(hdo, method_name)
             else:

@@ -33,6 +33,9 @@ class TensorValue:
     def copy_(self, other):
         self.value = other.value
 
+    def item(self):
+        return self.value
+
 
 class Parameter:
     pass
@@ -100,6 +103,43 @@ class DistributedOptimizer:
         self.optimizer = optimizer
 
 
+class DpPayloadDistributedOptimizer(DistributedOptimizer):
+    def __init__(self):
+        hdo = HybridDeviceOptimizer(initialized=False)
+        super().__init__(hdo)
+        self.model_param = Parameter()
+        self.main_param = TensorValue("dummy-param")
+        self.exp_avg = TensorValue("dummy-exp-avg")
+        self.exp_avg_sq = TensorValue("dummy-exp-avg-sq")
+        self.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+        self.model_param_group_index_map = {self.model_param: (0, 0)}
+        hdo.param_groups = [{"params": [self.main_param]}]
+        hdo.state = {
+            self.main_param: {
+                "exp_avg": self.exp_avg,
+                "exp_avg_sq": self.exp_avg_sq,
+                "step": TensorValue(1),
+            }
+        }
+        hdo.param_update_in_fp32 = False
+        hdo.param_to_fp32_param = {}
+        hdo.sub_optimizers = [SimpleNamespace(state={self.main_param: {"step": TensorValue(1)}})]
+
+    def _set_main_param_and_optimizer_states(self, model_param, tensors):
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        dst_tensors = {"param": main_param, **self.optimizer.state[main_param]}
+        for key in dst_tensors:
+            dst_tensors[key].copy_(tensors[key])
+
+    def load_state_dict(self, state_dict):
+        step = state_dict["optimizer"]["param_groups"][0].get("step")
+        if step is not None:
+            self.optimizer.state[self.main_param]["step"] = TensorValue(step)
+            self.optimizer.sub_optimizers[0].state[self.main_param]["step"] = TensorValue(step)
+        self._set_main_param_and_optimizer_states(self.model_param, state_dict["param_state"][0])
+
+
 class ChainedOptimizer:
     def __init__(self, *optimizers):
         self.chained_optimizers = list(optimizers)
@@ -136,6 +176,15 @@ class ChainedOptimizer:
                     )
                 else:
                     optimizer.optimizer.state = state_dict
+
+
+class DpPayloadChainedOptimizer(ChainedOptimizer):
+    def load_state_dict(self, state_dict):
+        states = [value for _, value in sorted(state_dict.items())] if isinstance(state_dict, dict) else state_dict
+        if len(self.chained_optimizers) == 1:
+            states = [state_dict]
+        for optimizer, child_state in zip(self.chained_optimizers, states):
+            optimizer.load_state_dict(child_state)
 
 
 class OrdinaryOptimizer:
@@ -257,6 +306,77 @@ def _generate_state_dict(*, mcore_016=True):
 
 
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    @staticmethod
+    def _dp_payload_state(step=250, missing=()):
+        tensors = {
+            "param": TensorValue("checkpoint-param"),
+            "exp_avg": TensorValue("checkpoint-exp-avg"),
+            "exp_avg_sq": TensorValue("checkpoint-exp-avg-sq"),
+        }
+        for key in missing:
+            tensors.pop(key)
+        return {
+            "optimizer": {"param_groups": [{"step": step}]},
+            "param_state": {0: tensors},
+        }
+
+    def test_dp_reshardable_hdo_step_uses_param_groups_for_two_chained_children(self):
+        children = [DpPayloadDistributedOptimizer(), DpPayloadDistributedOptimizer()]
+        optimizer = DpPayloadChainedOptimizer(*children)
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+
+        self.assertTrue(
+            helper(
+                optimizer,
+                {0: self._dp_payload_state(), 1: self._dp_payload_state()},
+                {"distrib_optim_sharding_type": "dp_reshardable"},
+            )
+        )
+
+        for child in children:
+            self.assertEqual(child.main_param.value, "checkpoint-param")
+            self.assertEqual(child.exp_avg.value, "checkpoint-exp-avg")
+            self.assertEqual(child.exp_avg_sq.value, "checkpoint-exp-avg-sq")
+            self.assertEqual(child.optimizer.state[child.main_param]["step"].value, 250)
+            self.assertEqual(
+                child.optimizer.sub_optimizers[0].state[child.main_param]["step"].value,
+                250,
+            )
+            self.assertNotIn("_set_main_param_and_optimizer_states", vars(child))
+            self.assertFalse(hasattr(child, "_verl_original_set_main_param_and_optimizer_states"))
+
+    def test_dp_reshardable_hdo_missing_real_parameter_state_fails_and_restores_override(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        for missing_key in ("exp_avg", "exp_avg_sq"):
+            with self.subTest(missing_key=missing_key):
+                child = DpPayloadDistributedOptimizer()
+                optimizer = DpPayloadChainedOptimizer(child)
+                with self.assertRaisesRegex(RuntimeError, missing_key):
+                    helper(
+                        optimizer,
+                        self._dp_payload_state(missing=(missing_key,)),
+                        {"distrib_optim_sharding_type": "dp_reshardable"},
+                    )
+                self.assertNotIn("_set_main_param_and_optimizer_states", vars(child))
+                self.assertFalse(hasattr(child, "_verl_original_set_main_param_and_optimizer_states"))
+
+    def test_dp_reshardable_hdo_requires_checkpoint_param_group_step(self):
+        child = DpPayloadDistributedOptimizer()
+        optimizer = DpPayloadChainedOptimizer(child)
+        state = self._dp_payload_state()
+        del state["optimizer"]["param_groups"][0]["step"]
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+
+        with self.assertRaisesRegex(RuntimeError, "no optimizer param-group step"):
+            helper(
+                optimizer,
+                state,
+                {"distrib_optim_sharding_type": "dp_reshardable"},
+            )
+
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(child))
+        self.assertFalse(hasattr(child, "_verl_original_set_main_param_and_optimizer_states"))
+
     def test_staged_load_clears_template_and_payload_on_failure(self):
         class TrackedDict(dict):
             cleared = False
