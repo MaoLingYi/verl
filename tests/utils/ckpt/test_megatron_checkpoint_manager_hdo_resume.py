@@ -212,6 +212,7 @@ def _production_methods(*, mcore_016=True):
         and node.name
         in {
             "_is_mcore_016_hdo_dp_reshardable_resume",
+            "log_hdo_staged_restore_diagnostics",
             "_prepare_mcore_016_hdo_dp_reshardable_resume",
             "_load_mcore_016_hdo_checkpoint_state",
         }
@@ -238,7 +239,7 @@ def _production_methods(*, mcore_016=True):
         ),
         "get_dist_checkpoint_path": lambda path: f"{path}/dist_ckpt",
         "log_with_rank": lambda *args, **kwargs: None,
-        "logger": None,
+        "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
         "gc": gc,
     }
     nodes = [
@@ -420,20 +421,56 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         )
         self.assertEqual(other_format.loading_flags, [True])
 
-    def test_partial_loads_do_not_trigger_full_resume_preparation(self):
+    def test_optimizer_only_load_uses_hdo_resume_preparation(self):
         model_only = ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer(initialized=False)))
         _manager(model_only).generate_state_dict(generate_optimizer=False, is_loading=True)
         self.assertEqual(model_only.loading_flags, [])
 
         optimizer_only = ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer(initialized=True)))
-        with self.assertRaisesRegex(KeyError, "param_to_fp32_param identity mismatch"):
-            _manager(optimizer_only).generate_state_dict(
-                generate_model=False,
-                generate_optimizer=True,
-                generate_extra=False,
-                is_loading=True,
-            )
-        self.assertEqual(optimizer_only.loading_flags, [True])
+        _manager(optimizer_only).generate_state_dict(
+            generate_model=False,
+            generate_optimizer=True,
+            generate_extra=False,
+            is_loading=True,
+        )
+        self.assertEqual(optimizer_only.loading_flags, [False])
+
+    def test_optimizer_only_hdo_restore_preserves_native_fp32_state(self):
+        hdo = HybridDeviceOptimizer(initialized=True, realistic_restore=True)
+        optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
+        manager = _manager(optimizer)
+        methods = _production_methods()
+        manager.generate_state_dict = MethodType(methods["generate_state_dict"], manager)
+        manager.load_checkpoint = MethodType(methods["load_checkpoint"], manager)
+        manager.checkpoint_load_contents = {"model", "optimizer", "extra"}
+        manager.use_dist_checkpointing = True
+        manager.use_distributed_optimizer = True
+        manager.use_hf_checkpoint = False
+        manager.use_checkpoint_opt_param_scheduler = False
+        manager.rank = 0
+        manager.peft_cls = None
+        checkpoint_state = {
+            "optimizer": {"param_groups": [{"params": [0, 1], "lr": 0.125}]},
+            "param_state": {
+                0: {"master_param": TensorValue("native-master")},
+                1: {"master_param": TensorValue("low-master")},
+            },
+        }
+        methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = lambda **kwargs: {
+            "optimizer": checkpoint_state
+        }
+
+        manager.load_checkpoint(
+            "checkpoint",
+            load_contents=("optimizer",),
+            sharded_sd_metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+            del_local_after_load=False,
+        )
+
+        self.assertEqual(optimizer.loading_flags, [False])
+        self.assertEqual(set(hdo.state), {hdo.native_fp32_param, hdo.low_precision_param})
+        self.assertNotIn(hdo.native_fp32_param, hdo.param_to_fp32_param)
+        self.assertEqual(hdo.param_to_fp32_param[hdo.low_precision_param].value, "low-master")
 
     def test_model_optimizer_and_extra_templates_remain_present(self):
         optimizer = ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer(initialized=True)))
@@ -530,16 +567,13 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
 
         ordinary = OrdinaryOptimizer()
         helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
-        self.assertFalse(helper(ordinary, checkpoint_state, metadata, full_resume=True))
+        self.assertFalse(helper(ordinary, checkpoint_state, metadata))
         self.assertEqual(ordinary.loaded_states, [checkpoint_state])
 
-        for helper_metadata, full_resume in (
-            ({"distrib_optim_sharding_type": "fully_reshardable"}, True),
-            (metadata, False),
-        ):
+        for helper_metadata in ({"distrib_optim_sharding_type": "fully_reshardable"},):
             hdo = HybridDeviceOptimizer(initialized=True)
             optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
-            self.assertFalse(helper(optimizer, checkpoint_state, helper_metadata, full_resume=full_resume))
+            self.assertFalse(helper(optimizer, checkpoint_state, helper_metadata))
             self.assertEqual(optimizer.loaded_states, [checkpoint_state])
 
         hdo = HybridDeviceOptimizer(initialized=True)
@@ -547,7 +581,7 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         other_version_helper = _production_methods(mcore_016=False)[
             "_load_mcore_016_hdo_checkpoint_state"
         ]
-        self.assertFalse(other_version_helper(optimizer, checkpoint_state, metadata, full_resume=True))
+        self.assertFalse(other_version_helper(optimizer, checkpoint_state, metadata))
         self.assertEqual(optimizer.loaded_states, [checkpoint_state])
 
     @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
@@ -589,7 +623,6 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
                 chained,
                 {"checkpoint": "optimizer-state"},
                 metadata={"distrib_optim_sharding_type": "dp_reshardable"},
-                full_resume=True,
             )
         )
         self.assertEqual(load_calls, [{"checkpoint": "optimizer-state"}])

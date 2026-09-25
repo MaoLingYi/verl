@@ -86,6 +86,7 @@ def _load_checkpoint_method(load_optimizer, offload_optimizer):
     namespace = {
         "load_megatron_optimizer": load_optimizer,
         "offload_megatron_optimizer": offload_optimizer,
+        "log_hdo_staged_restore_diagnostics": lambda *args, **kwargs: None,
         "load_megatron_optimizer_copy_params_to_gpu": lambda *_: (_ for _ in ()).throw(
             AssertionError("selective helper must not be called during resume")
         ),
@@ -102,6 +103,8 @@ def _load_checkpoint_method(load_optimizer, offload_optimizer):
     def load_checkpoint(self, *args, **kwargs):
         self._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], self)
         self._load_actor_optimizer_for_update = MethodType(namespace["_load_actor_optimizer_for_update"], self)
+        if not hasattr(self, "_load_eu_derpo_v15_state"):
+            self._load_eu_derpo_v15_state = lambda path: None
         return namespace["load_checkpoint"](self, *args, **kwargs)
 
     return load_checkpoint
@@ -142,6 +145,7 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             actor_module=object(),
             actor_optimizer=distributed_optimizer,
             checkpoint_mananager=checkpoint_manager,
+            _preserve_hdo_optimizer_residency=lambda: False,
         )
         worker.load_checkpoint = MethodType(
             _load_checkpoint_method(load_optimizer, offload_optimizer), worker
@@ -179,6 +183,7 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             actor_optimizer=object(),
             checkpoint_mananager=manager,
             _hdo_optimizer_residency_preserved=True,
+            _preserve_hdo_optimizer_residency=lambda: False,
         )
         worker.load_checkpoint = MethodType(
             _load_checkpoint_method(
@@ -204,6 +209,7 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             actor_module=object(),
             actor_optimizer=object(),
             checkpoint_mananager=manager,
+            _preserve_hdo_optimizer_residency=lambda: False,
         )
         worker.load_checkpoint = MethodType(
             _load_checkpoint_method(
@@ -231,6 +237,7 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             actor_module=object(),
             actor_optimizer=object(),
             checkpoint_mananager=manager,
+            _preserve_hdo_optimizer_residency=lambda: True,
         )
         worker.load_checkpoint = MethodType(
             _load_checkpoint_method(
@@ -244,7 +251,6 @@ class TestMegatronHDOResumeLifecycle(unittest.TestCase):
             worker.load_checkpoint("global_step_1")
 
         self.assertEqual(events, ["load", "restore", "offload"])
-
 
 if __name__ == "__main__":
     unittest.main()

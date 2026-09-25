@@ -56,13 +56,67 @@ if not mcore_ge_014:
     )
 
 
-def _prepare_mcore_016_hdo_dp_reshardable_resume(
-    optimizer, is_loading: bool, metadata: dict, full_resume: bool
-) -> bool:
+def log_hdo_staged_restore_diagnostics(optimizer, stage: str) -> None:
+    """Log bounded HDO parameter-identity diagnostics for staged restore."""
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    def type_name(value):
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}"
+
+    def param_summary(param):
+        return {
+            "id": id(param),
+            "device": str(getattr(param, "device", None)),
+            "dtype": str(getattr(param, "dtype", None)),
+            "shape": tuple(getattr(param, "shape", ())),
+            "numel": param.numel() if callable(getattr(param, "numel", None)) else None,
+        }
+
+    children = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    for index, child in enumerate(children):
+        inner = getattr(child, "optimizer", None)
+        param_groups = getattr(inner, "param_groups", ())
+        param_group_param_counts = [len(group.get("params", ())) for group in param_groups]
+        params = [param for group in param_groups for param in group.get("params", ())]
+        mapping = getattr(inner, "param_to_fp32_param", {})
+        state_keys = list(getattr(inner, "state", {}))
+        param_missing = [param for param in params if param not in mapping]
+        state_missing = [param for param in state_keys if param not in mapping]
+        first_missing = state_missing[0] if state_missing else (param_missing[0] if param_missing else None)
+        logger.warning(
+            "HDO_STAGED_RESTORE stage=%s child=%d child_class=%s is_distributed_optimizer=%r "
+            "inner_class=%s is_hdo=%r param_group_param_counts=%r param_count=%d mapping_len=%d "
+            "param_mapping_hit=%d param_mapping_missing=%d state_key_count=%d "
+            "state_mapping_hit=%d state_mapping_missing=%d first_missing=%r "
+            "param_ids=%r mapping_key_ids=%r state_key_ids=%r",
+            stage,
+            index,
+            type_name(child),
+            isinstance(child, DistributedOptimizer),
+            type_name(inner),
+            isinstance(inner, HybridDeviceOptimizer),
+            param_group_param_counts,
+            len(params),
+            len(mapping),
+            len(params) - len(param_missing),
+            len(param_missing),
+            len(state_keys),
+            len(state_keys) - len(state_missing),
+            len(state_missing),
+            param_summary(first_missing) if first_missing is not None else None,
+            [id(param) for param in params[:3]],
+            [id(param) for param in list(mapping)[:3]],
+            [id(param) for param in state_keys[:3]],
+        )
+
+
+def _prepare_mcore_016_hdo_dp_reshardable_resume(optimizer, is_loading: bool, metadata: dict) -> bool:
     if not (
         mcore_016
         and is_loading
-        and full_resume
         and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
     ):
         return False
@@ -85,10 +139,9 @@ def _prepare_mcore_016_hdo_dp_reshardable_resume(
     return found_hdo
 
 
-def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, full_resume: bool) -> bool:
+def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict) -> bool:
     if not (
         mcore_016
-        and full_resume
         and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
     ):
         optimizer.load_state_dict(state_dict)
@@ -369,17 +422,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         if generate_optimizer:
             torch.distributed.barrier()
             optimizer_is_loading = is_loading
-            if _prepare_mcore_016_hdo_dp_reshardable_resume(
-                self.optimizer,
-                is_loading,
-                base_metadata,
-                full_resume=generate_model and generate_optimizer and generate_extra,
-            ):
-                # Before the real payload load, MCore 0.16's loading-only self-load can rebuild
-                # CPU-offloaded HDO mappings while state is still keyed by previous parameter
-                # objects. Empty HDOs first use MCore's own dummy initialization; full resume
-                # then restores model, optimizer, and RNG state. dp_reshardable does not otherwise
-                # use is_loading, so the checkpoint payload and final optimizer restore are intact.
+            if is_loading:
+                log_hdo_staged_restore_diagnostics(self.optimizer, "before_optimizer_sharded_state_dict")
+            if _prepare_mcore_016_hdo_dp_reshardable_resume(self.optimizer, is_loading, base_metadata):
+                # MCore 0.16's loading-only self-load enters HDO's broken native-FP32 post-hook.
+                # Empty HDOs first use MCore's own initialization. dp_reshardable does not
+                # otherwise use is_loading, so template and payload loading remain intact.
                 optimizer_is_loading = False
             sharded_state_dict_kwargs = {"is_loading": optimizer_is_loading}
             if base_metadata is not None:
@@ -580,7 +628,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     self.optimizer,
                     optimizer_state_dict,
                     sharded_sd_metadata,
-                    full_resume=load_model and self.use_dist_checkpointing and load_optimizer and load_extra,
                 )
                 log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
                 restore_lr_scheduler = self.lr_scheduler is not None and (

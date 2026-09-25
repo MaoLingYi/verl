@@ -67,7 +67,12 @@ class CheckpointManager:
 
 
 def _staged_worker(
-    events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True
+    events,
+    *,
+    fail_stage=None,
+    model_offload_reduces_memory=True,
+    optimizer_offload_reduces_memory=True,
+    preserve_hdo=False,
 ):
     residency = {"model": False, "optimizer": False}
 
@@ -104,6 +109,7 @@ def _staged_worker(
         "offload_megatron_model_to_cpu": model_offload,
         "load_megatron_optimizer": optimizer_onload,
         "offload_megatron_optimizer": optimizer_offload,
+        "log_hdo_staged_restore_diagnostics": lambda *args, **kwargs: None,
         "load_megatron_optimizer_copy_params_to_gpu": lambda *_: (_ for _ in ()).throw(
             AssertionError("selective helper must not be called during staged resume")
         ),
@@ -127,6 +133,8 @@ def _staged_worker(
         actor_optimizer=object(),
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
         _hdo_optimizer_residency_preserved=True,
+        _preserve_hdo_optimizer_residency=lambda: preserve_hdo,
+        _load_eu_derpo_v15_state=lambda path: None,
     )
     load_checkpoint, offload_actor = _worker_method(namespace)
     worker._offload_actor_optimizer = MethodType(offload_actor, worker)
@@ -206,6 +214,16 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertLess(events.index("model_offload"), events.index("optimizer_onload"))
         self.assertIn("optimizer_offload", events)
         self.assertNotIn(("mem", "restore_complete"), events)
+
+    def test_successful_restore_preserves_partial_hdo_training_residency(self):
+        events = []
+        worker, residency = _staged_worker(events, preserve_hdo=True)
+
+        worker.load_checkpoint("global_step_100", staged_restore=True)
+
+        self.assertEqual(residency, {"model": False, "optimizer": True})
+        self.assertTrue(worker._hdo_optimizer_residency_preserved)
+        self.assertNotIn("optimizer_offload", events)
 
     def test_runtime_backend_accepts_only_checkpoint_supported_distributed_optimizers(self):
         class FusedAdam:

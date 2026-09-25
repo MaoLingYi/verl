@@ -45,7 +45,10 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.ppo.eu_derpo import policy_prepass_tensors
 from verl.utils import hf_tokenizer
-from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+from verl.utils.checkpoint.megatron_checkpoint_manager import (
+    MegatronCheckpointManager,
+    log_hdo_staged_restore_diagnostics,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES
 from verl.utils.device import (
@@ -1770,8 +1773,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             _reset_resume_peak_memory()
             optimizer_before_memory = _log_resume_memory("before_optimizer_load")
             optimizer_loaded_memory = None
+            optimizer_restore_succeeded = False
+            optimizer_residency_preserved = False
             try:
+                log_hdo_staged_restore_diagnostics(self.actor_optimizer, "before_load_megatron_optimizer")
                 load_megatron_optimizer(self.actor_optimizer)
+                log_hdo_staged_restore_diagnostics(self.actor_optimizer, "after_load_megatron_optimizer")
                 self.checkpoint_mananager.load_checkpoint(
                     local_path=checkpoint_path,
                     hdfs_path=hdfs_path,
@@ -1781,12 +1788,22 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     stage_callback=_log_resume_memory,
                 )
                 optimizer_loaded_memory = _log_resume_memory("after_optimizer_load")
+                optimizer_restore_succeeded = True
             finally:
-                self._offload_actor_optimizer()
+                if optimizer_restore_succeeded and self._preserve_hdo_optimizer_residency():
+                    self._hdo_optimizer_residency_preserved = True
+                    optimizer_residency_preserved = True
+                    logger.warning("staged restore preserved canonical partial HDO residency")
+                else:
+                    self._offload_actor_optimizer()
                 aggressive_empty_cache(force_sync=True)
-                optimizer_offloaded_memory = _log_resume_memory("after_optimizer_offload")
+                optimizer_offloaded_memory = _log_resume_memory(
+                    "after_optimizer_residency_restore"
+                    if optimizer_residency_preserved
+                    else "after_optimizer_offload"
+                )
                 if (
-                    optimizer_loaded_memory is not None
+                    not optimizer_residency_preserved and optimizer_loaded_memory is not None
                     and optimizer_loaded_memory["gpu_available"]
                     and optimizer_offloaded_memory["gpu_allocated"] >= optimizer_loaded_memory["gpu_allocated"]
                 ):
