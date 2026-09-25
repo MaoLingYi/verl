@@ -73,6 +73,8 @@ def _staged_worker(
     model_offload_reduces_memory=True,
     optimizer_offload_reduces_memory=True,
     preserve_hdo=False,
+    selective_offload=False,
+    fail_selective_offload=False,
 ):
     residency = {"model": False, "optimizer": False}
 
@@ -134,7 +136,33 @@ def _staged_worker(
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
         _hdo_optimizer_residency_preserved=True,
         _preserve_hdo_optimizer_residency=lambda: preserve_hdo,
+        _selective_optimizer_copy_param_offload_enabled=lambda: selective_offload,
+        _optimizer_copy_params_offloaded_for_rollout=False,
+        _optimizer_copy_params_cuda_bytes_before_rollout_offload=0,
         _load_eu_derpo_v15_state=lambda path: None,
+    )
+
+    def selective_transition():
+        events.append("selective_offload")
+        worker._optimizer_copy_params_offloaded_for_rollout = True
+        if fail_selective_offload:
+            raise RuntimeError("selective offload failed")
+        worker._hdo_optimizer_residency_preserved = True
+        return True
+
+    def restore_transition():
+        if not worker._optimizer_copy_params_offloaded_for_rollout:
+            return False
+        events.append("selective_restore")
+        worker._optimizer_copy_params_offloaded_for_rollout = False
+        return True
+
+    worker._offload_actor_optimizer_copy_params_for_rollout = selective_transition
+    worker._restore_actor_optimizer_copy_params_for_update = restore_transition
+    worker._actor_optimizer_residency = lambda: (
+        "ROLLOUT_PARTIAL"
+        if worker._optimizer_copy_params_offloaded_for_rollout
+        else ("TRAINING_RESIDENT" if residency["optimizer"] else "FULL_OFFLOADED")
     )
     load_checkpoint, offload_actor = _worker_method(namespace)
     worker._offload_actor_optimizer = MethodType(offload_actor, worker)
@@ -215,15 +243,52 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertIn("optimizer_offload", events)
         self.assertNotIn(("mem", "restore_complete"), events)
 
-    def test_successful_restore_preserves_partial_hdo_training_residency(self):
+    def test_successful_restore_enters_rollout_partial_and_next_update_restores_training_residency(self):
+        events = []
+        worker, residency = _staged_worker(events, preserve_hdo=True, selective_offload=True)
+
+        worker.load_checkpoint("global_step_100", staged_restore=True)
+
+        self.assertEqual(residency, {"model": False, "optimizer": True})
+        self.assertEqual(worker._actor_optimizer_residency(), "ROLLOUT_PARTIAL")
+        self.assertTrue(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertTrue(worker._hdo_optimizer_residency_preserved)
+        self.assertLess(events.index("optimizer_restore"), events.index("selective_offload"))
+        self.assertNotIn("optimizer_offload", events)
+
+        self.assertTrue(worker._restore_actor_optimizer_copy_params_for_update())
+        self.assertEqual(worker._actor_optimizer_residency(), "TRAINING_RESIDENT")
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+
+    def test_selective_transition_failure_falls_back_to_full_offload(self):
+        events = []
+        worker, residency = _staged_worker(
+            events,
+            preserve_hdo=True,
+            selective_offload=True,
+            fail_selective_offload=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "selective offload failed"):
+            worker.load_checkpoint("global_step_100", staged_restore=True)
+
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertEqual(worker._actor_optimizer_residency(), "FULL_OFFLOADED")
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertIn("optimizer_offload", events)
+
+    def test_preserve_without_selective_offload_stays_training_resident(self):
         events = []
         worker, residency = _staged_worker(events, preserve_hdo=True)
 
         worker.load_checkpoint("global_step_100", staged_restore=True)
 
         self.assertEqual(residency, {"model": False, "optimizer": True})
-        self.assertTrue(worker._hdo_optimizer_residency_preserved)
-        self.assertNotIn("optimizer_offload", events)
+        self.assertEqual(worker._actor_optimizer_residency(), "TRAINING_RESIDENT")
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+        warnings = [event[1] for event in events if event[0] == "warning"]
+        self.assertTrue(any("TRAINING_RESIDENT" in warning for warning in warnings))
+        self.assertFalse(any("partial HDO residency" in warning for warning in warnings))
 
     def test_runtime_backend_accepts_only_checkpoint_supported_distributed_optimizers(self):
         class FusedAdam:

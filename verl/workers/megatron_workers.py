@@ -1774,7 +1774,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             optimizer_before_memory = _log_resume_memory("before_optimizer_load")
             optimizer_loaded_memory = None
             optimizer_restore_succeeded = False
-            optimizer_residency_preserved = False
+            optimizer_full_offloaded = False
             try:
                 log_hdo_staged_restore_diagnostics(self.actor_optimizer, "before_load_megatron_optimizer")
                 load_megatron_optimizer(self.actor_optimizer)
@@ -1791,19 +1791,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 optimizer_restore_succeeded = True
             finally:
                 if optimizer_restore_succeeded and self._preserve_hdo_optimizer_residency():
-                    self._hdo_optimizer_residency_preserved = True
-                    optimizer_residency_preserved = True
-                    logger.warning("staged restore preserved canonical partial HDO residency")
+                    if self._selective_optimizer_copy_param_offload_enabled():
+                        try:
+                            self._offload_actor_optimizer_copy_params_for_rollout()
+                        except Exception:
+                            self._offload_actor_optimizer()
+                            raise
+                        logger.warning("staged restore transitioned optimizer to ROLLOUT_PARTIAL")
+                    else:
+                        self._hdo_optimizer_residency_preserved = True
+                        logger.warning(
+                            "staged restore kept optimizer TRAINING_RESIDENT; selective copy-param offload disabled"
+                        )
                 else:
                     self._offload_actor_optimizer()
+                    optimizer_full_offloaded = True
                 aggressive_empty_cache(force_sync=True)
                 optimizer_offloaded_memory = _log_resume_memory(
-                    "after_optimizer_residency_restore"
-                    if optimizer_residency_preserved
-                    else "after_optimizer_offload"
+                    "after_optimizer_offload" if optimizer_full_offloaded else "after_optimizer_residency_restore"
                 )
                 if (
-                    not optimizer_residency_preserved and optimizer_loaded_memory is not None
+                    optimizer_full_offloaded
+                    and optimizer_loaded_memory is not None
                     and optimizer_loaded_memory["gpu_available"]
                     and optimizer_offloaded_memory["gpu_allocated"] >= optimizer_loaded_memory["gpu_allocated"]
                 ):
