@@ -115,14 +115,14 @@ class TestActorConfig(unittest.TestCase):
         )
         self.assertEqual(config.current_route_mode, "natural")
         self.assertEqual(RouterReplayConfig(mode="R3_OLD_ONLY").mode, "R3_OLD_ONLY")
-        with self.assertRaisesRegex(ValueError, "delta_e=0.02"):
+        with self.assertRaisesRegex(ValueError, "EU-DERPO V1.3 freezes delta_e=0.02 and lambda_u=0.10"):
             EUDERPOConfig(
                 enabled=True,
                 version="1.3",
                 partial_rollout_old_alignment=True,
                 behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
-                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.05),
-                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.015),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.20, diagnostics=True),
             )
 
     def test_eu_derpo_v14_restores_rollout_anchor_and_keeps_partial_alignment(self):
@@ -131,18 +131,27 @@ class TestActorConfig(unittest.TestCase):
             version="1.4",
             partial_rollout_old_alignment=True,
             behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="rollout"),
-            expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
-            routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+            expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.015),
+            routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.20, diagnostics=True),
         )
         self.assertEqual(config.behavior_expert_is.behavior_source, "rollout")
+        with self.assertRaisesRegex(ValueError, "EU-DERPO V1.4 freezes delta_e=0.015 and lambda_u=0.20"):
+            EUDERPOConfig(
+                enabled=True,
+                version="1.4",
+                partial_rollout_old_alignment=True,
+                behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="rollout"),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+            )
         with self.assertRaisesRegex(ValueError, "behavior_source=rollout"):
             EUDERPOConfig(
                 enabled=True,
                 version="1.4",
                 partial_rollout_old_alignment=True,
                 behavior_expert_is=BehaviorExpertISConfig(enabled=True, behavior_source="aligned_old"),
-                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.02),
-                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.10, diagnostics=True),
+                expert_cluster_dppo=ExpertClusterDPPOConfig(enabled=True, delta_e=0.015),
+                routing_utility=RoutingUtilityConfig(enabled=True, lambda_u=0.20, diagnostics=True),
             )
         with self.assertRaisesRegex(ValueError, "live DPPO mask"):
             EUDERPOConfig(

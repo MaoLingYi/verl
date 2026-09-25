@@ -134,8 +134,10 @@ class EUDERPOConfig(BaseConfig):
         if self.version in {"1.3", "1.4"}:
             if dppo.diagnostics_only or not utility.diagnostics:
                 raise ValueError("EU-DERPO V1.3/V1.4 require the live DPPO mask and mandatory diagnostics")
-            if dppo.delta_e != 0.02 or utility.lambda_u != 0.10:
-                raise ValueError("EU-DERPO V1.3/V1.4 freeze delta_e=0.02 and lambda_u=0.10")
+        if self.version == "1.3" and (dppo.delta_e != 0.02 or utility.lambda_u != 0.10):
+            raise ValueError("EU-DERPO V1.3 freezes delta_e=0.02 and lambda_u=0.10")
+        if self.version == "1.4" and (dppo.delta_e != 0.015 or utility.lambda_u != 0.20):
+            raise ValueError("EU-DERPO V1.4 freezes delta_e=0.015 and lambda_u=0.20")
         if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
             raise ValueError("invalid Routing Utility normalization configuration")
 
