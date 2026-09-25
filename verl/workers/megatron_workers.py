@@ -149,17 +149,76 @@ def _optimizer_copy_param_host_decision(required_by_rank, mem_available):
     }
 
 
-def _is_gpu_adam_distributed_optimizer(optimizer):
+def _is_staged_restore_supported_optimizer(optimizer):
     from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
     from transformer_engine.pytorch.optimizers import FusedAdam
 
     optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
     return bool(optimizers) and all(
         isinstance(distributed_optimizer, DistributedOptimizer)
-        and isinstance(distributed_optimizer.optimizer, FusedAdam)
+        and isinstance(distributed_optimizer.optimizer, (FusedAdam, HybridDeviceOptimizer))
         for distributed_optimizer in optimizers
     )
+
+
+def _log_staged_restore_gate_diagnostics(
+    *,
+    is_offload_param,
+    is_offload_optimizer,
+    checkpoint_manager,
+    actor_optimizer,
+):
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    is_supported_optimizer = _is_staged_restore_supported_optimizer(actor_optimizer)
+    gate_values = (
+        ("self._is_offload_param", is_offload_param),
+        ("self._is_offload_optimizer", is_offload_optimizer),
+        ("checkpoint_manager.use_dist_checkpointing", checkpoint_manager.use_dist_checkpointing),
+        ("checkpoint_manager.should_load_model", checkpoint_manager.should_load_model),
+        ("checkpoint_manager.should_load_optimizer", checkpoint_manager.should_load_optimizer),
+        ("checkpoint_manager.should_load_extra", checkpoint_manager.should_load_extra),
+        (
+            "_is_staged_restore_supported_optimizer(actor_optimizer)",
+            is_supported_optimizer,
+        ),
+    )
+    for name, value in gate_values:
+        logger.warning("STAGED_RESTORE_GATE %s=%r", name, value)
+
+    optimizer_class = type(actor_optimizer)
+    logger.warning(
+        "STAGED_RESTORE_GATE actor_optimizer_class=%r module=%s qualname=%s",
+        optimizer_class,
+        optimizer_class.__module__,
+        optimizer_class.__qualname__,
+    )
+    if isinstance(actor_optimizer, ChainedOptimizer):
+        for index, child in enumerate(actor_optimizer.chained_optimizers):
+            child_class = type(child)
+            child_optimizer = getattr(child, "optimizer", None)
+            child_optimizer_class = type(child_optimizer) if child_optimizer is not None else None
+            logger.warning(
+                "STAGED_RESTORE_GATE chained_optimizer[%d] child_class=%r "
+                "child_module=%s child_qualname=%s is_distributed_optimizer=%r "
+                "child_optimizer_class=%r child_optimizer_module=%s "
+                "child_optimizer_qualname=%s is_te_fused_adam=%r",
+                index,
+                child_class,
+                child_class.__module__,
+                child_class.__qualname__,
+                isinstance(child, DistributedOptimizer),
+                child_optimizer_class,
+                child_optimizer_class.__module__ if child_optimizer_class is not None else None,
+                child_optimizer_class.__qualname__ if child_optimizer_class is not None else None,
+                isinstance(child_optimizer, FusedAdam),
+            )
+
+    return is_supported_optimizer
 
 
 def _log_resume_memory(stage):
@@ -1657,6 +1716,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             return
 
         if staged_restore:
+            is_supported_optimizer = _log_staged_restore_gate_diagnostics(
+                is_offload_param=self._is_offload_param,
+                is_offload_optimizer=self._is_offload_optimizer,
+                checkpoint_manager=self.checkpoint_mananager,
+                actor_optimizer=self.actor_optimizer,
+            )
             if not (
                 self._is_offload_param
                 and self._is_offload_optimizer
@@ -1664,11 +1729,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 and self.checkpoint_mananager.should_load_model
                 and self.checkpoint_mananager.should_load_optimizer
                 and self.checkpoint_mananager.should_load_extra
-                and _is_gpu_adam_distributed_optimizer(self.actor_optimizer)
+                and is_supported_optimizer
             ):
                 raise RuntimeError(
                     "Staged resume requires full model/optimizer/extra DCP loading with param_offload=true, "
-                    "optimizer_offload=true, and DistributedOptimizer + TransformerEngine FusedAdam"
+                    "optimizer_offload=true, and DistributedOptimizer with TransformerEngine FusedAdam "
+                    "or HybridDeviceOptimizer"
                 )
 
             _log_resume_memory("actor_initialized")

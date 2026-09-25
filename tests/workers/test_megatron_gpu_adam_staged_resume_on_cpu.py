@@ -111,7 +111,7 @@ def _staged_worker(
             AssertionError("selective helper must not be called during staged resume")
         ),
         "aggressive_empty_cache": lambda **kwargs: events.append("empty_cache"),
-        "_is_gpu_adam_distributed_optimizer": lambda optimizer: True,
+        "_log_staged_restore_gate_diagnostics": lambda **kwargs: True,
         "_log_resume_memory": log_memory,
         "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
@@ -207,7 +207,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertIn("optimizer_offload", events)
         self.assertNotIn(("mem", "restore_complete"), events)
 
-    def test_runtime_backend_accepts_only_distributed_fused_adam(self):
+    def test_runtime_backend_accepts_only_checkpoint_supported_distributed_optimizers(self):
         class FusedAdam:
             pass
 
@@ -223,9 +223,10 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
                 self.chained_optimizers = optimizers
 
         predicate = _module_function(
-            "_is_gpu_adam_distributed_optimizer",
+            "_is_staged_restore_supported_optimizer",
             {
                 "FusedAdam": FusedAdam,
+                "HybridDeviceOptimizer": HybridDeviceOptimizer,
                 "DistributedOptimizer": DistributedOptimizer,
                 "ChainedOptimizer": ChainedOptimizer,
             },
@@ -233,9 +234,115 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         )
 
         self.assertTrue(predicate(DistributedOptimizer(FusedAdam())))
-        self.assertTrue(predicate(ChainedOptimizer(DistributedOptimizer(FusedAdam()))))
-        self.assertFalse(predicate(DistributedOptimizer(HybridDeviceOptimizer())))
+        self.assertTrue(predicate(DistributedOptimizer(HybridDeviceOptimizer())))
+        self.assertTrue(predicate(ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer()))))
+        self.assertTrue(
+            predicate(
+                ChainedOptimizer(
+                    DistributedOptimizer(FusedAdam()),
+                    DistributedOptimizer(HybridDeviceOptimizer()),
+                )
+            )
+        )
         self.assertFalse(predicate(DistributedOptimizer(object())))
+        self.assertFalse(predicate(ChainedOptimizer(HybridDeviceOptimizer())))
+        self.assertFalse(predicate(ChainedOptimizer()))
+
+    def test_staged_restore_requires_distributed_full_checkpoint_contents(self):
+        for attribute in (
+            "use_dist_checkpointing",
+            "should_load_model",
+            "should_load_optimizer",
+            "should_load_extra",
+        ):
+            with self.subTest(attribute=attribute):
+                events = []
+                worker, residency = _staged_worker(events)
+                setattr(worker.checkpoint_mananager, attribute, False)
+
+                with self.assertRaisesRegex(RuntimeError, "Staged resume requires full model/optimizer/extra"):
+                    worker.load_checkpoint("global_step_100", staged_restore=True)
+
+                self.assertEqual(residency, {"model": False, "optimizer": False})
+                self.assertNotIn("model_onload", events)
+
+    def test_staged_restore_requires_param_and_optimizer_offload(self):
+        for attribute in ("_is_offload_param", "_is_offload_optimizer"):
+            with self.subTest(attribute=attribute):
+                events = []
+                worker, residency = _staged_worker(events)
+                setattr(worker, attribute, False)
+
+                with self.assertRaisesRegex(RuntimeError, "Staged resume requires full model/optimizer/extra"):
+                    worker.load_checkpoint("global_step_100", staged_restore=True)
+
+                self.assertEqual(residency, {"model": False, "optimizer": False})
+                self.assertNotIn("model_onload", events)
+
+    def test_staged_restore_gate_diagnostics_report_chained_optimizer_types(self):
+        class FusedAdam:
+            pass
+
+        class HybridDeviceOptimizer:
+            pass
+
+        class DistributedOptimizer:
+            def __init__(self, optimizer):
+                self.optimizer = optimizer
+
+        class ChainedOptimizer:
+            def __init__(self, *optimizers):
+                self.chained_optimizers = optimizers
+
+        warnings = []
+        diagnostic = _module_function(
+            "_log_staged_restore_gate_diagnostics",
+            {
+                "ChainedOptimizer": ChainedOptimizer,
+                "DistributedOptimizer": DistributedOptimizer,
+                "FusedAdam": FusedAdam,
+                "_is_staged_restore_supported_optimizer": lambda optimizer: False,
+                "logger": SimpleNamespace(warning=lambda message, *args: warnings.append(message % args)),
+            },
+            strip_imports=True,
+        )
+        checkpoint_manager = SimpleNamespace(
+            use_dist_checkpointing=True,
+            should_load_model=True,
+            should_load_optimizer=True,
+            should_load_extra=True,
+        )
+        optimizer = ChainedOptimizer(
+            DistributedOptimizer(HybridDeviceOptimizer()),
+            DistributedOptimizer(FusedAdam()),
+        )
+
+        result = diagnostic(
+            is_offload_param=True,
+            is_offload_optimizer=True,
+            checkpoint_manager=checkpoint_manager,
+            actor_optimizer=optimizer,
+        )
+
+        self.assertFalse(result)
+        for name in (
+            "self._is_offload_param",
+            "self._is_offload_optimizer",
+            "checkpoint_manager.use_dist_checkpointing",
+            "checkpoint_manager.should_load_model",
+            "checkpoint_manager.should_load_optimizer",
+            "checkpoint_manager.should_load_extra",
+            "_is_staged_restore_supported_optimizer(actor_optimizer)",
+            "actor_optimizer_class",
+        ):
+            self.assertTrue(any(name in warning for warning in warnings), name)
+        child_warnings = [warning for warning in warnings if "chained_optimizer[" in warning]
+        self.assertEqual(len(child_warnings), 2)
+        self.assertIn("is_distributed_optimizer=True", child_warnings[0])
+        self.assertIn("HybridDeviceOptimizer", child_warnings[0])
+        self.assertIn("is_te_fused_adam=False", child_warnings[0])
+        self.assertIn("FusedAdam", child_warnings[1])
+        self.assertIn("is_te_fused_adam=True", child_warnings[1])
 
     def test_host_memory_threshold_warns_and_returns_telemetry(self):
         memory = SimpleNamespace(used=850 * 1024**3, available=150 * 1024**3, percent=85.0)
