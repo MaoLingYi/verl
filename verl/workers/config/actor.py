@@ -31,6 +31,7 @@ __all__ = [
     "BehaviorExpertISConfig",
     "ExpertClusterDPPOConfig",
     "RoutingUtilityConfig",
+    "MCTRConfig",
     "EUDERPOConfig",
     "RouterShiftDiagnosticsConfig",
     "RouterShiftWeightingConfig",
@@ -71,6 +72,14 @@ class RoutingUtilityConfig(BaseConfig):
 
 
 @dataclass
+class MCTRConfig(BaseConfig):
+    enabled: bool = False
+    beta: Optional[float] = None
+    delta_min: Optional[float] = None
+    delta_max: Optional[float] = None
+
+
+@dataclass
 class EUDERPOConfig(BaseConfig):
     enabled: bool = False
     version: str = "1.2.1"
@@ -91,16 +100,17 @@ class EUDERPOConfig(BaseConfig):
     behavior_expert_is: BehaviorExpertISConfig = field(default_factory=BehaviorExpertISConfig)
     expert_cluster_dppo: ExpertClusterDPPOConfig = field(default_factory=ExpertClusterDPPOConfig)
     routing_utility: RoutingUtilityConfig = field(default_factory=RoutingUtilityConfig)
+    mctr: MCTRConfig = field(default_factory=MCTRConfig)
 
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version not in {"1.2.1", "1.3", "1.4"}:
-            raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, or 1.4")
+        if self.version not in {"1.2.1", "1.3", "1.4", "1.6"}:
+            raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, 1.4, or 1.6")
         if self.current_route_mode != "natural":
             raise ValueError("EU-DERPO current route mode must remain natural")
-        if self.partial_rollout_old_alignment != (self.version in {"1.3", "1.4"}):
-            raise ValueError("EU-DERPO V1.3/V1.4 require rollout-to-old partial alignment")
+        if self.partial_rollout_old_alignment != (self.version in {"1.3", "1.4", "1.6"}):
+            raise ValueError("EU-DERPO V1.3/V1.4/V1.6 require rollout-to-old partial alignment")
         step_e_contract = (
             self.step_e_implementation,
             self.hidden_source,
@@ -131,13 +141,24 @@ class EUDERPOConfig(BaseConfig):
         utility = self.routing_utility
         if utility.lambda_u is None or utility.lambda_u <= 0:
             raise ValueError("EU-DERPO requires explicit positive lambda_u")
-        if self.version in {"1.3", "1.4"}:
+        if self.version in {"1.3", "1.4", "1.6"}:
             if dppo.diagnostics_only or not utility.diagnostics:
-                raise ValueError("EU-DERPO V1.3/V1.4 require the live DPPO mask and mandatory diagnostics")
+                raise ValueError("EU-DERPO V1.3/V1.4/V1.6 require the live DPPO mask and mandatory diagnostics")
         if self.version == "1.3" and (dppo.delta_e != 0.02 or utility.lambda_u != 0.10):
             raise ValueError("EU-DERPO V1.3 freezes delta_e=0.02 and lambda_u=0.10")
         if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
             raise ValueError("invalid Routing Utility normalization configuration")
+        mctr = self.mctr
+        if self.version == "1.6":
+            values = (mctr.beta, mctr.delta_min, mctr.delta_max, dppo.delta_e)
+            if not mctr.enabled or any(value is None for value in values):
+                raise ValueError("EU-DERPO V1.6 requires explicit MCTR beta, bounds, and delta_0")
+            if (mctr.delta_min, mctr.delta_max) != (0.012, 0.018):
+                raise ValueError("EU-DERPO V1.6 freezes MCTR bounds to [0.012, 0.018]")
+            if not 0 < mctr.beta <= 1 or not mctr.delta_min <= dppo.delta_e <= mctr.delta_max:
+                raise ValueError("EU-DERPO V1.6 requires beta in (0,1] and delta_0 inside MCTR bounds")
+        elif mctr.enabled or any(value is not None for value in (mctr.beta, mctr.delta_min, mctr.delta_max)):
+            raise ValueError("EU-DERPO MCTR is valid only in V1.6")
 
 
 @dataclass

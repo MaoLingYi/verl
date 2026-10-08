@@ -80,4 +80,4 @@ def test_case_e_behavior_delta_decomposes_into_align_plus_engine():
 def test_v14_actor_selects_anchor_by_versioned_behavior_source():
     actor = (ROOT / "verl/workers/actor/megatron_actor.py").read_text(encoding="utf-8")
     assert actor.count("optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source") == 2
-    assert 'self.config.eu_derpo.version in {"1.3", "1.4"}' in actor
+    assert 'self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}' in actor

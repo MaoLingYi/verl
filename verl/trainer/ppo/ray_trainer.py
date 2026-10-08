@@ -1498,7 +1498,7 @@ class RayPPOTrainer:
                             old_log_prob.batch.pop("entropys")
                             if (
                                 actor_config.eu_derpo.enabled
-                                and actor_config.eu_derpo.version in {"1.3", "1.4"}
+                                and actor_config.eu_derpo.version in {"1.3", "1.4", "1.6"}
                             ):
                                 route_match = old_log_prob.batch.pop("route_match_rollout_old_aligned")
                                 if not torch.equal(route_match, torch.ones_like(route_match)):

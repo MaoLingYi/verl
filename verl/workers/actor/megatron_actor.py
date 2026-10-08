@@ -40,9 +40,11 @@ from torch import nn
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.trainer.ppo.eu_derpo import (
+    P95MCTRController,
     audit_optimizer_minibatches,
     cluster_statistics,
     distribution_stats,
+    distributed_exact_p95,
     edppo_token_coefficients,
     normalize_group_utility,
     route_match_fraction,
@@ -97,6 +99,40 @@ def _gather_diagnostic_values(values: torch.Tensor) -> torch.Tensor:
         torch.distributed.all_gather(gathered, padded, group=group)
         values = torch.cat([item[: length.item()] for item, length in zip(gathered, sizes, strict=True)])
     return values.cpu()
+
+
+def _global_mctr_outward_p95(values: torch.Tensor) -> tuple[float | None, int]:
+    """Exact global quantile with TP-rank-0 ownership of replicated cluster metadata."""
+    if mpu.get_pipeline_model_parallel_world_size() != 1:
+        raise RuntimeError("EU-DERPO V1.6 MCTR ownership contract requires PP=1")
+    owned = values.detach().float().flatten()
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        owned = owned[:0]
+    q_owned, count_owned = distributed_exact_p95(owned.to(get_device_id()), mpu.get_data_parallel_group())
+    if mpu.get_tensor_model_parallel_rank() == 0 and count_owned:
+        q_raw = float(q_owned) if q_owned is not None else float("nan")
+        count = count_owned
+    else:
+        q_raw = float("nan")
+        count = 0
+    payload = torch.tensor([q_raw, count], dtype=torch.float64, device=get_device_id())
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        torch.distributed.broadcast(
+            payload,
+            src=mpu.get_tensor_model_parallel_src_rank(),
+            group=mpu.get_tensor_model_parallel_group(),
+        )
+    count = int(payload[1].item())
+    if count and torch.isfinite(payload[0]):
+        bounds = torch.tensor([payload[0], payload[0]], dtype=torch.float64, device=payload.device)
+        torch.distributed.all_reduce(bounds[:1], op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(bounds[1:], op=torch.distributed.ReduceOp.MAX)
+        if not torch.isclose(bounds[0], bounds[1], rtol=0, atol=1.0e-12):
+            raise RuntimeError("EU-DERPO V1.6 MCTR delta input differs across actor ranks")
+        return payload[0].item(), count
+    if count:
+        return float("nan"), count
+    return None, 0
 
 
 def _append_eu_derpo_scalar_metrics(metrics, observer_metrics):
@@ -249,12 +285,14 @@ class MegatronPPOActor(BasePPOActor):
         self._eu_derpo_rollout_routes = None
         self._eu_derpo_rollout_route_mask = None
         self._eu_derpo_optimizer_generation = 0
+        self._eu_derpo_delta_current = None
+        self.mctr_controller = None
         if self.config.eu_derpo.enabled:
             if float(self.actor_optimizer.get_loss_scale().item()) != 1.0:
                 raise ValueError("EU-DERPO V1.2.1 alpha sensitivity requires unit BF16 loss scale")
             optimizer_override = self.config.optim.override_optimizer_config or {}
             expected_replay = (
-                "R3_OLD_ONLY" if self.config.eu_derpo.version in {"1.3", "1.4"} else "disabled"
+                "R3_OLD_ONLY" if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"} else "disabled"
             )
             conflicts = {
                 "router_replay": self.config.router_replay.mode != expected_replay,
@@ -291,13 +329,19 @@ class MegatronPPOActor(BasePPOActor):
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
             )
+            if self.config.eu_derpo.version == "1.6":
+                dppo = self.config.eu_derpo.expert_cluster_dppo
+                mctr = self.config.eu_derpo.mctr
+                self.mctr_controller = P95MCTRController(
+                    dppo.delta_e, mctr.beta, mctr.delta_min, mctr.delta_max
+                )
 
         config = get_model_config(self.actor_module[0])
         print(config)
         config.finalize_model_grads_func = finalize_model_grads
 
     def set_eu_derpo_rollout_route_diagnostic(self, routes: torch.Tensor, response_mask: torch.Tensor) -> None:
-        if self.config.eu_derpo.version not in {"1.3", "1.4"}:
+        if self.config.eu_derpo.version not in {"1.3", "1.4", "1.6"}:
             raise RuntimeError("rollout/current route diagnostic requires partial alignment")
         if routes.device.type != "cpu" or routes.dtype != torch.uint8:
             raise RuntimeError("V1.3 rollout route diagnostic must be a CPU uint8 tensor")
@@ -309,6 +353,14 @@ class MegatronPPOActor(BasePPOActor):
     def clear_eu_derpo_rollout_route_diagnostic(self) -> None:
         self._eu_derpo_rollout_routes = None
         self._eu_derpo_rollout_route_mask = None
+
+    def eu_derpo_checkpoint_state(self):
+        return self.mctr_controller.state_dict() if self.mctr_controller is not None else None
+
+    def load_eu_derpo_checkpoint_state(self, state):
+        if self.mctr_controller is None or state is None:
+            raise ValueError("EU-DERPO V1.6 resume requires MCTR controller checkpoint state")
+        self.mctr_controller.load_state_dict(state)
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -500,7 +552,7 @@ class MegatronPPOActor(BasePPOActor):
             "position_ids",
             "advantages",
         ]
-        if self.eu_derpo_observer is None or self.config.eu_derpo.version in {"1.3", "1.4"}:
+        if self.eu_derpo_observer is None or self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}:
             select_keys.append("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -676,11 +728,11 @@ class MegatronPPOActor(BasePPOActor):
                         response_mask,
                         routes,
                         self.eu_derpo_observer.num_experts,
-                        dppo.delta_e,
+                        self._eu_derpo_delta_current if self.mctr_controller is not None else dppo.delta_e,
                         dppo.diagnostics_only,
                         aligned_old_logp=(
                             data.get("old_log_probs")
-                            if self.config.eu_derpo.version in {"1.3", "1.4"}
+                            if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}
                             else None
                         ),
                         optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
@@ -1071,6 +1123,8 @@ class MegatronPPOActor(BasePPOActor):
                 eu_optimizer_minibatch_sizes.append(len(data))
                 eu_expanded_batch_size = int(data.meta_info["eu_derpo_expanded_batch_size"])
             step_started = time.perf_counter()
+            if self.mctr_controller is not None:
+                self._eu_derpo_delta_current = self.mctr_controller.delta_current
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
@@ -1179,16 +1233,16 @@ class MegatronPPOActor(BasePPOActor):
                         data.batch["response_mask"].cpu(),
                         routes,
                         self.eu_derpo_observer.num_experts,
-                        dppo.delta_e,
+                        self._eu_derpo_delta_current if self.mctr_controller is not None else dppo.delta_e,
                         dppo.diagnostics_only,
                         aligned_old_logp=(
                             data.batch["old_log_probs"].cpu()
-                            if self.config.eu_derpo.version in {"1.3", "1.4"}
+                            if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}
                             else None
                         ),
                         optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
                     )
-                    if self.config.eu_derpo.version in {"1.3", "1.4"}:
+                    if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}:
                         if self._eu_derpo_rollout_routes is None or self._eu_derpo_rollout_route_mask is None:
                             raise RuntimeError("EU-DERPO V1.3 current-route diagnostic payload is missing")
                         eu_metrics["route_match_rollout_current"] = route_match_fraction(
@@ -1197,6 +1251,10 @@ class MegatronPPOActor(BasePPOActor):
                             self._eu_derpo_rollout_route_mask,
                         )
                     active_total = stats_eu.active.sum((1, 2)).float()
+                    mctr_observation = None
+                    if self.mctr_controller is not None:
+                        outward_values = stats_eu.divergence[stats_eu.directional_outward]
+                        mctr_observation = _global_mctr_outward_p95(outward_values)
                     _, objective = edppo_token_coefficients(
                         stats_eu, routes, data.batch["response_mask"].cpu(), active_total
                     )
@@ -1287,7 +1345,7 @@ class MegatronPPOActor(BasePPOActor):
                                 values = _gather_diagnostic_values(values)
                                 for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
                                     metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
-                        elif self.config.eu_derpo.version == "1.4":
+                        elif self.config.eu_derpo.version in {"1.4", "1.6"}:
                             for prefix, values in (
                                 ("rho_e_beh", stats_eu.rho[active]),
                                 ("rho_e_align", stats_eu.rho_align[active]),
@@ -1412,6 +1470,11 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 for key, value in cleanup_metrics.items():
                     metrics[f"actor/eu_derpo/{key}"] = [value]
+                if self.mctr_controller is not None and update_successful:
+                    q_raw, outward_count = mctr_observation
+                    for key, value in self.mctr_controller.update(q_raw, outward_count).items():
+                        metrics[f"actor/eu_derpo/{key}"] = [value]
+                    self._eu_derpo_delta_current = None
             data = {"actor/grad_norm": grad_norm}
             append_to_dict(metrics, data)
 

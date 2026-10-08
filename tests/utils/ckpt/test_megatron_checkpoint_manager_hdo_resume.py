@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ast
+import copy
 import gc
 import importlib.util
 import unittest
@@ -182,7 +183,7 @@ class Model:
             self.parameter.value = state_dict["weight"]
 
 
-def _manager(optimizer, model=None, *, mcore_016=True):
+def _manager(optimizer, model=None, *, mcore_016=True, extra_state_provider=None, extra_state_loader=None):
     manager = SimpleNamespace(
         model=[model or Model()],
         optimizer=optimizer,
@@ -192,6 +193,8 @@ def _manager(optimizer, model=None, *, mcore_016=True):
             "distrib_optim_sharding_type": "dp_reshardable",
             "chained_optim_avoid_prefix": True,
         },
+        extra_state_provider=extra_state_provider,
+        extra_state_loader=extra_state_loader,
     )
     manager.generate_state_dict = MethodType(_generate_state_dict(mcore_016=mcore_016), manager)
     return manager
@@ -256,6 +259,49 @@ def _generate_state_dict(*, mcore_016=True):
 
 
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_eu_derpo_controller_extra_state_survives_mocked_dcp_round_trip(self):
+        eu_path = MANAGER.parents[2] / "trainer" / "ppo" / "eu_derpo.py"
+        spec = importlib.util.spec_from_file_location("eu_derpo_checkpoint_test", eu_path)
+        eu = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(eu)
+        saved_controller = eu.P95MCTRController(0.012, 0.0027, 0.012, 0.018)
+        saved_controller.update(0.018, 7)
+        restored_controller = eu.P95MCTRController(0.012, 0.0027, 0.012, 0.018)
+        manager = _manager(
+            OrdinaryOptimizer(),
+            extra_state_provider=saved_controller.state_dict,
+            extra_state_loader=restored_controller.load_state_dict,
+        )
+        methods = _production_methods()
+        manager.generate_state_dict = MethodType(methods["generate_state_dict"], manager)
+        manager.load_checkpoint = MethodType(methods["load_checkpoint"], manager)
+        manager.checkpoint_load_contents = {"extra"}
+        manager.use_dist_checkpointing = True
+        manager.use_distributed_optimizer = False
+        manager.rank = 0
+        manager.peft_cls = None
+        manager.load_rng_states = lambda state: None
+
+        storage = {}
+
+        def save_dist_checkpointing(*, sharded_state_dict, ckpt_dir):
+            storage[ckpt_dir] = copy.deepcopy(sharded_state_dict)
+
+        save_template = manager.generate_state_dict(
+            generate_model=False, generate_optimizer=False, generate_extra=True
+        )
+        save_dist_checkpointing(sharded_state_dict=save_template, ckpt_dir="checkpoint/dist_ckpt")
+        methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = (
+            lambda *, sharded_state_dict, ckpt_dir: copy.deepcopy(storage[ckpt_dir])
+        )
+        manager.load_checkpoint("checkpoint", load_contents=("extra",), del_local_after_load=False)
+
+        self.assertEqual(restored_controller.delta_current, saved_controller.delta_current)
+        self.assertEqual(restored_controller.controller_step, saved_controller.controller_step)
+        wrong_beta = eu.P95MCTRController(0.012, 0.01, 0.012, 0.018)
+        with self.assertRaisesRegex(ValueError, "differs from resolved config"):
+            wrong_beta.load_state_dict(storage["checkpoint/dist_ckpt"]["eu_derpo_controller"])
+
     def test_staged_load_clears_template_and_payload_on_failure(self):
         class TrackedDict(dict):
             cleared = False

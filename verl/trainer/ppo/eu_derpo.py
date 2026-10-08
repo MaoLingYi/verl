@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 
@@ -35,10 +36,107 @@ class ClusterStatistics:
     delta_total: torch.Tensor | None = None
     rho_align: torch.Tensor | None = None
     divergence_align: torch.Tensor | None = None
+    directional_outward: torch.Tensor | None = None
 
     @property
     def active(self) -> torch.Tensor:
         return self.count > 0
+
+
+class P95MCTRController:
+    """Detached, one-step-lagged threshold state for EU-DERPO V1.6."""
+
+    def __init__(self, delta_initial: float, beta: float, delta_min: float, delta_max: float):
+        values = (delta_initial, beta, delta_min, delta_max)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("EU-DERPO MCTR parameters must be finite")
+        if not 0 < beta <= 1 or not delta_min <= delta_initial <= delta_max:
+            raise ValueError("EU-DERPO MCTR requires beta in (0,1] and bounded delta_initial")
+        self.delta_current = float(delta_initial)
+        self.beta = float(beta)
+        self.delta_min = float(delta_min)
+        self.delta_max = float(delta_max)
+        self.controller_step = 0
+
+    def update(self, q_raw: float | None, outward_count: int) -> dict[str, float]:
+        current = self.delta_current
+        valid = outward_count > 0 and q_raw is not None and math.isfinite(float(q_raw))
+        if valid:
+            q_clipped = min(max(float(q_raw), self.delta_min), self.delta_max)
+            delta_next = min(
+                max((1.0 - self.beta) * current + self.beta * q_clipped, self.delta_min),
+                self.delta_max,
+            )
+        else:
+            q_clipped = current
+            delta_next = current
+        self.delta_current = delta_next
+        self.controller_step += 1
+        return {
+            "mctr/delta_current": current,
+            "mctr/q_outward_p95_raw": float(q_raw) if q_raw is not None else float("nan"),
+            "mctr/q_outward_p95_clipped": q_clipped,
+            "mctr/delta_next": delta_next,
+            "mctr/delta_change": delta_next - current,
+            "mctr/outward_candidate_count": float(outward_count),
+            "mctr/bound_hit_min": float(delta_next == self.delta_min),
+            "mctr/bound_hit_max": float(delta_next == self.delta_max),
+            "mctr/fallback_invalid_q": float(not valid),
+        }
+
+    def state_dict(self) -> dict[str, float | int]:
+        return {
+            "mctr_delta_current": self.delta_current,
+            "mctr_controller_step": self.controller_step,
+            "mctr_beta": self.beta,
+            "mctr_delta_min": self.delta_min,
+            "mctr_delta_max": self.delta_max,
+        }
+
+    def load_state_dict(self, state: dict[str, float | int]) -> None:
+        required = {
+            "mctr_delta_current", "mctr_controller_step", "mctr_beta", "mctr_delta_min", "mctr_delta_max"
+        }
+        if required.difference(state):
+            raise ValueError("EU-DERPO V1.6 checkpoint is missing MCTR controller state")
+        if (
+            float(state["mctr_beta"]) != self.beta
+            or float(state["mctr_delta_min"]) != self.delta_min
+            or float(state["mctr_delta_max"]) != self.delta_max
+        ):
+            raise ValueError("EU-DERPO V1.6 checkpoint MCTR config differs from resolved config")
+        delta = float(state["mctr_delta_current"])
+        step = int(state["mctr_controller_step"])
+        if not math.isfinite(delta) or not self.delta_min <= delta <= self.delta_max or step < 0:
+            raise ValueError("EU-DERPO V1.6 checkpoint MCTR state is invalid")
+        self.delta_current = delta
+        self.controller_step = step
+
+
+def exact_p95(values: torch.Tensor) -> float | None:
+    """Exact detached P95 over an already ownership-deduplicated distribution."""
+    values = values.detach().float().flatten()
+    if not values.numel() or not torch.isfinite(values).all():
+        return None
+    return torch.quantile(values, 0.95).item()
+
+
+def distributed_exact_p95(values: torch.Tensor, group=None) -> tuple[float | None, int]:
+    """Exact P95 of variable-length detached shards in one ownership domain."""
+    values = values.detach().float().flatten()
+    if not torch.distributed.is_initialized():
+        return exact_p95(values), values.numel()
+    world_size = torch.distributed.get_world_size(group)
+    size = torch.tensor([values.numel()], dtype=torch.int64, device=values.device)
+    sizes = [torch.zeros_like(size) for _ in range(world_size)]
+    torch.distributed.all_gather(sizes, size, group=group)
+    maximum = max(1, max(item.item() for item in sizes))
+    padded = torch.zeros(maximum, dtype=torch.float32, device=values.device)
+    padded[: values.numel()] = values
+    gathered = [torch.empty_like(padded) for _ in sizes]
+    torch.distributed.all_gather(gathered, padded, group=group)
+    distribution = torch.cat([item[: length.item()] for item, length in zip(gathered, sizes)])
+    return exact_p95(distribution), distribution.numel()
 
 
 def _finite(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -163,8 +261,8 @@ def cluster_statistics(
             dppo_mask = active
         else:
             adv = advantage[:, None, None]
-            outward = (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1))) & (divergence > delta_e)
-            dppo_mask = active & ~outward
+            directional_outward = active & (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1)))
+            dppo_mask = active & ~(directional_outward & (divergence > delta_e))
         # Keep the V1.2.1/default-off path allocation- and return-compatible.
         return ClusterStatistics(
             count,
@@ -172,6 +270,7 @@ def cluster_statistics(
             _finite("D_E", divergence),
             dppo_mask.detach(),
             advantage,
+            directional_outward=directional_outward.detach() if not diagnostics_only else None,
         )
     else:
         delta_engine = (engine_log_sum / safe_count).masked_fill(~active, 0.0)
@@ -189,8 +288,8 @@ def cluster_statistics(
         dppo_mask = active
     else:
         adv = advantage[:, None, None]
-        outward = (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1))) & (divergence > delta_e)
-        dppo_mask = active & ~outward
+        directional_outward = active & (((adv > 0) & (rho > 1)) | ((adv < 0) & (rho < 1)))
+        dppo_mask = active & ~(directional_outward & (divergence > delta_e))
     return ClusterStatistics(
         count,
         _finite("rho_E", rho),
@@ -205,6 +304,7 @@ def cluster_statistics(
         _finite("Delta_beh", delta_behavior),
         _finite("rho_E_align", rho_align),
         _finite("D_align", divergence_align),
+        directional_outward.detach() if not diagnostics_only else None,
     )
 
 

@@ -315,3 +315,10 @@ eu_derpo:
     min_std: 1.0e-6
     diagnostics: false
 
+  mctr:
+    _target_: verl.workers.config.MCTRConfig
+    enabled: false
+    beta: null
+    delta_min: null
+    delta_max: null
+

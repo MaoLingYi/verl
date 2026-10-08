@@ -213,6 +213,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         bridge=None,
         provider=None,
         peft_cls=None,
+        extra_state_provider=None,
+        extra_state_loader=None,
         **kwargs,
     ):
         super().__init__(
@@ -240,6 +242,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.provider = provider
         self.vanilla_bridge = self.provider is None
         self.peft_cls = peft_cls
+        self.extra_state_provider = extra_state_provider
+        self.extra_state_loader = extra_state_loader
         self.rank = torch.distributed.get_rank()
         # Megatron-Bridge is Okay to load/save HF checkpoint for value model as well
         self.use_dist_checkpointing = (
@@ -400,6 +404,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             torch.distributed.barrier()
             rng_state = self.get_rng_state()
             state_dict["rng_state"] = rng_state
+            extra_state_provider = getattr(self, "extra_state_provider", None)
+            if extra_state_provider is not None:
+                extra_state = extra_state_provider()
+                if extra_state is not None:
+                    state_dict["eu_derpo_controller"] = extra_state
 
         return state_dict
 
@@ -603,6 +612,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 )
                 rng_state = state_dict["rng_state"]
                 self.load_rng_states(rng_state)
+                extra_state_loader = getattr(self, "extra_state_loader", None)
+                if extra_state_loader is not None:
+                    if "eu_derpo_controller" not in state_dict:
+                        raise ValueError("EU-DERPO V1.6 checkpoint is missing controller extra-state")
+                    extra_state_loader(state_dict["eu_derpo_controller"])
                 log_with_rank(f"Loaded RNG states from {local_path}", rank=self.rank, logger=logger)
 
             if del_local_after_load:
