@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.eu_derpo import aime_accuracy_values, append_aime_history
+from verl.trainer.ppo.dynamic_sampling import PromptGroupSampler
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
@@ -945,6 +946,11 @@ class RayPPOTrainer:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
+        if (
+            self.config.actor_rollout_ref.actor.eu_derpo.enabled
+            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+        ):
+            dataloader_state_dict["eu_derpo_raw_data_epoch"] = self.raw_data_epoch
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
@@ -1018,6 +1024,12 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            if (
+                self.config.actor_rollout_ref.actor.eu_derpo.enabled
+                and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+            ):
+                self.raw_data_epoch = dataloader_state_dict.pop("eu_derpo_raw_data_epoch", 0)
+                self._raw_dataloader_resumed = True
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -1336,12 +1348,33 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        sampling = None
+        filter_groups = self.config.algorithm.get("filter_groups", None)
+        no_old_recompute = (
+            self.config.actor_rollout_ref.actor.eu_derpo.enabled
+            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+        )
+        dynamic_sampling = no_old_recompute and filter_groups is not None and filter_groups.get("enable", False)
+        logical_timing = {}
+        if no_old_recompute:
+            current_epoch = getattr(self, "raw_data_epoch", 0)
+            if self.global_steps > self.total_training_steps:
+                progress_bar.close()
+                return
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            if no_old_recompute:
+                self.raw_data_epoch = epoch
+                # Keep restored StatefulDataLoader position; only seed a new raw epoch.
+                if not getattr(self, "_raw_dataloader_resumed", False):
+                    sampler = self.train_dataloader.sampler
+                    if hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(epoch)
+                self._raw_dataloader_resumed = False
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
-                timing_raw = {}
+                timing_raw = logical_timing if dynamic_sampling else {}
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1372,11 +1405,16 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
+                        if not dynamic_sampling:
+                            self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        if dynamic_sampling:
+                            for key, value in gen_batch_output.meta_info["timing"].items():
+                                timing_raw[key] = timing_raw.get(key, 0.0) + value
+                        else:
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1434,8 +1472,42 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
+                            if dynamic_sampling:
+                                del batch_reward
 
                         # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    if dynamic_sampling:
+                        if sampling is None:
+                            sampling = PromptGroupSampler(
+                                self.config.data.train_batch_size,
+                                self.config.actor_rollout_ref.rollout.n,
+                                filter_groups.metric,
+                                filter_groups.max_num_gen_batches,
+                                self.config.data.max_response_length,
+                            )
+                            sampling.raw_data_epoch_start = epoch
+                        if filter_groups.metric not in reward_extra_infos_dict:
+                            raise ValueError(f"Dynamic Sampling reward metric {filter_groups.metric!r} is missing")
+                        # Preserve accepted reward metadata, but filter from the explicit reward output.
+                        batch.non_tensor_batch.update(
+                            {key: np.asarray(value) for key, value in reward_extra_infos_dict.items()}
+                        )
+                        batch.meta_info["reward_extra_keys"] = list(reward_extra_infos_dict)
+                        accepted = sampling.add(batch, metric_values=reward_extra_infos_dict[filter_groups.metric])
+                        # The raw tensors have a second owner through union(gen_batch_output).
+                        del batch, gen_batch_output, gen_batch, reward_tensor, reward_extra_infos_dict
+                        if accepted is None:
+                            continue
+                        batch = accepted
+                        del accepted
+                        self.checkpoint_manager.sleep_replicas()
+                        metrics.update(sampling.metrics(batch))
+                        metrics["dynamic_sampling/raw_data_epoch_start"] = sampling.raw_data_epoch_start
+                        metrics["dynamic_sampling/raw_data_epoch_end"] = epoch
+                        batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(-1).tolist()
+                        batch.meta_info["images_seqlens"] = []
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
@@ -1463,7 +1535,10 @@ class RayPPOTrainer:
                             groups, dtype=torch.int64, device=batch.batch.device
                         )
                         batch.meta_info["eu_derpo_rollout_n"] = self.config.actor_rollout_ref.rollout.n
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    if no_old_recompute:
+                        # V1.7 has no old-policy snapshot; actual-F uses raw rollout behavior directly.
+                        metrics["actor/eu_derpo/old_recompute_enabled"] = 0.0
+                    elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -1550,7 +1625,7 @@ class RayPPOTrainer:
                                     )
                                 )
 
-                    required_policy_logp = "old_log_probs"
+                    required_policy_logp = "rollout_log_probs" if no_old_recompute else "old_log_probs"
                     assert required_policy_logp in batch.batch, f'"{required_policy_logp}" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
@@ -1587,6 +1662,7 @@ class RayPPOTrainer:
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
                         if (
                             rollout_corr_config is not None
+                            and not no_old_recompute
                             and "rollout_log_probs" in batch.batch
                             and not bypass_recomputing_logprobs  # Only in decoupled mode
                         ):
@@ -1718,6 +1794,9 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                if dynamic_sampling:
+                    sampling = None
+                    logical_timing = {}
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1742,3 +1821,8 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+        if no_old_recompute and self.global_steps <= self.total_training_steps:
+            raise RuntimeError(
+                f"V1.7 raw-data epoch safety ceiling ({self.config.trainer.total_epochs}) exhausted: "
+                f"completed {self.global_steps - 1}/{self.total_training_steps} optimizer updates"
+            )

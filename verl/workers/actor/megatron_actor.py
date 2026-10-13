@@ -329,7 +329,7 @@ class MegatronPPOActor(BasePPOActor):
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
             )
-            if self.config.eu_derpo.version == "1.6":
+            if self.config.eu_derpo.version in {"1.6", "1.7"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
                 mctr = self.config.eu_derpo.mctr
                 self.mctr_controller = P95MCTRController(
@@ -1355,6 +1355,14 @@ class MegatronPPOActor(BasePPOActor):
                                 ("delta_beh", stats_eu.delta_total[active]),
                                 ("delta_align", stats_eu.delta_update[active]),
                                 ("delta_eng", stats_eu.delta_engine[active]),
+                            ):
+                                values = _gather_diagnostic_values(values)
+                                for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
+                                    metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
+                        elif self.config.eu_derpo.version == "1.7":
+                            for prefix, values in (
+                                ("rho_e_beh", stats_eu.rho[active]),
+                                ("d_beh", stats_eu.divergence[active]),
                             ):
                                 values = _gather_diagnostic_values(values)
                                 for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
