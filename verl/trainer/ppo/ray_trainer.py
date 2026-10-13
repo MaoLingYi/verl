@@ -1510,6 +1510,15 @@ class RayPPOTrainer:
                         batch.meta_info["images_seqlens"] = []
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    if no_old_recompute and "overlong_reward" in reward_extra_infos_dict:
+                        metrics.update(
+                            {
+                                "overlong/count": int(np.count_nonzero(reward_extra_infos_dict["overlong"])),
+                                "overlong/rate": float(np.mean(reward_extra_infos_dict["overlong"])),
+                                "overlong_reward/mean": float(np.mean(reward_extra_infos_dict["overlong_reward"])),
+                                "overlong_reward/min": float(np.min(reward_extra_infos_dict["overlong_reward"])),
+                            }
+                        )
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)

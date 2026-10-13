@@ -354,8 +354,11 @@ def fit_harness(monkeypatch, version, rounds, *, steps=1, target=128, batches_pe
     def extract(data):
         if hasattr(data, "correctness"):
             assert "acc" not in data.non_tensor_batch
-            return data.batch["rm_scores"], {"acc": data.correctness}
-        return data.batch["rm_scores"], {"acc": data.non_tensor_batch["acc"]}
+        extras = {
+            key: data.correctness if key == "acc" and hasattr(data, "correctness") else data.non_tensor_batch[key]
+            for key in data.meta_info["reward_extra_keys"]
+        }
+        return data.batch["rm_scores"], extras
 
     source = ast.parse((ROOT / "verl/trainer/ppo/ray_trainer.py").read_text(encoding="utf-8"))
     cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "RayPPOTrainer")

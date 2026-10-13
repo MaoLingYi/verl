@@ -11,13 +11,14 @@ import numpy as np
 
 def response_length_metrics(lengths, prefix, response_limit):
     values = np.asarray(lengths, dtype=np.int64)
+    hit_rate_key = "hit_16k_rate" if response_limit == 16384 else "hit_8k_rate"
     return {
         f"{prefix}/mean": float(values.mean()),
         f"{prefix}/p50": float(np.quantile(values, 0.50)),
         f"{prefix}/p90": float(np.quantile(values, 0.90)),
         f"{prefix}/p95": float(np.quantile(values, 0.95)),
         f"{prefix}/max": int(values.max()),
-        f"{prefix}/hit_8k_rate": float((values >= response_limit).mean()),
+        f"{prefix}/{hit_rate_key}": float((values >= response_limit).mean()),
     }
 
 
