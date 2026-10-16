@@ -57,32 +57,23 @@ if not mcore_ge_014:
 
 
 def _prepare_mcore_016_hdo_dp_reshardable_resume(
-    optimizer, is_loading: bool, metadata: dict, full_resume: bool
+    optimizer, is_loading: bool, metadata: dict, full_resume: bool, *, cold_restore=False
 ) -> bool:
-    if not (
-        mcore_016
-        and is_loading
-        and full_resume
-        and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
-    ):
+    if not is_loading:
         return False
-
-    from megatron.core.optimizer import ChainedOptimizer
-    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-
-    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
-    found_hdo = False
+    optimizers = _mcore_016_hdo_resume_optimizers(optimizer, metadata, full_resume)
+    if cold_restore and any(not opt.optimizer.state for opt in optimizers):
+        raise RuntimeError("HDO cold resume state bootstrap missing")
     for distributed_optimizer in optimizers:
-        if not (
-            isinstance(distributed_optimizer, DistributedOptimizer)
-            and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
-        ):
-            continue
-        found_hdo = True
         if not distributed_optimizer.optimizer.state:
             distributed_optimizer.optimizer.dummy_step()
-    return found_hdo
+    return bool(optimizers)
+
+
+def _mcore_016_hdo_resume_needs_bootstrap(optimizer, metadata, full_resume):
+    return any(
+        not opt.optimizer.state for opt in _mcore_016_hdo_resume_optimizers(optimizer, metadata, full_resume)
+    )
 
 
 def _mcore_016_hdo_resume_optimizers(optimizer, metadata, full_resume):
@@ -417,6 +408,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         generate_extra: bool = True,
         is_loading: bool = False,
         metadata: dict | None = None,
+        cold_restore: bool = False,
     ):
         # For save dist checkpointing
         state_dict = {}
@@ -453,6 +445,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 is_loading,
                 base_metadata,
                 full_resume=generate_model and generate_optimizer and generate_extra,
+                cold_restore=cold_restore,
             ):
                 # Before the real payload load, MCore 0.16's loading-only self-load can rebuild
                 # CPU-offloaded HDO mappings while state is still keyed by previous parameter
@@ -616,6 +609,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 load_extra,
                 is_loading=True,
                 metadata=sharded_sd_metadata,
+                cold_restore=cold_restore,
             )
             log_with_rank(
                 f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=self.rank, logger=logger

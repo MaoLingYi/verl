@@ -44,7 +44,11 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.ppo.eu_derpo import policy_prepass_tensors
 from verl.utils import hf_tokenizer
-from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+from verl.utils.checkpoint.megatron_checkpoint_manager import (
+    MegatronCheckpointManager,
+    _mcore_016_hdo_resume_needs_bootstrap,
+    _prepare_mcore_016_hdo_dp_reshardable_resume,
+)
 from verl.utils.checkpoint.megatron_checkpoint_manager import mcore_016 as checkpoint_mcore_016
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES
@@ -1703,9 +1707,24 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 if stage == "after_model_restore":
                     offload_megatron_model_to_cpu(self.actor_module)
 
+            primary_error = None
             try:
                 # Keep optimizer tensors cold; the first training update restores normal HDO residency.
+                offload_megatron_model_to_cpu(self.actor_module)
                 self._offload_actor_optimizer()
+                metadata = self.checkpoint_mananager._build_sharded_state_dict_metadata()
+                if _mcore_016_hdo_resume_needs_bootstrap(self.actor_optimizer, metadata, True):
+                    restore_stage("before_hdo_bootstrap")
+                    load_megatron_optimizer(self.actor_optimizer)
+                    restore_stage("after_hdo_onload_for_bootstrap")
+                    # MCore dummy_step uses real CUDA/D2H work; the model must stay offloaded.
+                    _prepare_mcore_016_hdo_dp_reshardable_resume(self.actor_optimizer, True, metadata, True)
+                    restore_stage("after_hdo_dummy_bootstrap")
+                    self._offload_actor_optimizer()
+                    restore_stage("after_hdo_bootstrap_offload")
+                    aggressive_empty_cache(force_sync=True)
+                    _best_effort_release_host_allocator_after_copy_param_restore()
+                    restore_stage("after_hdo_bootstrap_reclaim")
                 load_megatron_model_to_gpu(self.actor_module)
                 self.checkpoint_mananager.load_checkpoint(
                     local_path=checkpoint_path,
@@ -1715,12 +1734,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     cold_restore=True,
                     stage_callback=restore_stage,
                 )
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
-                offload_megatron_model_to_cpu(self.actor_module)
-                self._offload_actor_optimizer()
-                aggressive_empty_cache(force_sync=True)
-                _best_effort_release_host_allocator_after_copy_param_restore()
-                restore_stage("after_full_restore_cleanup")
+                cleanup_error = None
+                for cleanup in (
+                    lambda: offload_megatron_model_to_cpu(self.actor_module),
+                    self._offload_actor_optimizer,
+                    lambda: aggressive_empty_cache(force_sync=True),
+                    _best_effort_release_host_allocator_after_copy_param_restore,
+                    lambda: restore_stage("after_full_restore_cleanup"),
+                ):
+                    try:
+                        cleanup()
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                        logger.warning("Cold HDO restore cleanup failed", exc_info=True)
+                if primary_error is None and cleanup_error is not None:
+                    raise cleanup_error
             return
 
         if staged_restore and not full_state_hdo_restore:

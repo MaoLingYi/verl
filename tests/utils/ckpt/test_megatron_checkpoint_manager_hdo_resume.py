@@ -243,6 +243,7 @@ def _production_methods(*, mcore_016=True):
             "_prepare_mcore_016_hdo_dp_reshardable_resume",
             "_load_mcore_016_hdo_checkpoint_state",
             "_mcore_016_hdo_resume_optimizers",
+            "_mcore_016_hdo_resume_needs_bootstrap",
         }
     ]
     for helper in helpers:
@@ -763,6 +764,63 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertTrue(hdo.state)
         self.assertEqual(optimizer.loading_flags, [False])
         self.assertEqual(state_dict["optimizer"], {"template": True})
+
+    def test_cold_empty_hdo_fails_before_dummy_or_checkpoint_io(self):
+        hdo = HybridDeviceOptimizer(initialized=False)
+        optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
+        manager = _manager(optimizer)
+        with self.assertRaisesRegex(RuntimeError, "HDO cold resume state bootstrap missing"):
+            manager.generate_state_dict(is_loading=True, cold_restore=True)
+        self.assertEqual(hdo.dummy_steps, 0)
+        self.assertEqual(optimizer.loading_flags, [])
+
+    def test_bootstrap_query_is_scoped_and_template_does_not_repeat_dummy(self):
+        methods = _production_methods()
+        needs = methods["_mcore_016_hdo_resume_needs_bootstrap"]
+        prepare = methods["_prepare_mcore_016_hdo_dp_reshardable_resume"]
+        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
+        hdos = [HybridDeviceOptimizer(initialized=False), HybridDeviceOptimizer(initialized=True)]
+        optimizer = ChainedOptimizer(*(DistributedOptimizer(hdo) for hdo in hdos))
+        self.assertTrue(needs(optimizer, metadata, True))
+        self.assertFalse(needs(optimizer, metadata, False))
+        self.assertFalse(needs(optimizer, {"distrib_optim_sharding_type": "other"}, True))
+        self.assertFalse(needs(OrdinaryOptimizer(), metadata, True))
+        self.assertFalse(needs(ChainedOptimizer(DistributedOptimizer(object())), metadata, True))
+        self.assertFalse(_production_methods(mcore_016=False)["_mcore_016_hdo_resume_needs_bootstrap"](
+            optimizer, metadata, True))
+        prepare(optimizer, True, metadata, True)
+        self.assertFalse(needs(optimizer, metadata, True))
+        _manager(optimizer).generate_state_dict(is_loading=True, cold_restore=True)
+        _manager(optimizer).generate_state_dict(is_loading=True, cold_restore=True)
+        self.assertEqual([hdo.dummy_steps for hdo in hdos], [1, 0])
+
+    def test_cold_checkpoint_tensors_override_every_dummy_bootstrap_value(self):
+        chain, distributed, hdo, params, checkpoint, events = _cold_restore_case()
+        methods = _production_methods()
+        hdo.state.clear()
+
+        def dummy():
+            hdo.dummy_steps += 1
+            for group in hdo.param_groups:
+                for param in group["params"]:
+                    param.fill_(-999)
+                    hdo.state[param] = {"exp_avg": torch.full_like(param, 111),
+                                        "exp_avg_sq": torch.full_like(param, 222),
+                                        "master_param": torch.full_like(param, 333), "step": torch.tensor(1)}
+
+        hdo.dummy_step = dummy
+        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
+        methods["_prepare_mcore_016_hdo_dp_reshardable_resume"](chain, True, metadata, True)
+        self.assertEqual(hdo.dummy_steps, 1)
+        original_load = hdo.load_state_dict
+        methods["_load_mcore_016_hdo_checkpoint_state"](chain, checkpoint, metadata, True, cold_restore=True)
+        for param, source in zip(params, checkpoint["param_state"]):
+            torch.testing.assert_close(param, source["param"])
+            for key in ("exp_avg", "exp_avg_sq", "master_param"):
+                torch.testing.assert_close(hdo.state[param][key], source[key])
+            self.assertEqual(hdo.state[param]["step"].item(), 250)
+        self.assertIs(hdo.load_state_dict, original_load)
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
 
     def test_scope_excludes_save_ordinary_and_other_format(self):
         save_optimizer = ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer(initialized=True)))

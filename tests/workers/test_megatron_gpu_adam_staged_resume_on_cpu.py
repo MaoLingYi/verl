@@ -7,9 +7,12 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import ast
+import importlib.util
 import unittest
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+
+import torch
 
 
 WORKER = Path(__file__).resolve().parents[2] / "verl" / "workers" / "megatron_workers.py"
@@ -71,7 +74,7 @@ class CheckpointManager:
 
 def _staged_worker(
     events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True,
-    gpu_adam=True, hdo=False,
+    gpu_adam=True, hdo=False, empty_hdo=False,
 ):
     residency = {"model": False, "optimizer": False}
 
@@ -103,7 +106,16 @@ def _staged_worker(
         residency["optimizer"] = False
         events.append("optimizer_offload")
 
+    def dummy_bootstrap():
+        assert residency == {"model": False, "optimizer": True}
+        events.append("dummy_bootstrap")
+        if fail_stage == "bootstrap":
+            raise RuntimeError("bootstrap failed")
+        worker.actor_optimizer.state = {"dummy": {"step": 1}}
+
     namespace = {
+        "_mcore_016_hdo_resume_needs_bootstrap": lambda optimizer, *args: not optimizer.state,
+        "_prepare_mcore_016_hdo_dp_reshardable_resume": lambda *args: dummy_bootstrap(),
         "load_megatron_model_to_gpu": model_onload,
         "offload_megatron_model_to_cpu": model_offload,
         "load_megatron_optimizer": optimizer_onload,
@@ -124,7 +136,7 @@ def _staged_worker(
         "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
         "logger": SimpleNamespace(
-            warning=lambda message, *args: events.append(("warning", message % args))
+            warning=lambda message, *args, **kwargs: events.append(("warning", message % args))
         ),
         "_GIB": 1024**3,
     }
@@ -132,7 +144,7 @@ def _staged_worker(
         _is_offload_param=True,
         _is_offload_optimizer=True,
         actor_module=object(),
-        actor_optimizer=object(),
+        actor_optimizer=SimpleNamespace(state={} if empty_hdo else {"existing": {}}),
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
         _hdo_optimizer_residency_preserved=True,
     )
@@ -149,6 +161,125 @@ def _staged_worker(
 
 
 class TestMegatronGPUAdamStagedResume(unittest.TestCase):
+    def test_empty_hdo_bootstraps_once_before_model_onload_and_returns_to_native_update(self):
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True, empty_hdo=True)
+
+        def load(**kwargs):
+            self.assertTrue(worker.actor_optimizer.state)
+            self.assertEqual(residency, {"model": True, "optimizer": False})
+            events.append("model_restore")
+            kwargs["stage_callback"]("after_model_restore")
+            self.assertEqual(residency, {"model": False, "optimizer": False})
+            events.append("optimizer_restore")
+
+        worker.checkpoint_mananager.load_checkpoint = load
+        worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        order = ["before_hdo_bootstrap", "optimizer_onload", "after_hdo_onload_for_bootstrap",
+                 "dummy_bootstrap", "after_hdo_dummy_bootstrap", "after_hdo_bootstrap_offload",
+                 "after_hdo_bootstrap_reclaim", "model_onload", "model_restore", "after_model_restore",
+                 "optimizer_restore", "after_full_restore_cleanup"]
+        positions = [events.index(event) for event in order]
+        self.assertEqual(positions, sorted(positions))
+        bootstrap_end = events.index("after_hdo_bootstrap_reclaim")
+        self.assertIn("optimizer_offload", events[events.index("dummy_bootstrap"):bootstrap_end])
+        self.assertIn("empty_cache", events[events.index("after_hdo_bootstrap_offload"):bootstrap_end])
+        self.assertIn("host_reclaim", events[:bootstrap_end])
+        self.assertEqual(events.count("dummy_bootstrap"), 1)
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertTrue(worker._load_actor_optimizer_for_update())
+        self.assertEqual(events[-1], "optimizer_onload")
+        self.assertEqual(events.count("dummy_bootstrap"), 1)
+
+    def test_bootstrap_and_restore_failures_preserve_primary_even_when_cleanup_fails(self):
+        for phase in ("bootstrap", "model", "optimizer"):
+            with self.subTest(phase=phase):
+                events = []
+                worker, residency = _staged_worker(events, gpu_adam=False, hdo=True, empty_hdo=True)
+                namespace = worker.load_checkpoint.__func__.__globals__
+                primary = RuntimeError(phase + " primary failure")
+
+                def fail():
+                    raise primary
+
+                if phase == "bootstrap":
+                    namespace["_prepare_mcore_016_hdo_dp_reshardable_resume"] = lambda *args: fail()
+
+                def load(**kwargs):
+                    if phase == "optimizer":
+                        kwargs["stage_callback"]("after_model_restore")
+                    fail()
+
+                worker.checkpoint_mananager.load_checkpoint = load
+                namespace["aggressive_empty_cache"] = lambda **kwargs: (
+                    (_ for _ in ()).throw(RuntimeError("cleanup CUDA failure"))
+                    if (phase == "bootstrap" or "model_onload" in events) else None
+                )
+                with self.assertRaises(RuntimeError) as error:
+                    worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+                self.assertIs(error.exception, primary)
+                self.assertEqual(residency, {"model": False, "optimizer": False})
+                self.assertTrue(any(isinstance(event, tuple) and event[0] == "warning" for event in events))
+                self.assertEqual(events[-1], "after_full_restore_cleanup")
+                if phase == "bootstrap":
+                    self.assertNotIn("model_onload", events)
+
+    @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
+    def test_real_mcore_cold_restore_empty_hdo_bootstrap_lifecycle(self):
+        self._check_real_dummy_bootstrap("cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available() and importlib.util.find_spec("megatron") is not None,
+                         "requires CUDA and Megatron-Core")
+    def test_real_mcore_gpu_cold_restore_empty_hdo_bootstrap_lifecycle(self):
+        self._check_real_dummy_bootstrap("cuda")
+
+    def _check_real_dummy_bootstrap(self, device):
+        import megatron.core
+        from packaging import version
+        from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer as RealHDO
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer as RealDistributed
+        from verl.utils.checkpoint.megatron_checkpoint_manager import (
+            _mcore_016_hdo_resume_needs_bootstrap, _prepare_mcore_016_hdo_dp_reshardable_resume,
+        )
+
+        if version.parse(megatron.core.__version__).release[:2] != (0, 16):
+            self.skipTest("requires Megatron-Core 0.16.x")
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True, empty_hdo=True)
+        param = torch.zeros(2, device=device)
+        hdo = object.__new__(RealHDO)
+        torch.optim.Optimizer.__init__(hdo, [param], {"lr": 1e-6})
+        self.assertFalse(hdo.state)
+
+        def instrumented_step(self):
+            # Real dummy_step creates gradients and calls this step at the residency boundary.
+            assert residency == {"model": False, "optimizer": True}
+            assert param.grad is not None
+            events.append("real_dummy_step_entry")
+            self.state[param] = {"step": torch.tensor(1), "exp_avg": torch.full_like(param, 111)}
+
+        hdo.step = MethodType(instrumented_step, hdo)
+        distributed = object.__new__(RealDistributed)
+        distributed.optimizer = hdo
+        worker.actor_optimizer = distributed
+        namespace = worker.load_checkpoint.__func__.__globals__
+        namespace["_mcore_016_hdo_resume_needs_bootstrap"] = _mcore_016_hdo_resume_needs_bootstrap
+        namespace["_prepare_mcore_016_hdo_dp_reshardable_resume"] = _prepare_mcore_016_hdo_dp_reshardable_resume
+
+        def load(**kwargs):
+            self.assertEqual(hdo.state[param]["step"].item(), 1)
+            self.assertIsNone(param.grad)
+            self.assertFalse(_mcore_016_hdo_resume_needs_bootstrap(distributed,
+                             {"distrib_optim_sharding_type": "dp_reshardable"}, True))
+            self.assertTrue(_prepare_mcore_016_hdo_dp_reshardable_resume(distributed, True,
+                            {"distrib_optim_sharding_type": "dp_reshardable"}, True, cold_restore=True))
+            kwargs["stage_callback"]("after_model_restore")
+
+        worker.checkpoint_mananager.load_checkpoint = load
+        worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        self.assertEqual(events.count("real_dummy_step_entry"), 1)
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+
     def test_explicit_hdo_resume_uses_full_state_contents_and_cleans_residency(self):
         events = []
         worker, residency = _staged_worker(events, gpu_adam=False, hdo=True)
@@ -179,6 +310,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertEqual(restored, saved)
         self.assertEqual(events.count("full_state_restore"), 1)
         self.assertNotIn("optimizer_onload", events)
+        self.assertNotIn("dummy_bootstrap", events)
         self.assertLess(events.index("optimizer_offload"), events.index("model_onload"))
         self.assertLess(events.index("after_model_restore_reclaim"), events.index("before_optimizer_common_restore"))
         self.assertLess(events.index("full_state_restore"), events.index("host_reclaim"))
