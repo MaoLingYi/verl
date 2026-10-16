@@ -159,7 +159,7 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
                 "os": fake_os,
                 "find_latest_ckpt_path": lambda path: os.path.join(path, "global_step_100"),
                 "Role": SimpleNamespace(Critic="critic"),
-                "torch": SimpleNamespace(load=lambda *args, **kwargs: {"cursor": 100}),
+                "torch": SimpleNamespace(load=lambda *args, **kwargs: {"cursor": 100, "eu_derpo_raw_data_epoch": 7}),
             },
         )
 
@@ -174,7 +174,10 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
                 del_local_ckpt_after_load=False,
             )
             trainer = SimpleNamespace(
-                config=ConfigNode(trainer=trainer_config),
+                config=ConfigNode(
+                    trainer=trainer_config,
+                    actor_rollout_ref=ConfigNode(actor=ConfigNode(eu_derpo=ConfigNode(enabled=True, version="1.7"))),
+                ),
                 actor_rollout_wg=SimpleNamespace(
                     load_checkpoint=lambda *args, **kwargs: calls.append((args, kwargs))
                 ),
@@ -188,6 +191,8 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
             self.assertIs(calls[0][1]["staged_restore"], expected_staged)
             self.assertEqual(dataloader_states, [{"cursor": 100}])
             self.assertEqual(trainer.global_steps, 100)
+            self.assertEqual(trainer.raw_data_epoch, 7)
+            self.assertTrue(trainer._raw_dataloader_resumed)
 
     def test_fresh_run_keeps_rollout_initialization_before_checkpoint_load(self):
         events = ["actor_init"]

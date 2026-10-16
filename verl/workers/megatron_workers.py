@@ -160,6 +160,19 @@ def _is_gpu_adam_distributed_optimizer(optimizer):
     )
 
 
+def _is_hdo_distributed_optimizer(optimizer):
+    from megatron.core.optimizer import ChainedOptimizer
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
+    return bool(optimizers) and all(
+        isinstance(distributed_optimizer, DistributedOptimizer)
+        and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
+        for distributed_optimizer in optimizers
+    )
+
+
 def _log_resume_memory(stage):
     host = psutil.virtual_memory()
     device = get_torch_device()
@@ -1076,6 +1089,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         local_bytes = before_estimate["optimizer_phase_cuda_copy_param_bytes"]
         if local_bytes <= 0:
             raise RuntimeError("EU-DERPO selective rollout offload found no CUDA optimizer copy params")
+        observer = getattr(self.actor, "eu_derpo_observer", None)
+        if observer is not None and (
+            observer.mode is not None or observer._hidden_cache is not None or observer._support_cache is not None
+        ):
+            raise RuntimeError("EU-DERPO copy-param offload requires completed actor update and cleared cache")
+        get_torch_device().synchronize()
+        before_reclaim = log_eu_derpo_memory("before_post_cache_host_reclaim", self.actor_optimizer)
+        reclaim_started = time.perf_counter()
+        reclaim = _best_effort_release_host_allocator_after_copy_param_restore()
+        reclaim_elapsed = time.perf_counter() - reclaim_started
+        log_eu_derpo_memory(
+            "after_post_cache_host_reclaim",
+            self.actor_optimizer,
+            extra={
+                **reclaim,
+                "host_reclaim_elapsed_s": reclaim_elapsed,
+                "mem_available_gain_gib": (
+                    psutil.virtual_memory().available / _GIB - before_reclaim["mem_available_gib"]
+                ),
+                "rss_drop_gib": before_reclaim["rss_gib"] - psutil.Process().memory_info().rss / _GIB,
+            },
+        )
         host = self._optimizer_copy_param_host_preflight(local_bytes)
         log_eu_derpo_memory(
             "before_optimizer_copy_param_offload",
@@ -1638,7 +1673,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint", logger=logger)
             return
 
+        full_state_hdo_restore = False
         if staged_restore:
+            full_state_hdo_restore = _is_hdo_distributed_optimizer(self.actor_optimizer)
             if not (
                 self._is_offload_param
                 and self._is_offload_optimizer
@@ -1646,13 +1683,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 and self.checkpoint_mananager.should_load_model
                 and self.checkpoint_mananager.should_load_optimizer
                 and self.checkpoint_mananager.should_load_extra
-                and _is_gpu_adam_distributed_optimizer(self.actor_optimizer)
+                and (_is_gpu_adam_distributed_optimizer(self.actor_optimizer) or full_state_hdo_restore)
             ):
                 raise RuntimeError(
-                    "Staged resume requires full model/optimizer/extra DCP loading with param_offload=true, "
-                    "optimizer_offload=true, and DistributedOptimizer + TransformerEngine FusedAdam"
+                    "Explicit resume requires full model/optimizer/extra DCP loading with param_offload=true, "
+                    "optimizer_offload=true, and DistributedOptimizer + FusedAdam or HybridDeviceOptimizer"
                 )
 
+        if staged_restore and not full_state_hdo_restore:
             _log_resume_memory("actor_initialized")
             _reset_resume_peak_memory()
             model_before_memory = _log_resume_memory("before_model_load")
@@ -1723,7 +1761,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             load_megatron_optimizer(self.actor_optimizer)
         try:
             self.checkpoint_mananager.load_checkpoint(
-                local_path=checkpoint_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+                local_path=checkpoint_path,
+                hdfs_path=hdfs_path,
+                del_local_after_load=del_local_after_load,
+                # Explicit contents also restore the saved scheduler on the HDO full-state path.
+                load_contents=("model", "optimizer", "extra") if full_state_hdo_restore else None,
             )
         finally:
             if self._is_offload_param:

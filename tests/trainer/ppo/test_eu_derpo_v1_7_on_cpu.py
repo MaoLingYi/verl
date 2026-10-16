@@ -538,6 +538,22 @@ def test_real_fit_restored_loader_position_is_not_reseeded(monkeypatch):
     assert [entry["training/global_step"] for entry in logs] == [2, 3]
 
 
+def test_explicit_resume_250_runs_updates_251_through_absolute_target_370(monkeypatch):
+    trainer, run, updates, _, logs = fit_harness(
+        monkeypatch, "1.7", [1] * 120, steps=370, target=1, batches_per_epoch=1, epochs=130,
+    )
+
+    def restore():
+        trainer.global_steps = 250
+        trainer.raw_data_epoch = 0
+        trainer._raw_dataloader_resumed = True
+
+    trainer._load_checkpoint = restore
+    run()
+    assert len(updates) == 120
+    assert [entry["training/global_step"] for entry in logs] == list(range(251, 371))
+
+
 @pytest.mark.parametrize("version", ["1.6", "1.7"])
 def test_production_dataloader_checkpoint_blocks_preserve_state_and_raw_epoch(version):
     source = ast.parse((ROOT / "verl/trainer/ppo/ray_trainer.py").read_text(encoding="utf-8"))

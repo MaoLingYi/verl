@@ -206,7 +206,7 @@ def _production_methods(*, mcore_016=True):
     methods = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"generate_state_dict", "load_checkpoint"}
+        if isinstance(node, ast.FunctionDef) and node.name in {"generate_state_dict", "load_checkpoint", "load_rng_states"}
     ]
     helpers = [
         node
@@ -259,6 +259,24 @@ def _generate_state_dict(*, mcore_016=True):
 
 
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_rng_loader_restores_all_actor_rng_domains(self):
+        restored = {}
+        methods = _production_methods()
+        load = methods["load_rng_states"]
+        load.__globals__.update(
+            random=SimpleNamespace(setstate=lambda state: restored.update(python=state)),
+            np=SimpleNamespace(random=SimpleNamespace(set_state=lambda state: restored.update(numpy=state))),
+            torch=SimpleNamespace(set_rng_state=lambda state: restored.update(torch=state)),
+            get_device_name=lambda: "cuda",
+            get_torch_device=lambda: SimpleNamespace(set_rng_state=lambda state: restored.update(cuda=state)),
+            tensor_parallel=SimpleNamespace(get_cuda_rng_tracker=lambda: SimpleNamespace(
+                set_states=lambda state: restored.update(tracker=state))),
+        )
+        load(None, [{"random_rng_state": "python", "np_rng_state": "numpy", "torch_rng_state": "torch",
+                     "cuda_rng_state": "cuda", "rng_tracker_states": {"tracker": 250}}])
+        self.assertEqual(restored, {"python": "python", "numpy": "numpy", "torch": "torch",
+                                    "cuda": "cuda", "tracker": {"tracker": 250}})
+
     def test_eu_derpo_controller_extra_state_survives_mocked_dcp_round_trip(self):
         eu_path = MANAGER.parents[2] / "trainer" / "ppo" / "eu_derpo.py"
         spec = importlib.util.spec_from_file_location("eu_derpo_checkpoint_test", eu_path)
@@ -491,9 +509,18 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertEqual(state_dict["rng_state"], {"rng": "extra-template"})
 
     def test_final_optimizer_restore_preserves_checkpoint_state(self):
+        self._check_full_hdo_restore(explicit=False)
+
+    def test_explicit_full_hdo_restore_includes_scheduler_and_controller(self):
+        self._check_full_hdo_restore(explicit=True)
+
+    def _check_full_hdo_restore(self, *, explicit):
         parameter = SimpleNamespace(value="initial-model")
         rng = SimpleNamespace(value="initial-rng")
         scheduler = SimpleNamespace(step_calls=0, state_dict=lambda: {"scheduler": "initial"})
+        scheduler.loaded = []
+        scheduler.load_state_dict = lambda state: scheduler.loaded.append(dict(state))
+        controller_states = []
         hdo = HybridDeviceOptimizer(initialized=True, parameter=parameter, rng=rng, realistic_restore=True)
         optimizer = ChainedOptimizer(DistributedOptimizer(hdo))
         manager = _manager(optimizer, Model(parameter))
@@ -528,6 +555,8 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
             "model": {"weight": "checkpoint-model"},
             "optimizer": checkpoint_optimizer_state,
             "rng_state": {"value": "checkpoint-rng"},
+            "lr_scheduler": {"num_steps": 250},
+            "eu_derpo_controller": {"mctr_delta_current": 0.013, "mctr_controller_step": 250},
         }
         manager.generate_state_dict = MethodType(methods["generate_state_dict"], manager)
         manager.load_checkpoint = MethodType(methods["load_checkpoint"], manager)
@@ -544,8 +573,12 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         manager.peft_cls = None
         manager.global_step = 1
         manager.load_rng_states = lambda state: setattr(rng, "value", state["value"])
+        manager.extra_state_loader = lambda state: controller_states.append(dict(state))
 
-        manager.load_checkpoint("checkpoint", del_local_after_load=False)
+        manager.load_checkpoint(
+            "checkpoint", del_local_after_load=False,
+            load_contents=("model", "optimizer", "extra") if explicit else None,
+        )
 
         self.assertEqual(hdo.dummy_steps, 0)
         self.assertEqual(parameter.value, "checkpoint-model")
@@ -569,6 +602,8 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertEqual(rng.value, "checkpoint-rng")
         self.assertEqual(manager.global_step, 1)
         self.assertEqual(scheduler.step_calls, 0)
+        self.assertEqual(scheduler.loaded, [{"num_steps": 250}] if explicit else [])
+        self.assertEqual(controller_states, [{"mctr_delta_current": 0.013, "mctr_controller_step": 250}])
 
     def test_final_restore_compatibility_scope_is_exact(self):
         checkpoint_state = {"checkpoint": "state"}

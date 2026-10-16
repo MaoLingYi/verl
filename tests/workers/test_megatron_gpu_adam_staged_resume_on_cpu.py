@@ -67,7 +67,8 @@ class CheckpointManager:
 
 
 def _staged_worker(
-    events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True
+    events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True,
+    gpu_adam=True, hdo=False,
 ):
     residency = {"model": False, "optimizer": False}
 
@@ -91,7 +92,7 @@ def _staged_worker(
         events.append("model_offload")
 
     def optimizer_onload(optimizer):
-        assert not residency["model"]
+        assert hdo or not residency["model"]
         residency["optimizer"] = True
         events.append("optimizer_onload")
 
@@ -111,7 +112,8 @@ def _staged_worker(
             AssertionError("selective helper must not be called during staged resume")
         ),
         "aggressive_empty_cache": lambda **kwargs: events.append("empty_cache"),
-        "_is_gpu_adam_distributed_optimizer": lambda optimizer: True,
+        "_is_gpu_adam_distributed_optimizer": lambda optimizer: gpu_adam,
+        "_is_hdo_distributed_optimizer": lambda optimizer: hdo,
         "_log_resume_memory": log_memory,
         "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
@@ -135,6 +137,56 @@ def _staged_worker(
 
 
 class TestMegatronGPUAdamStagedResume(unittest.TestCase):
+    def test_explicit_hdo_resume_uses_full_state_contents_and_cleans_residency(self):
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True)
+        restored = {}
+        saved = {
+            "model": "checkpoint-model", "optimizer": {"step": 250},
+            "lr_scheduler": {"num_steps": 250},
+            "eu_derpo_controller": {"mctr_delta_current": 0.013, "mctr_controller_step": 250},
+            "rng_state": {"python": 1, "numpy": 2, "torch": 3, "cuda": 4, "tracker": 5},
+        }
+
+        def load(**kwargs):
+            self.assertEqual(kwargs["local_path"], "global_step_250/actor")
+            self.assertEqual(kwargs["load_contents"], ("model", "optimizer", "extra"))
+            self.assertEqual(residency, {"model": True, "optimizer": True})
+            # The real manager's explicit-contents scheduler/MCTR/RNG round trip is tested separately.
+            restored.update(saved)
+            events.append("full_state_restore")
+
+        worker.checkpoint_mananager.load_checkpoint = load
+        worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+
+        self.assertEqual(restored, saved)
+        self.assertEqual(events.count("full_state_restore"), 1)
+        self.assertLess(events.index("optimizer_onload"), events.index("full_state_restore"))
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertNotIn("reset_peak", events)
+
+    def test_explicit_resume_rejects_unsupported_optimizer_before_loading(self):
+        events = []
+        worker, _ = _staged_worker(events, gpu_adam=False)
+        with self.assertRaisesRegex(RuntimeError, "Explicit resume requires"):
+            worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        self.assertEqual(events, [])
+
+    def test_hdo_explicit_resume_failure_cleans_residency_without_retry(self):
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True)
+
+        def fail(**kwargs):
+            events.append("failed_load")
+            raise RuntimeError("corrupt payload")
+
+        worker.checkpoint_mananager.load_checkpoint = fail
+        with self.assertRaisesRegex(RuntimeError, "corrupt payload"):
+            worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        self.assertEqual(events.count("failed_load"), 1)
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+
     def test_none_checkpoint_keeps_existing_offload_only_path(self):
         events = []
         worker, residency = _staged_worker(events)
@@ -236,6 +288,23 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertTrue(predicate(ChainedOptimizer(DistributedOptimizer(FusedAdam()))))
         self.assertFalse(predicate(DistributedOptimizer(HybridDeviceOptimizer())))
         self.assertFalse(predicate(DistributedOptimizer(object())))
+        hdo_predicate = _module_function(
+            "_is_hdo_distributed_optimizer",
+            {
+                "HybridDeviceOptimizer": HybridDeviceOptimizer,
+                "DistributedOptimizer": DistributedOptimizer,
+                "ChainedOptimizer": ChainedOptimizer,
+            },
+            strip_imports=True,
+        )
+        self.assertTrue(hdo_predicate(DistributedOptimizer(HybridDeviceOptimizer())))
+        self.assertTrue(hdo_predicate(ChainedOptimizer(DistributedOptimizer(HybridDeviceOptimizer()))))
+        self.assertFalse(hdo_predicate(DistributedOptimizer(FusedAdam())))
+        self.assertFalse(hdo_predicate(DistributedOptimizer(object())))
+        self.assertFalse(hdo_predicate(ChainedOptimizer()))
+        self.assertFalse(hdo_predicate(ChainedOptimizer(
+            DistributedOptimizer(HybridDeviceOptimizer()), DistributedOptimizer(FusedAdam())
+        )))
 
     def test_host_memory_threshold_warns_and_returns_telemetry(self):
         memory = SimpleNamespace(used=850 * 1024**3, available=150 * 1024**3, percent=85.0)

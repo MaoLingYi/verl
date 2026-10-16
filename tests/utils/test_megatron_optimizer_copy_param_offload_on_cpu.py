@@ -427,3 +427,111 @@ def test_host_reclaim_is_selective_only_and_does_not_allocate_cpu_tensors():
     assert "_best_effort_release_host_allocator_after_copy_param_restore" not in worker_source[
         worker_source.index("    def load_checkpoint") : restore_start
     ]
+
+
+@pytest.mark.parametrize("checkpoint_hold", [False, True])
+def test_post_cache_reclaim_precedes_preflight_and_cpu_allocation(checkpoint_hold):
+    tree = ast.parse(WORKER.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ActorRolloutRefWorker")
+    names = {
+        "_offload_actor_optimizer_copy_params_for_rollout", "_finish_actor_update_residency",
+        "_release_checkpoint_residency_hold",
+    }
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    events, logs = [], {}
+    state = {"copy_cuda": True, "reclaimed": False}
+    observer = SimpleNamespace(mode="main", _hidden_cache=object(), _support_cache=object())
+
+    def estimate(_):
+        return {"optimizer_phase_cuda_copy_param_bytes": 64 if state["copy_cuda"] else 0,
+                "optimizer_phase_cuda_state_bytes": 80}
+
+    def log(stage, *args, **kwargs):
+        events.append(stage)
+        logs[stage] = kwargs.get("extra", {})
+        return {"mem_available_gib": 400., "rss_gib": 100.}
+
+    def reclaim():
+        assert observer.mode is None and observer._hidden_cache is None and observer._support_cache is None
+        assert "actor_update_complete" in events
+        events.append("reclaim")
+        state["reclaimed"] = True
+        return {"gc_collected": 1, "malloc_trim_attempted": 1, "malloc_trim_rc": 1}
+
+    def allocate(_):
+        assert state["reclaimed"]
+        events.append("cpu_allocation")
+        state["copy_cuda"] = False
+        return {"moved_bytes": 64, "moved_tensors": 1}
+
+    namespace = {
+        "_GIB": 1024**3, "time": time,
+        "estimate_optimizer_phase_offload_memory": estimate,
+        "_best_effort_release_host_allocator_after_copy_param_restore": reclaim,
+        "offload_megatron_optimizer_copy_params_to_cpu": allocate,
+        "log_eu_derpo_memory": log, "megatron_model_cpu_data_bytes": lambda _: 0,
+        "get_torch_device": lambda: SimpleNamespace(
+            synchronize=lambda: events.append("cuda_sync"), empty_cache=lambda: None),
+        "torch": SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
+        "psutil": SimpleNamespace(
+            Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=99 * 1024**3)),
+            virtual_memory=lambda: SimpleNamespace(available=401 * 1024**3)),
+        "offload_megatron_model_to_cpu": lambda _: events.append("model_offload"),
+        "is_megatron_model_offloaded": lambda _: False,
+        "log_gpu_memory_usage": lambda *args, **kwargs: None,
+        "aggressive_empty_cache": lambda **kwargs: None,
+        "logger": SimpleNamespace(warning=lambda *args: None),
+    }
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(WORKER), "exec"), namespace)
+    worker = SimpleNamespace(
+        actor=SimpleNamespace(eu_derpo_observer=observer), actor_module=object(), actor_optimizer=object(),
+        _optimizer_copy_params_offloaded_for_rollout=False, _is_offload_param=True,
+        _is_offload_optimizer=True, _checkpoint_training_residency_held=checkpoint_hold,
+        _selective_optimizer_copy_param_offload_enabled=lambda: True,
+        _preserve_hdo_optimizer_residency=lambda: True,
+        _actor_optimizer_residency=lambda: "TRAINING_RESIDENT",
+        _complete_optimizer_copy_param_transition=lambda *args: None,
+        config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=SimpleNamespace(
+            enabled=True, skip_post_checkpoint_optimizer_offload=True))),
+    )
+
+    def preflight(_):
+        events.append("preflight")
+        assert state["reclaimed"]
+        return {"node_required": 64, "safety_margin": 32 * 1024**3}
+
+    worker._optimizer_copy_param_host_preflight = preflight
+    offload = MethodType(namespace["_offload_actor_optimizer_copy_params_for_rollout"], worker)
+    worker._offload_actor_optimizer_copy_params_for_rollout = offload
+    with pytest.raises(RuntimeError, match="cleared cache"):
+        offload()
+    assert events == []
+    def clear():
+        observer.mode = observer._hidden_cache = observer._support_cache = None
+        events.append("observer_clear")
+
+    observer.clear = clear
+    observer._optimizer_generation = 250
+    observer_tree = ast.parse((ROOT / "verl/utils/debug/eu_derpo.py").read_text(encoding="utf-8"))
+    observer_cls = next(n for n in observer_tree.body if isinstance(n, ast.ClassDef) and n.name == "EUDERPOObserver")
+    finish = next(n for n in observer_cls.body if isinstance(n, ast.FunctionDef) and n.name == "finish_optimizer_step")
+    exec(compile(ast.Module(body=[finish], type_ignores=[]), "observer.finish_optimizer_step", "exec"), namespace)
+    assert namespace["finish_optimizer_step"](observer, 251)["cache_clear_count"] == 1
+    events.append("actor_update_complete")
+    if checkpoint_hold:
+        events.append("checkpoint_save_complete")
+        MethodType(namespace["_release_checkpoint_residency_hold"], worker)()
+    else:
+        MethodType(namespace["_finish_actor_update_residency"], worker)(False, True, True)
+    assert events.count("reclaim") == 1
+    order = ["observer_clear", "actor_update_complete", "model_offload", "cuda_sync",
+             "before_post_cache_host_reclaim", "reclaim", "after_post_cache_host_reclaim",
+             "preflight", "cpu_allocation"]
+    assert [events.index(item) for item in order] == sorted(events.index(item) for item in order)
+    assert logs["after_post_cache_host_reclaim"]["gc_collected"] == 1
+    assert logs["after_post_cache_host_reclaim"]["malloc_trim_rc"] == 1
+    assert logs["after_post_cache_host_reclaim"]["mem_available_gain_gib"] == 1
+    assert logs["after_post_cache_host_reclaim"]["rss_drop_gib"] == 1
+    assert logs["after_post_cache_host_reclaim"]["host_reclaim_elapsed_s"] >= 0
+    assert offload() is False  # Already offloaded: no duplicate reclaim/allocation.
+    assert events.count("reclaim") == 1
