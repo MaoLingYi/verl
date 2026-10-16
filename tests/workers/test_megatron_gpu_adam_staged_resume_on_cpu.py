@@ -42,6 +42,9 @@ class CheckpointManager:
     should_load_optimizer = True
     should_load_extra = True
 
+    def _build_sharded_state_dict_metadata(self):
+        return {"distrib_optim_sharding_type": "dp_reshardable"}
+
     def __init__(self, events, residency, fail_stage=None):
         self.events = events
         self.residency = residency
@@ -114,6 +117,9 @@ def _staged_worker(
         "aggressive_empty_cache": lambda **kwargs: events.append("empty_cache"),
         "_is_gpu_adam_distributed_optimizer": lambda optimizer: gpu_adam,
         "_is_hdo_distributed_optimizer": lambda optimizer: hdo,
+        "checkpoint_mcore_016": True,
+        "log_eu_derpo_memory": lambda stage, *args, **kwargs: events.append(stage),
+        "_best_effort_release_host_allocator_after_copy_param_restore": lambda: events.append("host_reclaim"),
         "_log_resume_memory": log_memory,
         "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
@@ -133,6 +139,12 @@ def _staged_worker(
     load_checkpoint, offload_actor = _worker_method(namespace)
     worker._offload_actor_optimizer = MethodType(offload_actor, worker)
     worker.load_checkpoint = MethodType(load_checkpoint, worker)
+    tree = ast.parse(WORKER.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    update_load = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_load_actor_optimizer_for_update")
+    exec(compile(ast.Module(body=[update_load], type_ignores=[]), str(WORKER), "exec"), namespace)
+    worker._load_actor_optimizer_for_update = MethodType(namespace[update_load.name], worker)
     return worker, residency
 
 
@@ -151,7 +163,12 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         def load(**kwargs):
             self.assertEqual(kwargs["local_path"], "global_step_250/actor")
             self.assertEqual(kwargs["load_contents"], ("model", "optimizer", "extra"))
-            self.assertEqual(residency, {"model": True, "optimizer": True})
+            self.assertEqual(residency, {"model": True, "optimizer": False})
+            self.assertTrue(kwargs["cold_restore"])
+            for stage in ("before_model_restore", "after_model_restore", "after_model_restore_reclaim",
+                          "before_optimizer_common_restore", "after_optimizer_common_restore",
+                          "before_optimizer_param_state_restore", "after_optimizer_param_state_restore"):
+                kwargs["stage_callback"](stage)
             # The real manager's explicit-contents scheduler/MCTR/RNG round trip is tested separately.
             restored.update(saved)
             events.append("full_state_restore")
@@ -161,10 +178,19 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
 
         self.assertEqual(restored, saved)
         self.assertEqual(events.count("full_state_restore"), 1)
-        self.assertLess(events.index("optimizer_onload"), events.index("full_state_restore"))
+        self.assertNotIn("optimizer_onload", events)
+        self.assertLess(events.index("optimizer_offload"), events.index("model_onload"))
+        self.assertLess(events.index("after_model_restore_reclaim"), events.index("before_optimizer_common_restore"))
+        self.assertLess(events.index("full_state_restore"), events.index("host_reclaim"))
+        self.assertEqual(events[-1], "after_full_restore_cleanup")
         self.assertEqual(residency, {"model": False, "optimizer": False})
         self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
         self.assertNotIn("reset_peak", events)
+        # The next training update uses the unchanged native residency loader, not cold restore.
+        self.assertTrue(worker._load_actor_optimizer_for_update())
+        self.assertEqual(events[-1], "optimizer_onload")
+        self.assertEqual(events.count("full_state_restore"), 1)
+        self.assertEqual(events.count("after_full_restore_cleanup"), 1)
 
     def test_explicit_resume_rejects_unsupported_optimizer_before_loading(self):
         events = []

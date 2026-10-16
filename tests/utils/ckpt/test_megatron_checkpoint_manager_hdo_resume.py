@@ -17,8 +17,10 @@ import copy
 import gc
 import importlib.util
 import unittest
+import weakref
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -240,6 +242,7 @@ def _production_methods(*, mcore_016=True):
             "_is_mcore_016_hdo_dp_reshardable_resume",
             "_prepare_mcore_016_hdo_dp_reshardable_resume",
             "_load_mcore_016_hdo_checkpoint_state",
+            "_mcore_016_hdo_resume_optimizers",
         }
     ]
     for helper in helpers:
@@ -304,7 +307,204 @@ def _step_restore_case(step=250):
     return chained, distributed, hdo, main_param, checkpoint, authority
 
 
+def _cold_restore_case(*, fail_common=False):
+    events = []
+    hdo = HybridDeviceOptimizer(initialized=False)
+    params = [torch.zeros(2) for _ in range(4)]
+    hdo.param_groups = [{"params": params[:2], "lr": -1}, {"params": params[2:], "lr": -2}]
+    hdo.state = {param: {key: torch.zeros(2) for key in ("exp_avg", "exp_avg_sq", "master_param")}
+                 for param in params}
+    hdo.param_to_inner_param = {param: object() for param in params}
+    hdo.inner_param_to_orig_param = {inner: param for param, inner in hdo.param_to_inner_param.items()}
+    hdo.sub_optimizers = [SimpleNamespace(param_groups=[{"params": [hdo.param_to_inner_param[param]]}])
+                          for param in params]
+
+    def sync_metadata():
+        events.append("sync_suboptimizer_metadata")
+        if fail_common:
+            raise RuntimeError("common restore failed")
+        for sub, param in zip(hdo.sub_optimizers, params):
+            group = next(group for group in hdo.param_groups if any(p is param for p in group["params"]))
+            sub.param_groups[0].update({key: value for key, value in group.items() if key != "params"})
+
+    hdo._sync_hdo_param_groups_to_sub_optimizers = sync_metadata
+
+    def generic_load(_):
+        raise AssertionError("generic Optimizer.load_state_dict would recast complete state tensors")
+
+    hdo.load_state_dict = generic_load
+
+    class ColdDistributed(DistributedOptimizer):
+        def load_state_dict(self, payload):
+            self.authoritative_steps = []
+            packed_state, packed_groups = {}, []
+            param_id = 0
+            for current, saved in zip(hdo.param_groups, payload["optimizer"]["param_groups"]):
+                packed_group = dict(saved, params=[])
+                step = torch.tensor(saved["step"])
+                self.authoritative_steps.append(step)
+                for param in current["params"]:
+                    hdo.state[param]["step"] = step
+                    packed_state[param_id] = hdo.state[param]
+                    packed_group["params"].append(param_id)
+                    param_id += 1
+                packed_groups.append(packed_group)
+            hdo.load_state_dict({"state": packed_state, "param_groups": packed_groups})
+            self.load_parameter_state_from_dp_reshardable(payload["param_state"])
+
+        def load_parameter_state_from_dp_reshardable(self, payload):
+            events.append("tensor_payload_copy")
+            for param, source in zip(params, payload):
+                self._set_main_param_and_optimizer_states(param, source)
+
+    distributed = ColdDistributed(hdo)
+    distributed.model_param_group_index_map = {
+        param: (group_index, index) for group_index, group in enumerate(hdo.param_groups)
+        for index, param in enumerate(group["params"])
+    }
+    chain = ChainedOptimizer(distributed)
+    chain.load_state_dict = distributed.load_state_dict
+    checkpoint = {
+        "optimizer": {"param_groups": [
+            {"params": [0, 1], "lr": .125, "betas": (.8, .95), "eps": 1e-9,
+             "weight_decay": .01, "lr_mult": 2., "wd_mult": .5, "step": 250},
+            {"params": [2, 3], "lr": .25, "betas": (.7, .98), "eps": 1e-8,
+             "weight_decay": .02, "pre_lr_mult": 3., "pre_wd_mult": .25, "step": 250},
+        ]},
+        "param_state": [{key: torch.full((2,), float(index + 1))
+                         for index, key in enumerate(("param", "exp_avg", "exp_avg_sq", "master_param"))}
+                        for _ in params],
+    }
+    return chain, distributed, hdo, params, checkpoint, events
+
+
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_cold_restore_skips_generic_cast_preserves_groups_mappings_and_tensor_ownership(self):
+        chain, distributed, hdo, params, checkpoint, events = _cold_restore_case()
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        mapping = dict(hdo.param_to_inner_param)
+        states = {param: dict(hdo.state[param]) for param in params}
+        original_loader = hdo.load_state_dict
+        with self.assertRaisesRegex(AssertionError, "recast"):
+            chain.load_state_dict(checkpoint)
+        helper(chain, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True,
+               cold_restore=True, stage_callback=events.append)
+        for current, saved in zip(hdo.param_groups, checkpoint["optimizer"]["param_groups"]):
+            self.assertEqual({k: v for k, v in current.items() if k != "params"},
+                             {k: v for k, v in saved.items() if k != "params"})
+        for index, param in enumerate(params):
+            self.assertIs(hdo.param_to_inner_param[param], mapping[param])
+            self.assertIs(hdo.state[param]["step"], distributed.authoritative_steps[index // 2])
+            self.assertEqual(hdo.state[param]["step"].item(), 250)
+            torch.testing.assert_close(param, checkpoint["param_state"][index]["param"])
+            for key in ("exp_avg", "exp_avg_sq", "master_param"):
+                self.assertIs(hdo.state[param][key], states[param][key])
+                torch.testing.assert_close(hdo.state[param][key], checkpoint["param_state"][index][key])
+            self.assertEqual(hdo.sub_optimizers[index].param_groups[0]["lr"], .125 if index < 2 else .25)
+        self.assertIs(hdo.load_state_dict, original_loader)
+        for name in ("_set_main_param_and_optimizer_states", "load_parameter_state_from_dp_reshardable"):
+            self.assertNotIn(name, vars(distributed))
+        self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+        order = ["before_optimizer_common_restore", "after_optimizer_common_restore",
+                 "before_optimizer_param_state_restore", "tensor_payload_copy", "after_optimizer_param_state_restore"]
+        self.assertEqual([events.index(stage) for stage in order], sorted(events.index(stage) for stage in order))
+        with self.assertRaisesRegex(AssertionError, "recast"):
+            hdo.load_state_dict({})  # No compatibility adapter remains for later training.
+
+    def test_cold_restore_failure_restores_all_methods_and_missing_tensors_fail_fast(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        for missing in (None, "param", "exp_avg", "exp_avg_sq", "master_param"):
+            with self.subTest(missing=missing):
+                chain, distributed, hdo, params, checkpoint, _ = _cold_restore_case(fail_common=missing is None)
+                original_loader = hdo.load_state_dict
+                if missing is not None:
+                    del checkpoint["param_state"][0][missing]
+                with self.assertRaises(RuntimeError if missing is None else KeyError):
+                    helper(chain, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True,
+                           cold_restore=True)
+                self.assertIs(hdo.load_state_dict, original_loader)
+                self.assertEqual(hdo.state[params[0]]["step"].item(), 250)
+                for name in ("_set_main_param_and_optimizer_states", "load_parameter_state_from_dp_reshardable"):
+                    self.assertNotIn(name, vars(distributed))
+                self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+
+    def test_cold_restore_scope_excludes_other_versions_metadata_partial_and_non_hdo(self):
+        for mcore, sharding, full_resume in ((False, "dp_reshardable", True),
+                                            (True, "fully_reshardable", True),
+                                            (True, "dp_reshardable", False)):
+            chain, _, hdo, _, checkpoint, events = _cold_restore_case()
+            helper = _production_methods(mcore_016=mcore)["_load_mcore_016_hdo_checkpoint_state"]
+            with self.assertRaisesRegex(AssertionError, "recast"):
+                helper(chain, checkpoint, {"distrib_optim_sharding_type": sharding}, full_resume,
+                       cold_restore=True, stage_callback=events.append)
+            self.assertEqual(events, [])
+            self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+        ordinary = OrdinaryOptimizer()
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        self.assertFalse(helper(ordinary, {}, {"distrib_optim_sharding_type": "dp_reshardable"}, True,
+                                cold_restore=True))
+
+    def test_cold_restore_supports_multiple_chained_hdos_without_cross_instance_binding(self):
+        cases = [_cold_restore_case(), _cold_restore_case()]
+        chain = ChainedOptimizer(*(case[1] for case in cases))
+        chain.load_state_dict = lambda payload: [case[1].load_state_dict(case[4]) for case in cases]
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        helper(chain, {}, {"distrib_optim_sharding_type": "dp_reshardable"}, True, cold_restore=True)
+        for _, distributed, hdo, params, _, events in cases:
+            self.assertEqual(events.count("tensor_payload_copy"), 1)
+            self.assertEqual(hdo.state[params[-1]]["step"].item(), 250)
+            self.assertNotIn("load_parameter_state_from_dp_reshardable", vars(distributed))
+
+    def test_cold_manager_releases_model_payload_before_optimizer_and_restores_extra_last(self):
+        chain, _, hdo, _, checkpoint, events = _cold_restore_case()
+        model_refs = []
+
+        class CopyModel:
+            def load_state_dict(self, state):
+                self.value = state["weight"].value
+                events.append("model_load")
+
+        model = CopyModel()
+        manager = _manager(chain, model)
+        methods = _production_methods()
+        methods["load_checkpoint"].__globals__["get_torch_device"] = lambda: SimpleNamespace(
+            synchronize=lambda: events.append("synchronize"), empty_cache=lambda: events.append("empty_cache"))
+
+        def load_dcp(*, sharded_state_dict, ckpt_dir):
+            if "model" in sharded_state_dict:
+                self.assertEqual(set(sharded_state_dict), {"model"})
+                tensor = TensorValue("checkpoint-model")
+                model_refs.append(weakref.ref(tensor))
+                return {"model": {"weight": tensor}}
+            self.assertIsNone(model_refs[0]())
+            self.assertEqual(model.value, "checkpoint-model")
+            events.append("optimizer_dcp_load")
+            return {"optimizer": checkpoint, "lr_scheduler": {"num_steps": 250},
+                    "rng_state": {"rng": 250}, "eu_derpo_controller": {"mctr_controller_step": 250}}
+
+        methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = load_dcp
+        manager.generate_state_dict = lambda *args, **kwargs: {"model": {"weight": "template"}, "optimizer": {}}
+        manager.checkpoint_load_contents = {"model", "optimizer", "extra"}
+        manager.use_dist_checkpointing = True
+        manager.use_distributed_optimizer = True
+        manager.use_checkpoint_opt_param_scheduler = False
+        manager.rank, manager.peft_cls = 0, None
+        manager.lr_scheduler = SimpleNamespace(load_state_dict=lambda state: events.append(("scheduler", state)))
+        manager.load_rng_states = lambda state: events.append(("rng", state))
+        manager.extra_state_loader = lambda state: events.append(("controller", state))
+        methods["load_checkpoint"](
+            manager, "checkpoint", load_contents=("model", "optimizer", "extra"),
+            cold_restore=True, stage_callback=events.append,
+        )
+        order = ["before_model_restore", "model_load", "after_model_restore", "synchronize", "empty_cache",
+                 "after_model_restore_reclaim", "optimizer_dcp_load", "before_optimizer_common_restore",
+                 "after_optimizer_common_restore", "before_optimizer_param_state_restore", "tensor_payload_copy",
+                 "after_optimizer_param_state_restore", ("scheduler", {"num_steps": 250}),
+                 ("rng", {"rng": 250}), ("controller", {"mctr_controller_step": 250})]
+        positions = [events.index(stage) for stage in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+
     def test_missing_sharded_step_preserves_param_group_authority_and_object(self):
         helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
         for saved_step in (11, 250):
@@ -742,6 +942,72 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         ]
         self.assertFalse(other_version_helper(optimizer, checkpoint_state, metadata, full_resume=True))
         self.assertEqual(optimizer.loaded_states, [checkpoint_state])
+
+    @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
+    def test_real_mcore_cold_restore_avoids_generic_state_recast(self):
+        import megatron.core
+        from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer as RealHDO
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer as RealDistributed
+        from megatron.core.optimizer.optimizer import param_group_identifier_keys
+        from packaging import version
+        from verl.utils.checkpoint.megatron_checkpoint_manager import _load_mcore_016_hdo_checkpoint_state
+
+        if version.parse(megatron.core.__version__).release[:2] != (0, 16):
+            self.skipTest("requires Megatron-Core 0.16.x")
+        param = torch.zeros(2)
+        hdo = object.__new__(RealHDO)
+        torch.optim.Optimizer.__init__(hdo, [param], {"lr": -1.})
+        hdo.param_update_in_fp32 = True
+        hdo.param_to_fp32_param, hdo.fp32_param_to_orig_param = {}, {}
+        hdo.param_to_inner_param = {param: param}
+        hdo.inner_param_to_orig_param = {param: param}
+        hdo.state[param] = {key: torch.zeros(2) for key in ("exp_avg", "exp_avg_sq", "master_param")}
+        hdo.cpu_optimizers = [torch.optim.AdamW([param], lr=1e-6)]
+        hdo.cpu_optimizers[0].state[param] = hdo.state[param]
+        hdo.gpu_optimizer = None
+        hdo._register_load_state_dict_hooks()
+        for key in param_group_identifier_keys:
+            hdo.param_groups[0][key] = 1.
+        saved_group = {**hdo.param_groups[0], "params": [0], "lr": .125, "betas": (.8, .95),
+                       "eps": 1e-9, "weight_decay": .01, "step": 250}
+        distributed = object.__new__(RealDistributed)
+        distributed.optimizer = hdo
+        distributed.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+        distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False, fp16=False)
+        distributed.grad_scaler = None
+        distributed.model_param_group_index_map = {param: (0, 0)}
+        source = {key: torch.full((2,), float(index + 1))
+                  for index, key in enumerate(("param", "exp_avg", "exp_avg_sq", "master_param"))}
+        payload = {"optimizer": {"param_groups": [saved_group]}, "param_state": source,
+                   "param_state_sharding_type": "dp_reshardable"}
+
+        def restore_payload(self, state):
+            # Real DistributedOptimizer.load_state_dict dispatches here after the real inner-HDO load.
+            self._set_main_param_and_optimizer_states(param, state)
+
+        distributed.load_parameter_state_from_dp_reshardable = MethodType(restore_payload, distributed)
+        original_param_loader = distributed.load_parameter_state_from_dp_reshardable
+        with patch.object(torch.optim.Optimizer, "_process_value_according_to_param_policy",
+                          side_effect=RuntimeError("generic state tensor recast")) as recast:
+            with self.assertRaisesRegex(RuntimeError, "generic state tensor recast"):
+                distributed.load_state_dict(payload)  # Actual MCore load reaches actual torch generic casting.
+            self.assertGreater(recast.call_count, 0)
+            recast.reset_mock()
+            self.assertTrue(_load_mcore_016_hdo_checkpoint_state(
+                distributed, payload, {"distrib_optim_sharding_type": "dp_reshardable"}, True, cold_restore=True,
+            ))
+            self.assertEqual(recast.call_count, 0)
+        torch.testing.assert_close(param, source["param"])
+        for key in ("exp_avg", "exp_avg_sq", "master_param"):
+            torch.testing.assert_close(hdo.state[param][key], source[key])
+        self.assertEqual(hdo.state[param]["step"].item(), 250)
+        for key in ("lr", "betas", "eps", "weight_decay", "step", *param_group_identifier_keys):
+            self.assertEqual(hdo.param_groups[0][key], saved_group[key])
+            self.assertEqual(hdo.cpu_optimizers[0].param_groups[0][key], saved_group[key])
+        self.assertIs(distributed.load_parameter_state_from_dp_reshardable, original_param_loader)
+        self.assertNotIn("load_state_dict", vars(hdo))
+        self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
 
     @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
     def test_real_mcore_final_restore_compatibility(self):

@@ -85,26 +85,31 @@ def _prepare_mcore_016_hdo_dp_reshardable_resume(
     return found_hdo
 
 
-def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, full_resume: bool) -> bool:
+def _mcore_016_hdo_resume_optimizers(optimizer, metadata, full_resume):
     if not (
         mcore_016
         and full_resume
         and metadata.get("distrib_optim_sharding_type") == "dp_reshardable"
     ):
-        optimizer.load_state_dict(state_dict)
-        return False
+        return []
 
     from megatron.core.optimizer import ChainedOptimizer
     from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
-    distributed_hdos = [
+    return [
         distributed_optimizer
         for distributed_optimizer in optimizers
         if isinstance(distributed_optimizer, DistributedOptimizer)
         and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
     ]
+
+
+def _load_mcore_016_hdo_checkpoint_state(
+    optimizer, state_dict, metadata: dict, full_resume: bool, *, cold_restore=False, stage_callback=None
+) -> bool:
+    distributed_hdos = _mcore_016_hdo_resume_optimizers(optimizer, metadata, full_resume)
     if not distributed_hdos:
         optimizer.load_state_dict(state_dict)
         return False
@@ -128,11 +133,55 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, 
     missing = object()
     previous_methods = [(hdo, method_name, vars(hdo).get(method_name, missing)) for hdo in hdos]
     previous_methods += [(dist, setter_name, vars(dist).get(setter_name, missing)) for dist in distributed_hdos]
+    if cold_restore:
+        previous_methods += [(hdo, "load_state_dict", vars(hdo).get("load_state_dict", missing)) for hdo in hdos]
     try:
         for hdo in hdos:
             setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+            if cold_restore:
+
+                def load_common_metadata(hdo, common):
+                    if stage_callback is not None:
+                        stage_callback("before_optimizer_common_restore")
+                    saved_groups = common["param_groups"]
+                    if len(saved_groups) != len(hdo.param_groups):
+                        raise ValueError("HDO cold restore param-group count mismatch")
+                    # MCore supplies the existing state here, with checkpoint step already restored.
+                    # Preserve its tensors and CPU/GPU mappings; generic torch load would recast them.
+                    for saved, current in zip(saved_groups, hdo.param_groups):
+                        if len(saved["params"]) != len(current["params"]):
+                            raise ValueError("HDO cold restore parameter count mismatch")
+                        for param_id, param in zip(saved["params"], current["params"]):
+                            if common["state"][param_id] is not hdo.state[param]:
+                                raise ValueError("HDO cold restore requires the existing MCore state mapping")
+                    for saved, current in zip(saved_groups, hdo.param_groups):
+                        params = current["params"]
+                        current.clear()
+                        current.update(saved, params=params)
+                    hdo._sync_hdo_param_groups_to_sub_optimizers()
+                    if stage_callback is not None:
+                        stage_callback("after_optimizer_common_restore")
+
+                hdo.load_state_dict = load_common_metadata.__get__(hdo, type(hdo))
         for distributed in distributed_hdos:
             original_setter = getattr(distributed, setter_name)
+            if cold_restore:
+                param_loader_name = "load_parameter_state_from_dp_reshardable"
+                original_param_loader = getattr(distributed, param_loader_name)
+                previous_methods.append(
+                    (distributed, param_loader_name, vars(distributed).get(param_loader_name, missing))
+                )
+
+                def load_param_state(dist, payload, original=original_param_loader):
+                    if stage_callback is not None:
+                        stage_callback("before_optimizer_param_state_restore")
+                    result = original(payload)
+                    dist.optimizer._update_fp32_params_by_new_state()
+                    if stage_callback is not None:
+                        stage_callback("after_optimizer_param_state_restore")
+                    return result
+
+                setattr(distributed, param_loader_name, load_param_state.__get__(distributed, type(distributed)))
 
             def set_main_param_and_optimizer_states(dist, model_param, tensors, original=original_setter):
                 if dist.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -502,6 +551,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         load_contents=None,
         sharded_sd_metadata=None,
         stage_callback=None,
+        cold_restore=False,
     ):
         supported_contents = {"model", "optimizer", "extra"}
         requested_contents = (
@@ -543,12 +593,22 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             else:
                 sharded_sd_metadata = self._build_sharded_state_dict_metadata()
 
+        cold_restore = bool(
+            cold_restore
+            and load_model
+            and self.use_dist_checkpointing
+            and load_optimizer
+            and load_extra
+            and _mcore_016_hdo_resume_optimizers(self.optimizer, sharded_sd_metadata, True)
+        )
+
         sharded_state_dict = None
         state_dict = None
         model_state_dict = None
         optimizer_state_dict = None
         lr_scheduler_state_dict = None
         rng_state = None
+        model_template = None
         try:
             sharded_state_dict = self.generate_state_dict(
                 load_model and self.use_dist_checkpointing,
@@ -563,8 +623,14 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             if load_optimizer and stage_callback is not None:
                 stage_callback("after_optimizer_template")
 
+            if cold_restore:
+                model_template = {
+                    key: sharded_state_dict.pop(key) for key in list(sharded_state_dict) if key.startswith("model")
+                }
+                if stage_callback is not None:
+                    stage_callback("before_model_restore")
             state_dict = load_dist_checkpointing(
-                sharded_state_dict=sharded_state_dict,
+                sharded_state_dict=model_template if cold_restore else sharded_state_dict,
                 ckpt_dir=dist_checkpoint_path,
             )
 
@@ -579,6 +645,21 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
                     self.model[vpp_rank].load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded sharded model checkpoint from {local_path}", rank=self.rank, logger=logger)
+                if cold_restore:
+                    if stage_callback is not None:
+                        stage_callback("after_model_restore")
+                    state_dict.clear()
+                    model_template.clear()
+                    model_state_dict = None
+                    device = get_torch_device()
+                    device.synchronize()
+                    gc.collect()
+                    device.empty_cache()
+                    if stage_callback is not None:
+                        stage_callback("after_model_restore_reclaim")
+                    state_dict = load_dist_checkpointing(
+                        sharded_state_dict=sharded_state_dict, ckpt_dir=dist_checkpoint_path
+                    )
             elif load_model and self.use_hf_checkpoint and self.peft_cls is None:
                 hf_model_path = get_hf_model_checkpoint_path(local_path)
                 if self.vanilla_bridge:
@@ -616,7 +697,13 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     optimizer_state_dict,
                     sharded_sd_metadata,
                     full_resume=load_model and self.use_dist_checkpointing and load_optimizer and load_extra,
+                    cold_restore=cold_restore,
+                    stage_callback=stage_callback,
                 )
+                if cold_restore:
+                    state_dict.pop("optimizer", None)
+                    sharded_state_dict.pop("optimizer", None)
+                    optimizer_state_dict = None
                 log_with_rank(f"Loaded optimizer checkpoint from {local_path}", rank=self.rank, logger=logger)
                 restore_lr_scheduler = self.lr_scheduler is not None and (
                     self.use_checkpoint_opt_param_scheduler or load_contents is not None
@@ -660,6 +747,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 state_dict.clear()
             if sharded_state_dict is not None and sharded_state_dict is not state_dict:
                 sharded_state_dict.clear()
+            if model_template is not None:
+                model_template.clear()
             model_state_dict = None
             optimizer_state_dict = None
             lr_scheduler_state_dict = None

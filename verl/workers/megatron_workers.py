@@ -45,6 +45,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.ppo.eu_derpo import policy_prepass_tensors
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
+from verl.utils.checkpoint.megatron_checkpoint_manager import mcore_016 as checkpoint_mcore_016
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES
 from verl.utils.device import (
@@ -1689,6 +1690,38 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "Explicit resume requires full model/optimizer/extra DCP loading with param_offload=true, "
                     "optimizer_offload=true, and DistributedOptimizer + FusedAdam or HybridDeviceOptimizer"
                 )
+
+        if (
+            full_state_hdo_restore
+            and checkpoint_mcore_016
+            and self.checkpoint_mananager._build_sharded_state_dict_metadata().get("distrib_optim_sharding_type")
+            == "dp_reshardable"
+        ):
+
+            def restore_stage(stage):
+                log_eu_derpo_memory(stage, self.actor_optimizer)
+                if stage == "after_model_restore":
+                    offload_megatron_model_to_cpu(self.actor_module)
+
+            try:
+                # Keep optimizer tensors cold; the first training update restores normal HDO residency.
+                self._offload_actor_optimizer()
+                load_megatron_model_to_gpu(self.actor_module)
+                self.checkpoint_mananager.load_checkpoint(
+                    local_path=checkpoint_path,
+                    hdfs_path=hdfs_path,
+                    del_local_after_load=del_local_after_load,
+                    load_contents=("model", "optimizer", "extra"),
+                    cold_restore=True,
+                    stage_callback=restore_stage,
+                )
+            finally:
+                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_optimizer()
+                aggressive_empty_cache(force_sync=True)
+                _best_effort_release_host_allocator_after_copy_param_restore()
+                restore_stage("after_full_restore_cleanup")
+            return
 
         if staged_restore and not full_state_hdo_restore:
             _log_resume_memory("actor_initialized")
