@@ -365,11 +365,13 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
                 if phase == "bootstrap":
                     self.assertNotIn("model_onload", events)
 
-    @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
+    @unittest.skipUnless((importlib.util.find_spec("megatron") is not None
+                              and importlib.util.find_spec("megatron.core") is not None), "Megatron-Core is not installed")
     def test_real_mcore_cold_restore_empty_hdo_bootstrap_lifecycle(self):
         self._check_real_dummy_bootstrap("cpu")
 
-    @unittest.skipUnless(torch.cuda.is_available() and importlib.util.find_spec("megatron") is not None,
+    @unittest.skipUnless(torch.cuda.is_available() and (importlib.util.find_spec("megatron") is not None
+                              and importlib.util.find_spec("megatron.core") is not None),
                          "requires CUDA and Megatron-Core")
     def test_real_mcore_gpu_cold_restore_empty_hdo_bootstrap_lifecycle(self):
         self._check_real_dummy_bootstrap("cuda")

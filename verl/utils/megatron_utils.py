@@ -523,6 +523,41 @@ def megatron_model_cpu_data_bytes(models):
     return total
 
 
+def release_megatron_model_cpu_data(models):
+    """Drop reload copies only after every DDP parameter buffer is fully on GPU."""
+    owners = {}
+    for chunk in models:
+        if not isinstance(chunk, DDP):
+            continue
+        for buffers in (chunk.buffers, chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                data = buffer.param_data
+                if not hasattr(data, "cpu_data"):
+                    continue
+                if data.device.type != "cuda" or data.storage().size() != buffer.param_data_size:
+                    raise RuntimeError("Cannot release model CPU backing before complete GPU onload")
+                if data.storage().size() == 0:
+                    raise RuntimeError("Cannot release CPU backing of an empty model buffer")
+                owners[id(data)] = data
+    if not owners:
+        return 0
+    released = megatron_model_cpu_data_bytes(models)
+    get_torch_device().synchronize()  # Complete async H2D reads before dropping their source owners.
+    for data in owners.values():
+        del data.cpu_data
+    gc.collect()
+    # torch 2.9.1: empty_cache() clears device cache only; this clears unused pinned-host blocks.
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is not None:
+        try:
+            empty_host_cache()
+        except Exception as exc:
+            logger.warning(
+                "Unable to clear unused pinned-host allocator cache after model CPU backing release: %r", exc
+            )
+    return released
+
+
 def is_megatron_model_offloaded(models):
     """Return whether any DDP parameter buffer currently has no device storage."""
     for model_chunk in models:

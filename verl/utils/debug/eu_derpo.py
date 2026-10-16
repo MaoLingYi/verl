@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
-from functools import wraps
+from functools import lru_cache, wraps
 import os
+from pathlib import Path
+import re
 import time
 from types import MethodType
 
@@ -55,17 +57,59 @@ def _staging_chunk_rows(staging_mib, hidden_size, topk):
     return rows
 
 
-def _node_ram_decision(required_by_rank, mem_available, safety_margin):
+def _node_ram_decision(required_by_rank, mem_available, safety_margin, ray_limit=None):
     node_required = sum(int(value) for value in required_by_rank)
     mem_available = int(mem_available)
     safety_margin = int(safety_margin)
+    ray_headroom = None
+    if ray_limit is not None:
+        threshold, total = map(int, ray_limit)
+        if not 0 < threshold <= total or not 0 <= mem_available <= total:
+            raise ValueError("Invalid Ray/Linux memory accounting bounds")
+        ray_headroom = threshold - (total - mem_available) - node_required
     return {
         "required_by_rank": [int(value) for value in required_by_rank],
         "node_required": node_required,
         "mem_available": mem_available,
         "safety_margin": safety_margin,
-        "passed": mem_available >= node_required + safety_margin,
+        "ray_headroom_after_cache": ray_headroom,
+        "runtime_headroom_sufficient": None if ray_headroom is None else ray_headroom >= safety_margin,
+        "passed": mem_available >= node_required + safety_margin
+        and (ray_headroom is None or ray_headroom >= safety_margin),
     }
+
+
+@lru_cache(maxsize=1)
+def _raylet_linux_memory_limit():
+    """Use the live raylet's resolved limit only when Ray selects Linux accounting."""
+    try:
+        import ray
+
+        session = ray._private.worker.global_worker.node.get_session_dir_path()
+        with open(Path(session) / "logs" / "raylet.out", encoding="utf-8", errors="replace") as stream:
+            startup = stream.read(64 * 1024)
+        match = re.search(
+            r"ThresholdMemoryMonitor initialized with usage threshold at (\d+) bytes "
+            r"[^\n]*total system memory bytes: (\d+), monitor interval: [^\n]*", startup,
+        )
+        if match is None or "resource isolation enabled" in match[0]:
+            return None
+        threshold, total = map(int, match.groups())
+        with open("/proc/meminfo", encoding="ascii") as stream:
+            physical_total = next(int(line.split()[1]) * 1024 for line in stream if line.startswith("MemTotal:"))
+        if total != physical_total:
+            return None
+        # Ray 2.56.1 selects cgroup used when its finite limit is <= physical total.
+        for name in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            path = Path(name)
+            if path.exists():
+                limit = path.read_text().strip()
+                if limit != "max" and 0 < int(limit) <= total:
+                    return None
+                break
+        return (threshold, total) if 0 < threshold <= total else None
+    except (ImportError, AttributeError, OSError, ValueError, StopIteration):
+        return None
 
 
 def _read_mem_available():
@@ -551,17 +595,21 @@ class EUDERPOObserver:
             gathered = [torch.zeros_like(local) for _ in range(8)]
             torch.distributed.all_gather(gathered, local)
             required_by_rank = [int(item.item()) for item in gathered]
-            payload = torch.zeros(2, dtype=torch.int64, device=device)
+            payload = torch.zeros(4, dtype=torch.int64, device=device)
             if torch.distributed.get_rank() == 0:
                 available = _read_mem_available()
                 decision = _node_ram_decision(
-                    required_by_rank, available, HOST_RAM_SAFETY_MARGIN_BYTES
+                    required_by_rank, available, HOST_RAM_SAFETY_MARGIN_BYTES, _raylet_linux_memory_limit()
                 )
                 payload[0] = available
                 payload[1] = int(decision["passed"])
+                ray_limit = _raylet_linux_memory_limit()
+                if ray_limit is not None:
+                    payload[2], payload[3] = ray_limit
             torch.distributed.broadcast(payload, src=0)
             decision = _node_ram_decision(
-                required_by_rank, int(payload[0].item()), HOST_RAM_SAFETY_MARGIN_BYTES
+                required_by_rank, int(payload[0].item()), HOST_RAM_SAFETY_MARGIN_BYTES,
+                (int(payload[2].item()), int(payload[3].item())) if payload[3].item() else None,
             )
             if bool(payload[1].item()) != decision["passed"]:
                 raise RuntimeError("EU-DERPO node RAM preflight broadcast was inconsistent")
@@ -571,7 +619,7 @@ class EUDERPOObserver:
             except (OSError, RuntimeError):
                 available = (1 << 63) - 1
             decision = _node_ram_decision(
-                [local_required], available, HOST_RAM_SAFETY_MARGIN_BYTES
+                [local_required], available, HOST_RAM_SAFETY_MARGIN_BYTES, _raylet_linux_memory_limit()
             )
         if not decision["passed"]:
             raise MemoryError(f"EU-DERPO node RAM preflight failed: {decision}")
@@ -580,7 +628,9 @@ class EUDERPOObserver:
                 "EU-DERPO host RAM preflight: "
                 f"MemAvailable_before_actor_update={decision['mem_available']} "
                 f"EU_cache_required_bytes={local_required} "
-                f"node_EU_cache_required_bytes={decision['node_required']}",
+                f"node_EU_cache_required_bytes={decision['node_required']} "
+                f"ray_headroom_after_cache={decision['ray_headroom_after_cache']} "
+                f"runtime_headroom_sufficient={decision['runtime_headroom_sufficient']}",
                 flush=True,
             )
         return decision

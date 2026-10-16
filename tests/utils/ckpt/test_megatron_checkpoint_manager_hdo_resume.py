@@ -1014,7 +1014,8 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertFalse(other_version_helper(optimizer, checkpoint_state, metadata, full_resume=True))
         self.assertEqual(optimizer.loaded_states, [checkpoint_state])
 
-    @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
+    @unittest.skipUnless((importlib.util.find_spec("megatron") is not None
+                              and importlib.util.find_spec("megatron.core") is not None), "Megatron-Core is not installed")
     def test_real_mcore_cold_restore_avoids_generic_state_recast(self):
         import megatron.core
         from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer as RealHDO
@@ -1080,7 +1081,8 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
         self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
 
-    @unittest.skipUnless(importlib.util.find_spec("megatron") is not None, "Megatron-Core is not installed")
+    @unittest.skipUnless((importlib.util.find_spec("megatron") is not None
+                              and importlib.util.find_spec("megatron.core") is not None), "Megatron-Core is not installed")
     def test_real_mcore_final_restore_compatibility(self):
         import megatron.core
         from megatron.core.optimizer import ChainedOptimizer as RealChainedOptimizer

@@ -63,7 +63,7 @@ from verl.utils.megatron.router_replay_utils import (
 )
 from verl.utils.debug.router_shift import RouterShiftObserver, clear_router_shift_on_error
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
-from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
+from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, megatron_model_cpu_data_bytes, unwrap_model
 from verl.utils.logger import print_rank_0
 from verl.utils.memory_utils import log_eu_derpo_memory
 from verl.utils.profiler import GPUMemoryLogger
@@ -1218,7 +1218,9 @@ class MegatronPPOActor(BasePPOActor):
                         "after_native_finalize",
                         "after_eu_cache_complete",
                     ):
-                        log_eu_derpo_memory(memory_stage, self.actor_optimizer)
+                        log_eu_derpo_memory(
+                            memory_stage, self.actor_optimizer, megatron_model_cpu_data_bytes(self.actor_module)
+                        )
                     main_finished = time.perf_counter()
                     utility_sum, utility_sum_sq, utility_count, eu_metrics = self.eu_derpo_observer.finish_main_batch()
                     aggregation_started = time.perf_counter()

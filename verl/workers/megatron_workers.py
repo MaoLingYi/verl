@@ -71,6 +71,7 @@ from verl.utils.megatron_utils import (
     load_megatron_optimizer,
     load_megatron_optimizer_copy_params_to_gpu,
     megatron_model_cpu_data_bytes,
+    release_megatron_model_cpu_data,
     offload_megatron_model_to_cpu,
     offload_megatron_optimizer,
     offload_megatron_optimizer_copy_params_to_cpu,
@@ -968,6 +969,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         preserve_hdo = self._preserve_hdo_optimizer_residency()
         if self._load_actor_optimizer_for_update():
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        if eu_enabled and self._is_offload_param:
+            log_eu_derpo_memory(
+                "before_actor_cpu_backing_release", self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+            )
+            released = release_megatron_model_cpu_data(self.actor_module)
+            reclaim = _best_effort_release_host_allocator_after_copy_param_restore()
+            log_eu_derpo_memory(
+                "after_actor_cpu_backing_release", self.actor_optimizer,
+                megatron_model_cpu_data_bytes(self.actor_module),
+                extra={
+                    "model_cpu_backing_released_gib": released / _GIB,
+                    "pinned_host_empty_cache_available": int(hasattr(torch._C, "_host_emptyCache")), **reclaim,
+                },
+            )
         if eu_enabled:
             log_eu_derpo_memory(
                 "after_actor_load",

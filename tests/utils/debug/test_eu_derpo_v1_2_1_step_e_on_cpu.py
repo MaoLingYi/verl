@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -175,6 +178,99 @@ class TestEUDERPOV121StepE(unittest.TestCase):
         self.assertEqual(passed["node_required"], sum(required))
         failed = self.eu._node_ram_decision(required, mem_available=459, safety_margin=100)
         self.assertFalse(failed["passed"])
+
+    def test_real_resume_cache_size_has_insufficient_ray_transient_headroom(self):
+        total, threshold = 1081812213760, 1027721592832
+        available, planned = 193872072704, 134718798592
+        margin = 32 * 1024**3
+        old = self.eu._node_ram_decision([planned], available, margin)
+        self.assertTrue(old["passed"])
+        self.assertIsNone(old["runtime_headroom_sufficient"])
+        decision = self.eu._node_ram_decision([planned], available, margin, (threshold, total))
+        expected_headroom = available - planned - (total - threshold)
+        self.assertEqual(decision["ray_headroom_after_cache"], expected_headroom)
+        self.assertGreater(expected_headroom, 0)
+        self.assertLess(expected_headroom, margin)
+        self.assertFalse(decision["passed"])
+        self.assertFalse(decision["runtime_headroom_sufficient"])
+        # Releasing 8.197 GiB/rank backing would restore budget, if the pages reach the OS.
+        reclaimed = int(8.197 * 8 * 1024**3)
+        after = self.eu._node_ram_decision([planned], available + reclaimed, margin, (threshold, total))
+        self.assertTrue(after["passed"])
+        self.assertEqual(after["ray_headroom_after_cache"], expected_headroom + reclaimed)
+
+    def test_ray_limit_uses_current_raylet_and_rejects_cgroup_or_isolated_accounting(self):
+        total, threshold = 1081812213760, 1027721592832
+
+        class FakePath:
+            def __init__(self, name):
+                self.name = str(name)
+
+            def __truediv__(self, part):
+                return FakePath(self.name + "/" + part)
+
+            def __str__(self):
+                return self.name
+
+            def exists(self):
+                return True
+
+            def read_text(self):
+                return limit
+
+        node = SimpleNamespace(get_session_dir_path=lambda: "/current-session")
+        ray = SimpleNamespace(_private=SimpleNamespace(worker=SimpleNamespace(global_worker=SimpleNamespace(node=node))))
+        for isolated, limit, valid_header in ((False, "max", True), (True, "max", True),
+                                               (False, str(total), True), (False, "max", False)):
+            self.eu._raylet_linux_memory_limit.cache_clear()
+            startup = (
+                f"ThresholdMemoryMonitor initialized with usage threshold at {threshold} bytes "
+                f"(95.000000% of system memory), total system memory bytes: {total}, monitor interval: 250ms"
+                + (", resource isolation enabled, monitoring only user slice memory usage" if isolated else "")
+            ) if valid_header else "unrecognized raylet header"
+
+            def open_file(name, **kwargs):
+                if str(name) == "/current-session/logs/raylet.out":
+                    return io.StringIO(startup)
+                self.assertEqual(str(name), "/proc/meminfo")
+                return io.StringIO(f"MemTotal: {total // 1024} kB\n")
+
+            with patch.dict(sys.modules, {"ray": ray}), patch.object(self.eu, "Path", FakePath), \
+                    patch.object(self.eu, "open", open_file, create=True):
+                expected = (threshold, total) if valid_header and not isolated and limit == "max" else None
+                self.assertEqual(self.eu._raylet_linux_memory_limit(), expected)
+                self.assertEqual(self.eu._raylet_linux_memory_limit(), expected)
+        self.eu._raylet_linux_memory_limit.cache_clear()
+
+    def test_ray_budget_rejection_is_broadcast_consistently_to_all_eight_ranks(self):
+        planned, available = 134718798592, 193872072704
+        shared = {}
+        rank = 0
+
+        def gather(outputs, local):
+            for output in outputs:
+                output.fill_(planned // 8)
+
+        def broadcast(payload, src):
+            if rank == 0:
+                shared["payload"] = payload.clone()
+            else:
+                payload.copy_(shared["payload"])
+
+        distributed = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True,
+                                      get_world_size=lambda: 8, get_rank=lambda: rank,
+                                      all_gather=gather, broadcast=broadcast)
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False), distributed=distributed,
+                                     tensor=torch.tensor, zeros=torch.zeros, zeros_like=torch.zeros_like,
+                                     int64=torch.int64)
+        observer = SimpleNamespace(routers=[SimpleNamespace(weight=torch.zeros(1))])
+        with patch.object(self.eu, "torch", fake_torch), \
+                patch.object(self.eu, "_read_mem_available", return_value=available) as read, \
+                patch.object(self.eu, "_raylet_linux_memory_limit", return_value=(1027721592832, 1081812213760)):
+            for rank in range(8):
+                with self.assertRaisesRegex(MemoryError, "EU-DERPO node RAM preflight failed"):
+                    self.eu.EUDERPOObserver._coordinated_ram_preflight(observer, planned // 8)
+            self.assertEqual(read.call_count, 1)
 
     def test_error_decorator_releases_cache_references(self):
         class Observer:
