@@ -74,7 +74,7 @@ class CheckpointManager:
 
 def _staged_worker(
     events, *, fail_stage=None, model_offload_reduces_memory=True, optimizer_offload_reduces_memory=True,
-    gpu_adam=True, hdo=False, empty_hdo=False,
+    gpu_adam=True, hdo=False, empty_hdo=False, normalize_rollout=False,
 ):
     residency = {"model": False, "optimizer": False}
 
@@ -131,6 +131,7 @@ def _staged_worker(
         "_is_hdo_distributed_optimizer": lambda optimizer: hdo,
         "checkpoint_mcore_016": True,
         "log_eu_derpo_memory": lambda stage, *args, **kwargs: events.append(stage),
+        "megatron_model_cpu_data_bytes": lambda models: 8 * 1024**3,
         "_best_effort_release_host_allocator_after_copy_param_restore": lambda: events.append("host_reclaim"),
         "_log_resume_memory": log_memory,
         "_reset_resume_peak_memory": lambda: events.append("reset_peak"),
@@ -147,7 +148,21 @@ def _staged_worker(
         actor_optimizer=SimpleNamespace(state={} if empty_hdo else {"existing": {}}),
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
         _hdo_optimizer_residency_preserved=True,
+        _preserve_hdo_optimizer_residency=lambda: normalize_rollout,
+        _selective_optimizer_copy_param_offload_enabled=lambda: normalize_rollout,
     )
+
+    def selective_offload():
+        assert residency == {"model": False, "optimizer": True}
+        events.append("selective_optimizer_offload")
+        if fail_stage == "normalization":
+            raise RuntimeError("normalization failed")
+        residency["optimizer"] = False
+        worker._optimizer_copy_params_offloaded_for_rollout = True
+        worker._optimizer_copy_params_cuda_bytes_before_rollout_offload = 64
+        worker._hdo_optimizer_residency_preserved = True
+
+    worker._offload_actor_optimizer_copy_params_for_rollout = selective_offload
     load_checkpoint, offload_actor = _worker_method(namespace)
     worker._offload_actor_optimizer = MethodType(offload_actor, worker)
     worker.load_checkpoint = MethodType(load_checkpoint, worker)
@@ -161,6 +176,132 @@ def _staged_worker(
 
 
 class TestMegatronGPUAdamStagedResume(unittest.TestCase):
+    def test_successful_cold_resume_normalizes_once_after_payloads_before_rollout(self):
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True, normalize_rollout=True)
+        authority = {"exp_avg": torch.tensor([2.]), "exp_avg_sq": torch.tensor([3.]),
+                     "master_param": torch.tensor([4.]), "step": torch.tensor(250)}
+        groups = [{"params": [object()], "lr": 1e-6, "step": 250}]
+        extras = {
+            "scheduler": {"num_steps": 250, "lr": 1e-6},
+            "rng": {"python": 1, "numpy": 2, "torch": 3, "cuda": 4, "tracker": 5},
+            "mctr": {"controller_step": 250, "delta_current": 0.013},
+        }
+        expected_state = {key: tensor.clone() for key, tensor in authority.items()}
+        expected_groups = [dict(group, params=list(group["params"])) for group in groups]
+        expected_extras = {key: dict(value) if isinstance(value, dict) else value for key, value in extras.items()}
+
+        def load(**kwargs):
+            worker.actor_optimizer.state = authority
+            worker.actor_optimizer.param_groups = groups
+            worker.restored_extra = extras
+            kwargs["stage_callback"]("after_model_restore")
+            events.append("checkpoint_payloads_released")
+
+        worker.checkpoint_mananager.load_checkpoint = load
+        worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        order = ["checkpoint_payloads_released", "before_resume_rollout_residency", "optimizer_onload",
+                 "selective_optimizer_offload", "after_resume_rollout_residency", "after_full_restore_cleanup"]
+        self.assertEqual([events.index(stage) for stage in order], sorted(events.index(stage) for stage in order))
+        self.assertEqual(events.count("selective_optimizer_offload"), 1)
+        self.assertTrue(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertTrue(worker._hdo_optimizer_residency_preserved)
+        self.assertEqual(events.count("optimizer_offload"), 1)  # Only startup; final cleanup preserves partial HDO.
+        self.assertIs(worker.actor_optimizer.state, authority)
+        self.assertIs(worker.actor_optimizer.param_groups, groups)
+        self.assertIs(worker.restored_extra, extras)
+        self.assertEqual(worker.actor_optimizer.state["step"].item(), 250)
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        namespace = worker.load_checkpoint.__func__.__globals__
+        tree = ast.parse(WORKER.read_text(encoding="utf-8"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "ActorRolloutRefWorker")
+        restore = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                       and node.name == "_restore_actor_optimizer_copy_params_for_update")
+        copy_state = {"cuda": False}
+
+        def restore_copy_params(optimizer):
+            self.assertIs(optimizer, worker.actor_optimizer)
+            self.assertTrue(worker._optimizer_copy_params_offloaded_for_rollout)
+            self.assertFalse(copy_state["cuda"])
+            events.append("selective_copy_param_restore")
+            copy_state["cuda"] = True
+            return {"moved_tensors": 2, "moved_bytes": 64}
+
+        def reclaim():
+            self.assertTrue(copy_state["cuda"])
+            self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+            events.append("selective_host_reclaim")
+            return {"gc_collected": 1, "malloc_trim_attempted": 1, "malloc_trim_rc": 1}
+
+        namespace.update(
+            load_megatron_optimizer=lambda *_: self.fail("generic full optimizer load must remain skipped"),
+            load_megatron_optimizer_copy_params_to_gpu=restore_copy_params,
+            estimate_optimizer_phase_offload_memory=lambda _: {
+                "optimizer_phase_cuda_copy_param_bytes": 64 if copy_state["cuda"] else 0,
+                "optimizer_phase_cuda_state_bytes": 80,
+            },
+            get_torch_device=lambda: SimpleNamespace(synchronize=lambda: events.append("restore_cuda_sync")),
+            torch=SimpleNamespace(distributed=SimpleNamespace(is_initialized=lambda: False)),
+            psutil=SimpleNamespace(
+                Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=8 * 1024**3)),
+                virtual_memory=lambda: SimpleNamespace(available=128 * 1024**3),
+            ),
+            time=SimpleNamespace(perf_counter=lambda: 0.0),
+            _best_effort_release_host_allocator_after_copy_param_restore=reclaim,
+        )
+
+        def complete_transition(stage, failure, error, moved):
+            if error is not None:
+                raise error
+            events.append(stage)
+
+        worker._complete_optimizer_copy_param_transition = complete_transition
+        worker._actor_optimizer_residency = lambda: (
+            "ROLLOUT_PARTIAL" if worker._optimizer_copy_params_offloaded_for_rollout else "TRAINING_RESIDENT"
+        )
+        exec(compile(ast.Module(body=[restore], type_ignores=[]), str(WORKER), "exec"), namespace)
+        worker._restore_actor_optimizer_copy_params_for_update = MethodType(namespace[restore.name], worker)
+        self.assertTrue(worker._restore_actor_optimizer_copy_params_for_update())
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertTrue(worker._hdo_optimizer_residency_preserved)
+        self.assertEqual(events.count("selective_copy_param_restore"), 1)
+        self.assertEqual(events.count("selective_host_reclaim"), 1)
+        transition_order = ["selective_copy_param_restore", "restore_cuda_sync", "restore_sanity",
+                            "selective_host_reclaim", "after_optimizer_copy_param_restore"]
+        positions = [events.index(stage) for stage in transition_order]
+        self.assertEqual(positions, sorted(positions))
+        event_count = len(events)
+        self.assertFalse(worker._restore_actor_optimizer_copy_params_for_update())
+        self.assertFalse(worker._load_actor_optimizer_for_update())
+        self.assertEqual(len(events), event_count)
+        self.assertIs(worker.actor_optimizer.state, authority)
+        for key, expected in expected_state.items():
+            torch.testing.assert_close(worker.actor_optimizer.state[key], expected, rtol=0, atol=0)
+        self.assertIs(worker.actor_optimizer.param_groups, groups)
+        self.assertEqual(groups, expected_groups)
+        self.assertIs(worker.restored_extra, extras)
+        self.assertEqual(extras, expected_extras)
+
+    def test_failed_normalization_full_offloads_and_does_not_retry_or_enter_rollout(self):
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True,
+                                          normalize_rollout=True, fail_stage="normalization")
+        worker.checkpoint_mananager.load_checkpoint = lambda **kwargs: kwargs["stage_callback"]("after_model_restore")
+        with self.assertRaisesRegex(RuntimeError, "normalization failed"):
+            worker.load_checkpoint("global_step_250/actor", staged_restore=True)
+        self.assertEqual(events.count("selective_optimizer_offload"), 1)
+        self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertFalse(worker._optimizer_copy_params_offloaded_for_rollout)
+        self.assertFalse(worker._hdo_optimizer_residency_preserved)
+        self.assertNotIn("after_resume_rollout_residency", events)
+
+    def test_fresh_run_does_not_normalize_even_when_selective_policy_enabled(self):
+        events = []
+        worker, _ = _staged_worker(events, gpu_adam=False, hdo=True, normalize_rollout=True)
+        worker.load_checkpoint(None, staged_restore=True)
+        self.assertEqual(events, ["model_offload", "optimizer_offload"])
+
     def test_empty_hdo_bootstraps_once_before_model_onload_and_returns_to_native_update(self):
         events = []
         worker, residency = _staged_worker(events, gpu_adam=False, hdo=True, empty_hdo=True)

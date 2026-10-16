@@ -459,6 +459,15 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
     def test_cold_manager_releases_model_payload_before_optimizer_and_restores_extra_last(self):
         chain, _, hdo, _, checkpoint, events = _cold_restore_case()
         model_refs = []
+        payload_refs = []
+
+        class Payload(dict):
+            pass
+
+        def tracked_payload(**values):
+            payload = Payload(values)
+            payload_refs.append(weakref.ref(payload))
+            return payload
 
         class CopyModel:
             def load_state_dict(self, state):
@@ -476,15 +485,16 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
                 self.assertEqual(set(sharded_state_dict), {"model"})
                 tensor = TensorValue("checkpoint-model")
                 model_refs.append(weakref.ref(tensor))
-                return {"model": {"weight": tensor}}
+                return tracked_payload(model={"weight": tensor})
             self.assertIsNone(model_refs[0]())
             self.assertEqual(model.value, "checkpoint-model")
             events.append("optimizer_dcp_load")
-            return {"optimizer": checkpoint, "lr_scheduler": {"num_steps": 250},
-                    "rng_state": {"rng": 250}, "eu_derpo_controller": {"mctr_controller_step": 250}}
+            return tracked_payload(optimizer=checkpoint, lr_scheduler={"num_steps": 250},
+                                   rng_state={"rng": 250}, eu_derpo_controller={"mctr_controller_step": 250})
 
         methods["load_checkpoint"].__globals__["load_dist_checkpointing"] = load_dcp
-        manager.generate_state_dict = lambda *args, **kwargs: {"model": {"weight": "template"}, "optimizer": {}}
+        manager.generate_state_dict = lambda *args, **kwargs: tracked_payload(
+            model={"weight": "template"}, optimizer={})
         manager.checkpoint_load_contents = {"model", "optimizer", "extra"}
         manager.use_dist_checkpointing = True
         manager.use_distributed_optimizer = True
@@ -505,6 +515,9 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         positions = [events.index(stage) for stage in order]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+        self.assertTrue(payload_refs)
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in payload_refs))
 
     def test_missing_sharded_step_preserves_param_group_authority_and_object(self):
         helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]

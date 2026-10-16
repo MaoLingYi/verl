@@ -1703,13 +1703,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         ):
 
             def restore_stage(stage):
-                log_eu_derpo_memory(stage, self.actor_optimizer)
+                log_eu_derpo_memory(stage, self.actor_optimizer, megatron_model_cpu_data_bytes(self.actor_module))
                 if stage == "after_model_restore":
                     offload_megatron_model_to_cpu(self.actor_module)
 
             primary_error = None
+            rollout_residency_restored = False
             try:
-                # Keep optimizer tensors cold; the first training update restores normal HDO residency.
+                # Keep optimizer tensors cold until all checkpoint payloads have been consumed.
                 offload_megatron_model_to_cpu(self.actor_module)
                 self._offload_actor_optimizer()
                 metadata = self.checkpoint_mananager._build_sharded_state_dict_metadata()
@@ -1734,6 +1735,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     cold_restore=True,
                     stage_callback=restore_stage,
                 )
+                if self._preserve_hdo_optimizer_residency() and self._selective_optimizer_copy_param_offload_enabled():
+                    restore_stage("before_resume_rollout_residency")
+                    # Match a continuous-training rollout boundary, with model still offloaded.
+                    load_megatron_optimizer(self.actor_optimizer)
+                    self._offload_actor_optimizer_copy_params_for_rollout()
+                    restore_stage("after_resume_rollout_residency")
+                    rollout_residency_restored = True
             except BaseException as error:
                 primary_error = error
                 raise
@@ -1741,7 +1749,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 cleanup_error = None
                 for cleanup in (
                     lambda: offload_megatron_model_to_cpu(self.actor_module),
-                    self._offload_actor_optimizer,
+                    lambda: None if rollout_residency_restored else self._offload_actor_optimizer(),
                     lambda: aggressive_empty_cache(force_sync=True),
                     _best_effort_release_host_allocator_after_copy_param_restore,
                     lambda: restore_stage("after_full_restore_cleanup"),
