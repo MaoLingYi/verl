@@ -99,13 +99,13 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, 
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     optimizers = optimizer.chained_optimizers if isinstance(optimizer, ChainedOptimizer) else (optimizer,)
-    hdos = [
-        distributed_optimizer.optimizer
+    distributed_hdos = [
+        distributed_optimizer
         for distributed_optimizer in optimizers
         if isinstance(distributed_optimizer, DistributedOptimizer)
         and isinstance(distributed_optimizer.optimizer, HybridDeviceOptimizer)
     ]
-    if not hdos:
+    if not distributed_hdos:
         optimizer.load_state_dict(state_dict)
         return False
 
@@ -122,19 +122,45 @@ def _load_mcore_016_hdo_checkpoint_state(optimizer, state_dict, metadata: dict, 
             if fp32_param is not None:
                 fp32_param.data.copy_(value["master_param"])
 
+    hdos = [distributed.optimizer for distributed in distributed_hdos]
     method_name = "_update_fp32_params_by_new_state"
+    setter_name = "_set_main_param_and_optimizer_states"
     missing = object()
-    previous_methods = [(hdo, vars(hdo).get(method_name, missing)) for hdo in hdos]
-    for hdo in hdos:
-        setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+    previous_methods = [(hdo, method_name, vars(hdo).get(method_name, missing)) for hdo in hdos]
+    previous_methods += [(dist, setter_name, vars(dist).get(setter_name, missing)) for dist in distributed_hdos]
     try:
+        for hdo in hdos:
+            setattr(hdo, method_name, update_fp32_params_by_new_state.__get__(hdo, type(hdo)))
+        for distributed in distributed_hdos:
+            original_setter = getattr(distributed, setter_name)
+
+            def set_main_param_and_optimizer_states(dist, model_param, tensors, original=original_setter):
+                if dist.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    return original(model_param, tensors)
+                group_index, group_order = dist.model_param_group_index_map[model_param]
+                main_param = dist.optimizer.param_groups[group_index]["params"][group_order]
+                optim_state = dist.optimizer.state[main_param]
+                # MCore restores step from param_groups; dp_reshardable saves no step tensor.
+                if {"param", *optim_state} - tensors.keys() == {"step"}:
+                    authoritative_step = optim_state.pop("step")
+                    try:
+                        return original(model_param, tensors)
+                    finally:
+                        optim_state["step"] = authoritative_step
+                return original(model_param, tensors)
+
+            setattr(
+                distributed, setter_name,
+                set_main_param_and_optimizer_states.__get__(distributed, type(distributed)),
+            )
         optimizer.load_state_dict(state_dict)
     finally:
-        for hdo, previous_method in previous_methods:
+        for instance, name, previous_method in reversed(previous_methods):
             if previous_method is missing:
-                delattr(hdo, method_name)
+                if name in vars(instance):
+                    delattr(instance, name)
             else:
-                setattr(hdo, method_name, previous_method)
+                setattr(instance, name, previous_method)
     return True
 
 

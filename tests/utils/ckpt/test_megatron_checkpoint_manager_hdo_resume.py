@@ -35,8 +35,9 @@ class TensorValue:
         self.value = other.value
 
 
-class Parameter:
-    pass
+class Parameter(TensorValue):
+    def __init__(self):
+        super().__init__("initial-param")
 
 
 class HybridDeviceOptimizer:
@@ -99,6 +100,33 @@ class HybridDeviceOptimizer:
 class DistributedOptimizer:
     def __init__(self, optimizer):
         self.optimizer = optimizer
+        self.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+
+    def _set_main_param_and_optimizer_states(self, model_param, tensors):
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        optim_state = self.optimizer.state[main_param]
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            for key, value in tensors.items():
+                optim_state["master_param" if key == "param" else key] = value
+            return
+        for key, destination in {"param": main_param, **optim_state}.items():
+            destination.copy_(tensors[key])
+
+    def load_state_dict(self, state_dict):
+        groups = state_dict["optimizer"]["param_groups"]
+        # Real MCore restores the non-sharded step before copying the sharded tensor payload.
+        self.authoritative_step = TensorValue(groups[0]["step"])
+        initial_state = {
+            param_id: {**{key: TensorValue("initial") for key in ("exp_avg", "exp_avg_sq", "master_param")},
+                       "step": self.authoritative_step}
+            for param_id in state_dict["param_state"]
+        }
+        self.optimizer.load_state_dict({"state": initial_state, "param_groups": groups})
+        params = self.optimizer.param_groups[0]["params"]
+        self.model_param_group_index_map = {param: (0, order) for order, param in enumerate(params)}
+        for param, tensors in zip(params, state_dict["param_state"].values()):
+            self._set_main_param_and_optimizer_states(param, {"param": tensors["master_param"], **tensors})
 
 
 class ChainedOptimizer:
@@ -129,12 +157,7 @@ class ChainedOptimizer:
                 optimizer.optimizer, HybridDeviceOptimizer
             ):
                 if optimizer.optimizer.param_update_in_fp32:
-                    optimizer.optimizer.load_state_dict(
-                        {
-                            "state": state_dict["param_state"],
-                            "param_groups": state_dict["optimizer"]["param_groups"],
-                        }
-                    )
+                    optimizer.load_state_dict(state_dict)
                 else:
                     optimizer.optimizer.state = state_dict
 
@@ -258,7 +281,90 @@ def _generate_state_dict(*, mcore_016=True):
     return _production_methods(mcore_016=mcore_016)["generate_state_dict"]
 
 
+def _step_restore_case(step=250):
+    hdo = HybridDeviceOptimizer(initialized=False)
+    main_param = torch.zeros(2)
+    hdo.param_groups = [{"params": [main_param]}]
+    hdo.state = {main_param: {key: torch.zeros(2) for key in ("exp_avg", "exp_avg_sq", "master_param")}}
+    distributed = DistributedOptimizer(hdo)
+    distributed.model_param_group_index_map = {main_param: (0, 0)}
+    chained = ChainedOptimizer(distributed)
+    source = {key: torch.full((2,), value) for key, value in
+              (("param", 1.), ("exp_avg", 2.), ("exp_avg_sq", 3.), ("master_param", 4.))}
+    checkpoint = {"optimizer": {"param_groups": [{"step": step}]}, "param_state": source}
+    authority = {}
+
+    def load(state_dict):
+        authority["step"] = torch.tensor(state_dict["optimizer"]["param_groups"][0]["step"])
+        hdo.state[main_param]["step"] = authority["step"]
+        distributed._set_main_param_and_optimizer_states(main_param, state_dict["param_state"])
+        hdo._update_fp32_params_by_new_state()
+
+    chained.load_state_dict = load
+    return chained, distributed, hdo, main_param, checkpoint, authority
+
+
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_missing_sharded_step_preserves_param_group_authority_and_object(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        for saved_step in (11, 250):
+            with self.subTest(step=saved_step):
+                chained, distributed, hdo, param, checkpoint, authority = _step_restore_case(saved_step)
+                self.assertNotIn("step", checkpoint["param_state"])
+                self.assertTrue(helper(chained, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True))
+                torch.testing.assert_close(param, checkpoint["param_state"]["param"])
+                for key in ("exp_avg", "exp_avg_sq", "master_param"):
+                    torch.testing.assert_close(hdo.state[param][key], checkpoint["param_state"][key])
+                self.assertIs(hdo.state[param]["step"], authority["step"])
+                self.assertEqual(hdo.state[param]["step"].item(), saved_step)
+                self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
+                self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+
+    def test_missing_tensor_state_still_fails_and_restores_both_methods(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        for missing_key in ("param", "exp_avg", "exp_avg_sq", "master_param"):
+            with self.subTest(missing=missing_key):
+                chained, distributed, hdo, param, checkpoint, authority = _step_restore_case()
+                del checkpoint["param_state"][missing_key]
+                with self.assertRaises(KeyError) as error:
+                    helper(chained, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True)
+                self.assertEqual(error.exception.args, (missing_key,))
+                self.assertIs(hdo.state[param]["step"], authority["step"])
+                self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
+                self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+
+    def test_source_step_and_precision_aware_path_keep_original_behavior(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        for precision_aware, source_step in ((False, True), (True, True), (True, False)):
+            with self.subTest(precision_aware=precision_aware, source_step=source_step):
+                chained, distributed, hdo, param, checkpoint, authority = _step_restore_case()
+                distributed.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = precision_aware
+                if source_step:
+                    checkpoint["param_state"]["step"] = torch.tensor(17)
+                helper(chained, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True)
+                self.assertEqual(hdo.state[param]["step"].item(), 17 if source_step else 250)
+                if precision_aware and source_step:
+                    self.assertIs(hdo.state[param]["step"], checkpoint["param_state"]["step"])
+                else:
+                    self.assertIs(hdo.state[param]["step"], authority["step"])
+
+    def test_step_and_existing_instance_methods_restore_after_copy_failure(self):
+        helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
+        chained, distributed, hdo, param, checkpoint, authority = _step_restore_case()
+
+        def fail_copy(model_param, tensors):
+            self.assertNotIn("step", hdo.state[param])
+            raise RuntimeError("copy failed")
+
+        original_hook = hdo._update_fp32_params_by_new_state
+        distributed._set_main_param_and_optimizer_states = fail_copy
+        hdo._update_fp32_params_by_new_state = original_hook
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            helper(chained, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True)
+        self.assertIs(hdo.state[param]["step"], authority["step"])
+        self.assertIs(distributed._set_main_param_and_optimizer_states, fail_copy)
+        self.assertIs(hdo._update_fp32_params_by_new_state, original_hook)
+
     def test_rng_loader_restores_all_actor_rng_domains(self):
         restored = {}
         methods = _production_methods()
@@ -533,6 +639,7 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
                         "lr": 0.125,
                         "betas": (0.8, 0.95),
                         "weight_decay": 0.01,
+                        "step": 250,
                     }
                 ]
             },
@@ -541,13 +648,11 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
                     "exp_avg": TensorValue("native-exp-avg"),
                     "exp_avg_sq": TensorValue("native-exp-avg-sq"),
                     "master_param": TensorValue("native-master"),
-                    "step": TensorValue(11),
                 },
                 1: {
                     "exp_avg": TensorValue("low-exp-avg"),
                     "exp_avg_sq": TensorValue("low-exp-avg-sq"),
                     "master_param": TensorValue("low-master"),
-                    "step": TensorValue(11),
                 },
             },
         }
@@ -593,11 +698,12 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
             self.assertEqual(hdo.state[param]["exp_avg"].value, f"{prefix}-exp-avg")
             self.assertEqual(hdo.state[param]["exp_avg_sq"].value, f"{prefix}-exp-avg-sq")
             self.assertEqual(hdo.state[param]["master_param"].value, f"{prefix}-master")
-            self.assertEqual(hdo.state[param]["step"].value, 11)
+            self.assertEqual(hdo.state[param]["step"].value, 250)
+            self.assertIs(hdo.state[param]["step"], optimizer.chained_optimizers[0].authoritative_step)
         self.assertEqual(hdo.param_groups[0]["lr"], 0.125)
         self.assertEqual(hdo.param_groups[0]["betas"], (0.8, 0.95))
         self.assertEqual(hdo.param_groups[0]["weight_decay"], 0.01)
-        self.assertEqual(hdo.param_to_fp32_param[hdo.low_precision_param].value, "low-master")
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(optimizer.chained_optimizers[0]))
         self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
         self.assertEqual(rng.value, "checkpoint-rng")
         self.assertEqual(manager.global_step, 1)
@@ -613,6 +719,12 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
         helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
         self.assertFalse(helper(ordinary, checkpoint_state, metadata, full_resume=True))
         self.assertEqual(ordinary.loaded_states, [checkpoint_state])
+
+        non_hdo = DistributedOptimizer(OrdinaryOptimizer())
+        non_hdo_chain = ChainedOptimizer(non_hdo)
+        self.assertFalse(helper(non_hdo_chain, checkpoint_state, metadata, full_resume=True))
+        self.assertEqual(non_hdo_chain.loaded_states, [checkpoint_state])
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(non_hdo))
 
         for helper_metadata, full_resume in (
             ({"distrib_optim_sharding_type": "fully_reshardable"}, True),
@@ -643,21 +755,41 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
             self.skipTest("requires Megatron-Core 0.16.x")
 
         hdo = object.__new__(RealHybridDeviceOptimizer)
-        native_fp32_param = object()
+        model_param = torch.zeros(2)
+        main_param = torch.zeros(2)
         hdo.param_update_in_fp32 = True
-        hdo.state = {native_fp32_param: {"master_param": object()}}
+        authoritative_step = torch.tensor(250)
+        hdo.state = {main_param: {
+            "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2),
+            "master_param": torch.zeros(2), "step": authoritative_step,
+        }}
+        hdo.param_groups = [{"params": [main_param], "step": 250}]
         hdo.param_to_fp32_param = {}
         with self.assertRaises(KeyError):
             hdo._update_fp32_params_by_new_state()
 
         distributed = object.__new__(RealDistributedOptimizer)
         distributed.optimizer = hdo
+        distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
+        distributed.model_param_group_index_map = {model_param: (0, 0)}
+        source = {key: torch.full((2,), value) for key, value in
+                  (("param", 1.), ("exp_avg", 2.), ("exp_avg_sq", 3.), ("master_param", 4.))}
+        self.assertNotIn("step", source)
+        with self.assertRaises(KeyError) as error:
+            RealDistributedOptimizer._set_main_param_and_optimizer_states(distributed, model_param, source)
+        self.assertEqual(error.exception.args, ("step",))
+        main_param.zero_()
+        for key in ("exp_avg", "exp_avg_sq", "master_param"):
+            hdo.state[main_param][key].zero_()
+
         chained = object.__new__(RealChainedOptimizer)
         chained.chained_optimizers = [distributed]
         load_calls = []
 
         def load_state_dict(optimizer, state_dict):
             load_calls.append(state_dict)
+            # Dispatch through the instance wrapper into the real, failing MCore setter.
+            optimizer.chained_optimizers[0]._set_main_param_and_optimizer_states(model_param, source)
             optimizer.chained_optimizers[0].optimizer._update_fp32_params_by_new_state()
 
         chained.load_state_dict = MethodType(load_state_dict, chained)
@@ -674,6 +806,15 @@ class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
             )
         )
         self.assertEqual(load_calls, [{"checkpoint": "optimizer-state"}])
+        torch.testing.assert_close(main_param, source["param"])
+        for key in ("exp_avg", "exp_avg_sq", "master_param"):
+            torch.testing.assert_close(hdo.state[main_param][key], source[key])
+        self.assertIs(hdo.state[main_param]["step"], authoritative_step)
+        self.assertEqual(authoritative_step.item(), 250)
+        self.assertNotIn("_set_main_param_and_optimizer_states", vars(distributed))
+        self.assertNotIn("_update_fp32_params_by_new_state", vars(hdo))
+        self.assertIs(distributed._set_main_param_and_optimizer_states.__func__,
+                      RealDistributedOptimizer._set_main_param_and_optimizer_states)
         with self.assertRaises(KeyError):
             hdo._update_fp32_params_by_new_state()
 
