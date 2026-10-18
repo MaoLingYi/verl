@@ -35,6 +35,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
@@ -619,7 +620,20 @@ class MegatronPPOActor(BasePPOActor):
         # TODO: actually, we just need to control the sampling order.
         if self.config.router_replay.mode == "R3" and mpu.get_pipeline_model_parallel_world_size() == 1:
             # PP1 already owns every layer: transfer routes only with each microbatch.
-            mini_batch = data.to("cpu")
+            mini_batch = data
+            if not use_dynamic_bsz and (
+                "multi_modal_inputs" in data.non_tensor_batch or data.batch["position_ids"].dim() == 3
+            ):
+                # Only the local containers may be mutated; tensor leaves and payloads stay shared.
+                mini_batch = DataProto(
+                    batch=TensorDict(
+                        dict(data.batch.items()), batch_size=data.batch.batch_size,
+                        device=data.batch.device, names=data.batch.names,
+                    ),
+                    non_tensor_batch=data.non_tensor_batch.copy(),
+                    meta_info=data.meta_info,
+                )
+            mini_batch = mini_batch.to("cpu")
         else:
             data.to(get_device_id())
             data.batch = data.batch.contiguous()
@@ -1069,9 +1083,9 @@ class MegatronPPOActor(BasePPOActor):
         # loss_reduces contains the stats returned from loss_func
 
         if self.has_multi_modal_inputs:
-            data.batch.pop("multi_modal_inputs")
-            data.batch.pop("multi_modal_inputs_idx")
-            data.non_tensor_batch.pop("multi_modal_inputs")
+            mini_batch.batch.pop("multi_modal_inputs")
+            mini_batch.batch.pop("multi_modal_inputs_idx")
+            mini_batch.non_tensor_batch.pop("multi_modal_inputs")
 
         losses_reduced = {"output": losses_reduced}
         losses_reduced["model_forward_seconds"] = model_forward_seconds
