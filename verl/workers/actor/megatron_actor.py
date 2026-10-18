@@ -630,8 +630,12 @@ class MegatronPPOActor(BasePPOActor):
                 group=mpu.get_pipeline_model_parallel_group(),
             )
             mini_batch.to("cpu")
+        # Fixed R3 PP1 batches can be consolidated/locked; forward_step converts each mask locally.
+        if use_dynamic_bsz or not (
+            self.config.router_replay.mode == "R3" and mpu.get_pipeline_model_parallel_world_size() == 1
+        ):
+            mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         # split into micro-batches
-        mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             mini_batch.batch["multi_modal_inputs"] = mini_batch.non_tensor_batch["multi_modal_inputs"]

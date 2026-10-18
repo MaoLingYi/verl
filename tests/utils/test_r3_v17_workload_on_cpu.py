@@ -185,8 +185,10 @@ def test_batch_staging_r3_pp1_is_microbatch_only(mode,pp,expected):
     tree=ast.parse((ROOT/'verl/workers/actor/megatron_actor.py').read_text(encoding='utf-8'))
     fn=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='forward_backward_batch')
     # Execute actual staging prefix, before microbatch split and model forward.
-    prefix=fn.body[1:next(i for i,n in enumerate(fn.body) if isinstance(n,ast.Assign)
-                         and ast.unparse(n.targets[0])=='mini_batch.batch[\'attention_mask\']')]
+    prefix=fn.body[1:next(i for i,n in enumerate(fn.body) if isinstance(n,ast.If)
+                         and any(isinstance(child,ast.Assign) and
+                                 ast.unparse(child.targets[0])=="mini_batch.batch['attention_mask']"
+                                 for child in ast.walk(n)))]
     events=[]
     class Batch:
         def contiguous(self): return self
@@ -323,3 +325,166 @@ def test_built_r3_accepts_enum_and_does_not_impose_qwen3_on_other_models_or_mode
     execute_built_config(moe_router_score_function=Score.softmax,moe_router_load_balancing_type=Balance.none)
     execute_built_config(mode='disabled',num_layers=2,enable_routing_replay=False)
     execute_built_config(model_type='other_moe',num_layers=2,num_moe_experts=16,moe_router_topk=2)
+
+
+@pytest.fixture
+def real_dataproto_types(record_property):
+    # These tests intentionally skip rather than substitute a fake TensorDict/DataProto.
+    td = pytest.importorskip('tensordict', reason='real TensorDict is not installed locally')
+    pytest.importorskip('ray', reason='real DataProto import requires Ray; no Ray runtime is started')
+    from verl.protocol import DataProto
+    record_property('tensordict_version', td.__version__)
+    return td.TensorDict, DataProto
+
+
+def run_full_actor_batch_on_cpu(data, mode, pp, monkeypatch, forward_only=True):
+    """Run the whole method with real containers and mocked model/schedule/replay installation.
+
+    forward_only=False checks forward preparation/retention flags, not the loss closure or backward.
+    """
+    import sys
+    import time
+    from functools import partial
+    from types import ModuleType
+    tree=ast.parse((ROOT/'verl/workers/actor/megatron_actor.py').read_text(encoding='utf-8'))
+    fn=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='forward_backward_batch')
+    fn.decorator_list=[]
+    seen=[]; replay=[]; broadcast=[]
+    def model_forward(**kwargs):
+        assert kwargs['attention_mask'].dtype==torch.bool
+        assert kwargs['position_ids'].ndim==2
+        assert kwargs['logits_processor_args']['label_mask'].dtype==torch.bool
+        seen.append(kwargs)
+        return {'log_probs':torch.zeros_like(kwargs['input_ids'],dtype=torch.float32)}
+    mcore=ModuleType('verl.models.mcore')
+    mcore.get_mcore_forward_fn=lambda config:model_forward
+    mcore.get_mcore_forward_fused_fn=lambda config:model_forward
+    monkeypatch.setitem(sys.modules,'verl.models.mcore',mcore)
+    def schedule(**kwargs):
+        outputs=[]
+        for _ in range(kwargs['num_microbatches']):
+            output,loss_fn=kwargs['forward_step_func'](kwargs['data_iterator'],kwargs['model'][0])
+            if forward_only:
+                _,stats=loss_fn(output)
+                outputs.append(stats)
+        return outputs
+    def install(routes,mask,*a,**kwargs):
+        assert mask.dtype==torch.bool
+        replay.append((routes,mask,kwargs['retain_for_backward']))
+    class Config(NS):
+        def get(self,key,default=None):return getattr(self,key,default)
+    owner=NS(config=Config(router_replay=NS(mode=mode),megatron=NS(use_remove_padding=True),
+                           clip_ratio=.2,entropy_coeff=0.,clip_ratio_c=3.),
+             router_shift_observer=None,eu_derpo_observer=None,tf_config=NS(),hf_config=NS(),
+             actor_module=[NS()],use_fused_kernels=False,mtp_config=None)
+    ns={'torch':torch,'time':time,'partial':partial,'get_device_id':lambda:'cpu',
+        'mpu':NS(get_pipeline_model_parallel_world_size=lambda:pp,
+                 get_pipeline_model_parallel_last_rank=lambda:0,get_pipeline_model_parallel_group=lambda:None),
+        'broadcast_dict_tensor':lambda batch,**kwargs:broadcast.append(batch),
+        'get_forward_backward_func':lambda:schedule,'unwrap_model':lambda model:model,
+        'make_batch_generator':function('verl/utils/megatron/pipeline_parallel.py','make_batch_generator',{}),
+        'set_router_replay_data':install,
+        'RouterReplayHelper':NS(is_replay_backward_action=lambda *a:False,
+                               is_replay_forward_action=lambda *a:mode=='R3',
+                               is_r2_record_action=lambda *a:False,get_micro_batch_router_list=lambda *a:[])}
+    exec(compile(ast.Module(body=[fn],type_ignores=[]),'full-actor-batch','exec',
+                 flags=__import__('__future__').annotations.compiler_flag),ns)
+    result=ns['forward_backward_batch'](owner,data,forward_only=forward_only,
+                                       use_dynamic_bsz=False,micro_batch_size=1)
+    assert len(seen)==len(data)
+    assert len(broadcast)==(0 if mode=='R3' and pp==1 else 1)
+    return seen,replay,result
+
+
+def real_actor_data(types, three_dim_positions=False):
+    TensorDict,DataProto=types
+    rows,seq_len=4,8
+    mask=torch.tensor([[0,1,1,1,1,1,1,0],[1,1,1,1,1,0,0,0],
+                       [0,0,1,1,1,1,1,1],[1,1,1,1,1,1,1,1]],dtype=torch.int64)
+    positions=mask.cumsum(-1)-1
+    if three_dim_positions:positions=positions[:,None,:].expand(-1,3,-1).clone()
+    input_ids=torch.arange(rows*seq_len).reshape(rows,seq_len)
+    batch=TensorDict({'input_ids':input_ids,
+                     'responses':input_ids[:,-3:].clone(),
+                     'attention_mask':mask,'position_ids':positions,
+                     'routed_experts':(torch.arange(rows*seq_len*48*8).reshape(rows,seq_len,48,8)%128).to(torch.uint8)},
+                    batch_size=[rows],device='cpu')
+    return DataProto(batch=batch,meta_info={'temperature':1.})
+
+
+@pytest.mark.parametrize('representation',['locked','consolidated','serialized'])
+@pytest.mark.parametrize('forward_only',[True,False])
+def test_locked_real_dataproto_r3_pp1_complete_microbatch_path(
+        real_dataproto_types,monkeypatch,representation,forward_only):
+    """Locked support is scoped to text-only R3 PP1, fixed microbatches and 2-D position_ids."""
+    import pickle
+    data=real_actor_data(real_dataproto_types)
+    if representation=='consolidated':data.batch=data.batch.consolidate()
+    elif representation=='serialized':data=pickle.loads(pickle.dumps(data))
+    data.batch.lock_()
+    original=data.batch
+    routes=original['routed_experts'];mask=original['attention_mask']
+    route_values=routes.clone();mask_values=mask.clone()
+    assert data.to('cpu') is data and data.batch is original and data.batch.is_locked
+    # This is the exact old dtype-changing assignment, not a string/AST assertion.
+    with pytest.raises(RuntimeError,match='[Ll]ocked'):
+        data.batch['attention_mask']=data.batch['attention_mask'].to(bool)
+    for _ in range(2):
+        seen,replay,_=run_full_actor_batch_on_cpu(data,'R3',1,monkeypatch,forward_only)
+        assert data.batch is original and original.is_locked
+        assert original['attention_mask'] is mask and mask.dtype==torch.int64
+        assert original['routed_experts'] is routes
+        torch.testing.assert_close(routes,route_values)
+        torch.testing.assert_close(mask,mask_values)
+        assert len(replay)==len(data)
+        for row,(model_args,(micro_routes,replay_mask,retain)) in enumerate(zip(seen,replay)):
+            torch.testing.assert_close(model_args['attention_mask'],mask[row:row+1].bool())
+            torch.testing.assert_close(replay_mask,mask[row:row+1].bool())
+            torch.testing.assert_close(micro_routes,routes[row:row+1])
+            assert micro_routes.dtype==torch.uint8 and micro_routes.shape==(1,8,48,8)
+            assert micro_routes.data_ptr()==routes[row:row+1].data_ptr()
+            assert micro_routes.untyped_storage().data_ptr()==routes.untyped_storage().data_ptr()
+            assert retain is (not forward_only)
+            torch.testing.assert_close(model_args['position_ids'],original['position_ids'][row:row+1])
+            labels=model_args['logits_processor_args']['label']
+            torch.testing.assert_close(labels[:,-4:-1],original['responses'][row:row+1])
+
+
+@pytest.mark.parametrize('mode,pp',[('disabled',1),('R3',4)])
+@pytest.mark.parametrize('three_dim_positions',[False,True])
+def test_real_dataproto_other_paths_still_broadcast_and_replace_keys(
+        real_dataproto_types,monkeypatch,mode,pp,three_dim_positions):
+    """Preserve legacy behavior with writable inputs; do not claim locked-input support here."""
+    data=real_actor_data(real_dataproto_types,three_dim_positions)
+    assert not data.batch.is_locked
+    routes=data.batch['routed_experts']
+    expected_mask=data.batch['attention_mask'].bool()
+    expected_positions=data.batch['position_ids'][:,0] if three_dim_positions else data.batch['position_ids']
+    seen,replay,_=run_full_actor_batch_on_cpu(data,mode,pp,monkeypatch)
+    assert data.batch['attention_mask'].dtype==torch.bool
+    assert data.batch['position_ids'].ndim==2
+    assert data.batch['routed_experts'].data_ptr()==routes.data_ptr()
+    for row,kwargs in enumerate(seen):
+        torch.testing.assert_close(kwargs['attention_mask'],expected_mask[row:row+1])
+        torch.testing.assert_close(kwargs['position_ids'],expected_positions[row:row+1])
+    assert len(replay)==(len(data) if mode=='R3' else 0)
+
+
+@pytest.mark.parametrize('mode,pp,dynamic,converted',[
+    ('R3',1,False,False),('R3',1,True,True),('disabled',1,False,True),('R3',4,False,True)])
+def test_bulk_mask_assignment_is_skipped_only_for_fixed_r3_pp1(mode,pp,dynamic,converted):
+    # Runnable without TensorDict: verifies the exact production guard and real Torch dtype conversion.
+    tree=ast.parse((ROOT/'verl/workers/actor/megatron_actor.py').read_text(encoding='utf-8'))
+    fn=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='forward_backward_batch')
+    block=next(n for n in fn.body if isinstance(n,ast.If) and any(
+        isinstance(child,ast.Assign) and ast.unparse(child.targets[0])=="mini_batch.batch['attention_mask']"
+        for child in ast.walk(n)))
+    original=torch.tensor([[0,1,1]],dtype=torch.int64)
+    ns={'self':NS(config=NS(router_replay=NS(mode=mode))),
+        'mpu':NS(get_pipeline_model_parallel_world_size=lambda:pp),'use_dynamic_bsz':dynamic,
+        'mini_batch':NS(batch={'attention_mask':original})}
+    exec(compile(ast.Module(body=[block],type_ignores=[]),'bulk-mask-guard','exec'),ns)
+    actual=ns['mini_batch'].batch['attention_mask']
+    assert actual.dtype==(torch.bool if converted else torch.int64)
+    torch.testing.assert_close(actual.bool(),original.bool())
+    assert (actual is original)==(not converted)
