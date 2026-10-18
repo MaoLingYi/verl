@@ -258,7 +258,9 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None, replay_token_mask=None):
+def set_router_replay_data(
+    layers_topk_idx, attention_mask, tf_config, vp_rank=None, replay_token_mask=None, retain_for_backward=True
+):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -331,7 +333,7 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
             router.set_target_indices(
                 layers_topk_idx_reshape[idx].to(torch.int64),
                 None if token_mask_split is None else token_mask_split,
-                retain_for_backward=token_mask_split is None,
+                retain_for_backward=retain_for_backward and token_mask_split is None,
             )
             router_offset += 1
             moe_idx += 1

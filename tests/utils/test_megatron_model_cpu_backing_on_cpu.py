@@ -179,7 +179,8 @@ def test_actor_update_releases_loaded_backing_before_cache_allocation_only_for_e
         _is_actor=True, _is_offload_param=True, actor_module=[model], actor_optimizer=object(),
         _restore_actor_optimizer_copy_params_for_update=lambda: events.append("selective_restore"),
         _preserve_hdo_optimizer_residency=lambda: True, _load_actor_optimizer_for_update=lambda: False,
-        config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=SimpleNamespace(enabled=eu_enabled))),
+        config=SimpleNamespace(actor=SimpleNamespace(
+            eu_derpo=SimpleNamespace(enabled=eu_enabled), router_replay=SimpleNamespace(mode="disabled"))),
     )
     namespace["update_actor"](worker, SimpleNamespace(meta_info={}))
     if eu_enabled:

@@ -617,15 +617,19 @@ class MegatronPPOActor(BasePPOActor):
         """
         # broadcast from last pp rank to all other pp ranks
         # TODO: actually, we just need to control the sampling order.
-        data.to(get_device_id())
-        data.batch = data.batch.contiguous()
-        mini_batch = data
-        broadcast_dict_tensor(
-            mini_batch.batch,
-            src=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group(),
-        )
-        mini_batch.to("cpu")
+        if self.config.router_replay.mode == "R3" and mpu.get_pipeline_model_parallel_world_size() == 1:
+            # PP1 already owns every layer: transfer routes only with each microbatch.
+            mini_batch = data.to("cpu")
+        else:
+            data.to(get_device_id())
+            data.batch = data.batch.contiguous()
+            mini_batch = data
+            broadcast_dict_tensor(
+                mini_batch.batch,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+            mini_batch.to("cpu")
         # split into micro-batches
         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
@@ -917,6 +921,7 @@ class MegatronPPOActor(BasePPOActor):
                     self.tf_config,
                     vp_rank,
                     replay_token_mask=replay_token_mask,
+                    retain_for_backward=not (forward_only and self.config.router_replay.mode == "R3"),
                 )
 
             from verl.models.mcore import get_mcore_forward_fn, get_mcore_forward_fused_fn

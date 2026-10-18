@@ -664,7 +664,7 @@ class AgentLoopWorker:
                     f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
                 )
 
-            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+            routed_experts[:, start_pos:end_pos] = experts_tensor[: end_pos - start_pos].unsqueeze(0)
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)

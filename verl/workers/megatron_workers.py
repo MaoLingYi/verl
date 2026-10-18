@@ -969,7 +969,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         preserve_hdo = self._preserve_hdo_optimizer_residency()
         if self._load_actor_optimizer_for_update():
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
-        if eu_enabled and self._is_offload_param:
+        if (eu_enabled or self.config.actor.router_replay.mode == "R3") and self._is_offload_param:
             log_eu_derpo_memory(
                 "before_actor_cpu_backing_release", self.actor_optimizer,
                 megatron_model_cpu_data_bytes(self.actor_module),
@@ -1006,6 +1006,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(dataloader=dataloader)
         finally:
+            if self.config.actor.router_replay.mode == "R3":
+                RouterReplay.clear_global_indices()
+                RouterReplay.clear_global_router_replay_action()
             if v13_route_diagnostic is not None:
                 self.actor.clear_eu_derpo_rollout_route_diagnostic()
         delta_time = timer.last
