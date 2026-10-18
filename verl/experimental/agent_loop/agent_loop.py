@@ -528,7 +528,16 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
+        output = self._postprocess(
+            outputs,
+            input_non_tensor_batch=batch.non_tensor_batch,
+            require_routing_replay=(
+                OmegaConf.select(
+                    self.config.get("actor_rollout_ref", self.config), "actor.router_replay.mode", default="disabled"
+                ) == "R3"
+                and not batch.meta_info.get("validate", False)
+            ),
+        )
 
         return output
 
@@ -649,14 +658,29 @@ class AgentLoopWorker:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
             if experts_tensor.ndim != 3 or tuple(experts_tensor.shape) != (length, layer_num, topk_num):
                 raise ValueError("routed_experts must have shape [token, layer, topk]")
-            if experts_tensor.numel() and (experts_tensor.min() < 0 or experts_tensor.max() > 255):
-                raise ValueError("routed_experts must contain global expert ids in uint8 range")
+            hf_config = self.model_config.hf_config
+            if (layer_num, topk_num) != (hf_config.num_hidden_layers, hf_config.num_experts_per_tok):
+                raise ValueError("routed_experts layer/top-k shape does not match the model")
+            if experts_tensor.is_floating_point() or experts_tensor.is_complex() or experts_tensor.dtype == torch.bool:
+                raise ValueError("routed_experts must contain integer expert ids")
+            num_experts = getattr(hf_config, "num_experts", getattr(hf_config, "num_local_experts", 256))
+            if experts_tensor.numel() and (
+                int(experts_tensor.min()) < 0 or int(experts_tensor.max()) >= min(num_experts, 256)
+            ):
+                raise ValueError("routed_experts must contain valid global expert ids in uint8 range")
             experts_tensor = experts_tensor.to(torch.uint8)
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            end_pos = min(start_pos + length, total_length)
+            # SGLang captures prompt + response[:-1]; the final sampled token has no forward.
+            # Its logprob comes from the preceding input position, including at EOS/hard cap.
+            token_length = len(output.prompt_ids) + len(output.response_ids)
+            if not token_length - 1 <= length <= token_length:
+                raise ValueError(
+                    f"routed_experts does not cover causal replay inputs: routes={length}, tokens={token_length}"
+                )
+            end_pos = start_pos + length
 
             # Add boundary checks for robustness
             if start_pos < 0 or end_pos > total_length:
@@ -795,6 +819,7 @@ class AgentLoopWorker:
         self,
         inputs: list[_InternalAgentLoopOutput],
         input_non_tensor_batch: dict | None = None,
+        require_routing_replay: bool = False,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
@@ -807,7 +832,10 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
+        route_present = [output.routed_experts is not None for output in inputs]
+        if (any(route_present) or require_routing_replay) and not all(route_present):
+            raise ValueError("Full R3 requires routed_experts for every training trajectory; mixed route payloads are invalid")
+        if all(route_present):
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 
         batch = TensorDict(

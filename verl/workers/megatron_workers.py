@@ -51,7 +51,7 @@ from verl.utils.checkpoint.megatron_checkpoint_manager import (
 )
 from verl.utils.checkpoint.megatron_checkpoint_manager import mcore_016 as checkpoint_mcore_016
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES
+from verl.utils.debug.eu_derpo import HOST_RAM_SAFETY_MARGIN_BYTES, _raylet_linux_memory_limit
 from verl.utils.device import (
     get_device_id,
     get_device_name,
@@ -577,6 +577,33 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 peft_config=self.config.model.get("lora", None),
             )
             self.tf_config = updated_tf_config
+            if self.config.actor.router_replay.mode == "R3":
+                r3_fields = (
+                    "num_layers", "num_moe_experts", "moe_router_topk", "moe_router_pre_softmax",
+                    "moe_router_score_function", "moe_aux_loss_coeff", "moe_z_loss_coeff",
+                    "moe_router_load_balancing_type", "enable_routing_replay",
+                )
+                r3_config = {key: getattr(self.tf_config, key, None) for key in r3_fields}
+                r3_expected = {
+                    key: override_transformer_config[key]
+                    for key in ("moe_aux_loss_coeff", "moe_z_loss_coeff", "moe_router_load_balancing_type")
+                    if key in override_transformer_config
+                }
+                if self.hf_config.model_type == "qwen3_moe":
+                    r3_expected.update(
+                        num_layers=48, num_moe_experts=128, moe_router_topk=8,
+                        moe_router_pre_softmax=False, moe_router_score_function="softmax",
+                        enable_routing_replay=True, moe_aux_loss_coeff=0.0, moe_z_loss_coeff=0.0,
+                        moe_router_load_balancing_type="none",
+                    )
+                for key, expected in r3_expected.items():
+                    actual = getattr(r3_config[key], "value", r3_config[key])
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"R3 TransformerConfig contract was not applied: {key}={actual!r}, expected={expected!r}"
+                        )
+                if self.rank == 0:
+                    print(f"R3_TRANSFORMER_CONFIG={r3_config}", flush=True)
             print(f"actor_module: {len(actor_module)}")
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:
@@ -897,7 +924,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         update_weights_started = time.perf_counter()
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
-        if self.config.actor.eu_derpo.enabled:
+        if self.config.actor.eu_derpo.enabled or self.config.actor.router_replay.mode == "R3":
             log_eu_derpo_memory(
                 "before_rollout_update_weights",
                 self.actor_optimizer,
@@ -923,7 +950,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.base_sync_done = True
 
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
-        if self.config.actor.eu_derpo.enabled:
+        if self.config.actor.eu_derpo.enabled or self.config.actor.router_replay.mode == "R3":
             log_eu_derpo_memory(
                 "after_rollout_update_weights",
                 self.actor_optimizer,
@@ -939,7 +966,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self._warn_eu_derpo_hdo_gpu_headroom("before_rollout_wakeup")
             wakeup_started = time.perf_counter()
             await self.rollout.resume(tags=["kv_cache"])
-            if self.config.actor.eu_derpo.enabled:
+            if self.config.actor.eu_derpo.enabled or self.config.actor.router_replay.mode == "R3":
                 log_eu_derpo_memory(
                     "after_rollout_wakeup",
                     self.actor_optimizer,
@@ -957,11 +984,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._restore_actor_optimizer_copy_params_for_update()
         eu_enabled = self.config.actor.eu_derpo.enabled
         defer_phase_offload = bool(data.meta_info.get("defer_phase_offload_for_checkpoint", False))
-        if eu_enabled:
+        if eu_enabled or self.config.actor.router_replay.mode == "R3":
+            ray_limit = _raylet_linux_memory_limit() if self.config.actor.router_replay.mode == "R3" else None
             log_eu_derpo_memory(
                 "before_actor_update",
                 self.actor_optimizer,
                 megatron_model_cpu_data_bytes(self.actor_module),
+                extra={
+                    "ray_linux_threshold_bytes": ray_limit[0] if ray_limit else None,
+                    "ray_linux_headroom_estimate_gib": (
+                        (ray_limit[0] - ray_limit[1] + psutil.virtual_memory().available) / _GIB
+                        if ray_limit else None
+                    ),
+                } if self.config.actor.router_replay.mode == "R3" else None,
             )
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
@@ -984,7 +1019,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "pinned_host_empty_cache_available": int(hasattr(torch._C, "_host_emptyCache")), **reclaim,
                 },
             )
-        if eu_enabled:
+        if eu_enabled or self.config.actor.router_replay.mode == "R3":
             log_eu_derpo_memory(
                 "after_actor_load",
                 self.actor_optimizer,
