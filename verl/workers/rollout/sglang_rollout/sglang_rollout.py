@@ -172,13 +172,19 @@ class ServerAdapter(BaseRollout):
         """
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
+            if self.config.enable_rollout_routing_replay and "kv_cache" in tags and "cuda_graph" not in tags:
+                # Recover graphs with KV cache, after the actor has offloaded its parameters.
+                tags = [*tags, "cuda_graph"]
             await self._engine.resume_memory_occupation(tags=tags)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
         await self._init_server_adapter()
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
-            await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
+            tags = ["kv_cache", "weights"]
+            if self.config.enable_rollout_routing_replay:
+                tags.append("cuda_graph")
+            await self._engine.release_memory_occupation(tags=tags)
 
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs

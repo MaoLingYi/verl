@@ -159,6 +159,13 @@ class SGLangHttpServer:
         return self._server_address, self._server_port
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
+        if (
+            self.config.enable_rollout_routing_replay
+            and self.config.free_cache_engine
+            and self.rollout_mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED)
+        ):
+            # SGLang 0.5.9 must tag graph allocations before capture for sleep to release them.
+            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
         if self.nnodes > 1:
             if self.node_rank != 0:
                 assert master_address and master_port, "non-master node should provide master address and port"
@@ -311,7 +318,10 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            tags = ["kv_cache", "weights"]
+            if self.config.enable_rollout_routing_replay:
+                tags.append("cuda_graph")
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -324,11 +334,12 @@ class SGLangHttpServer:
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
-        if self.rollout_mode == RolloutMode.HYBRID:
-            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
-            await self.tokenizer_manager.release_memory_occupation(obj, None)
-        elif self.rollout_mode == RolloutMode.COLOCATED:
-            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+        if self.rollout_mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED):
+            tags = ["kv_cache", "weights"]
+            if self.config.enable_rollout_routing_replay:
+                # SGLang 0.5.9 keeps graph-pool memory in a separate memory-saver region.
+                tags.append("cuda_graph")
+            obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
