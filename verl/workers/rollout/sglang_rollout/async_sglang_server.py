@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
 
+from verl.utils.memory_utils import log_r3_cuda_phase
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -341,6 +342,7 @@ class SGLangHttpServer:
                 tags.append("cuda_graph")
             obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
+            log_r3_cuda_phase("sglang_sleep_ack", r3_enabled=self.config.enable_rollout_routing_replay)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
             obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])

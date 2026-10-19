@@ -236,7 +236,7 @@ def test_backing_release_is_scoped_and_before_actor_compute(mode,eu,offload,expe
     model=object()
     ns={'self':NS(config=NS(actor=NS(router_replay=NS(mode=mode))),_is_offload_param=offload,
                   actor_module=model,actor_optimizer=object()),'eu_enabled':eu,'_GIB':2**30,
-        'log_eu_derpo_memory':lambda *a,**k:None,'megatron_model_cpu_data_bytes':lambda m:0,
+        'log_r3_cuda_phase':lambda *a,**k:None,'log_eu_derpo_memory':lambda *a,**k:None,'megatron_model_cpu_data_bytes':lambda m:0,
         'release_megatron_model_cpu_data':lambda m:events.append(('release',m)) or 123,
         '_best_effort_release_host_allocator_after_copy_param_restore':lambda:events.append('reclaim') or {},
         'torch':torch}

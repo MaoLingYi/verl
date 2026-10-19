@@ -236,6 +236,46 @@ def log_eu_derpo_memory(
     return values
 
 
+def log_r3_cuda_phase(stage, optimizer=None, model=None, *, r3_enabled=False):
+    """Opt-in, non-collective telemetry; never mask a training/CUDA failure."""
+    if not r3_enabled or os.getenv("R3_CUDA_PHASE_DIAG") != "1":
+        return None
+    values = {"stage": stage, "timestamp": datetime.now().astimezone().isoformat(),
+              "pid": os.getpid(), "local_rank": os.getenv("LOCAL_RANK"), "errors": {}}
+
+    def read(name, fn):
+        try:
+            values[name] = fn()
+        except Exception as exc:
+            values["errors"][name] = repr(exc)
+
+    read("global_rank", lambda: torch.distributed.get_rank() if torch.distributed.is_initialized() else None)
+    read("cuda_initialized", torch.cuda.is_initialized)
+    # HTTP control processes may not own a CUDA context; diagnostics must not create one.
+    if values.get("cuda_initialized"):
+        read("cuda_device", torch.cuda.current_device)
+        read("physical_gpu_uuid", lambda: str(torch.cuda.get_device_properties(values["cuda_device"]).uuid))
+        for field, api in (("cuda_memory_allocated", "memory_allocated"),
+                           ("cuda_memory_reserved", "memory_reserved"),
+                           ("cuda_max_memory_allocated", "max_memory_allocated"),
+                           ("cuda_max_memory_reserved", "max_memory_reserved")):
+            read(field, lambda api=api: getattr(torch.cuda, api)())
+        read("cuda_mem_get_info", torch.cuda.mem_get_info)
+        read("pytorch_allocator", lambda: {k: v for k, v in torch.cuda.memory_stats().items()
+                                          if k in ("active_bytes.all.current", "inactive_split_bytes.all.current")})
+    read("optimizer_phase", lambda: estimate_optimizer_phase_offload_memory(optimizer))
+    if model is not None:
+        def backing():
+            from verl.utils.megatron_utils import megatron_model_cpu_data_bytes
+            return megatron_model_cpu_data_bytes(model) / _GIB
+        read("phase_model_cpu_backing_gib", backing)
+    try:
+        logger.warning("R3_CUDA_PHASE_DIAG %s", values)
+    except Exception:
+        pass
+    return values
+
+
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:
     """
     More aggressive GPU memory cleanup function, tries to release PyTorch reserved

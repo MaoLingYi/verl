@@ -78,6 +78,7 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
+from verl.utils.memory_utils import log_r3_cuda_phase
 from verl.utils.memory_utils import (
     aggressive_empty_cache,
     estimate_hdo_memory,
@@ -998,17 +999,23 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     ),
                 } if self.config.actor.router_replay.mode == "R3" else None,
             )
+        log_r3_cuda_phase("before_actor_onload", self.actor_optimizer, self.actor_module,
+                          r3_enabled=self.config.actor.router_replay.mode == "R3")
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
         preserve_hdo = self._preserve_hdo_optimizer_residency()
         if self._load_actor_optimizer_for_update():
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
+        log_r3_cuda_phase("after_actor_optimizer_onload", self.actor_optimizer, self.actor_module,
+                          r3_enabled=self.config.actor.router_replay.mode == "R3")
         if (eu_enabled or self.config.actor.router_replay.mode == "R3") and self._is_offload_param:
             log_eu_derpo_memory(
                 "before_actor_cpu_backing_release", self.actor_optimizer,
                 megatron_model_cpu_data_bytes(self.actor_module),
             )
+            log_r3_cuda_phase("before_cpu_backing_release", self.actor_optimizer, self.actor_module,
+                              r3_enabled=self.config.actor.router_replay.mode == "R3")
             released = release_megatron_model_cpu_data(self.actor_module)
             reclaim = _best_effort_release_host_allocator_after_copy_param_restore()
             log_eu_derpo_memory(
@@ -1026,6 +1033,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 megatron_model_cpu_data_bytes(self.actor_module),
             )
 
+        log_r3_cuda_phase("after_cpu_backing_release", self.actor_optimizer, self.actor_module,
+                          r3_enabled=self.config.actor.router_replay.mode == "R3")
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         v13_route_diagnostic = None

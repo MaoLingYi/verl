@@ -66,7 +66,7 @@ from verl.utils.debug.router_shift import RouterShiftObserver, clear_router_shif
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, megatron_model_cpu_data_bytes, unwrap_model
 from verl.utils.logger import print_rank_0
-from verl.utils.memory_utils import log_eu_derpo_memory
+from verl.utils.memory_utils import log_eu_derpo_memory, log_r3_cuda_phase
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -840,6 +840,8 @@ class MegatronPPOActor(BasePPOActor):
             append_to_dict(metrics, stats)
             return policy_loss, [metrics, ret_entropy]
 
+        diag_microbatches = 0
+
         def forward_step(batch_iter, model, return_schedule_plan: bool = False):
             """
             Args:
@@ -847,6 +849,13 @@ class MegatronPPOActor(BasePPOActor):
                 model: the model
                 return_schedule_plan: whether to return the schedule plan, for 1f1b overlap
             """
+            nonlocal diag_microbatches
+            # In the PP1 schedule, the preceding microbatch backward has returned here.
+            if not forward_only and self.config.router_replay.mode == "R3" and mpu.get_pipeline_model_parallel_world_size() == 1:
+                if diag_microbatches and diag_microbatches % 16 == 0:
+                    log_r3_cuda_phase(f"after_microbatch_backward_{diag_microbatches}",
+                                      self.actor_optimizer, self.actor_module, r3_enabled=True)
+                diag_microbatches += 1
             if return_schedule_plan:
                 assert self.tf_config.overlap_moe_expert_parallel_comm, (
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
@@ -1080,6 +1089,9 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=1,  # in use for pp = 1
                 forward_only=forward_only,
             )
+        if not forward_only:
+            log_r3_cuda_phase("after_full_backward", self.actor_optimizer, self.actor_module,
+                              r3_enabled=self.config.router_replay.mode == "R3")
         # loss_reduces contains the stats returned from loss_func
 
         if self.has_multi_modal_inputs:
@@ -1493,7 +1505,16 @@ class MegatronPPOActor(BasePPOActor):
                     self._eu_derpo_optimizer_generation
                 )
                 log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
-            update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+            log_r3_cuda_phase("before_optimizer_step", self.actor_optimizer, self.actor_module,
+                              r3_enabled=self.config.router_replay.mode == "R3")
+            try:
+                update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+            except Exception:
+                log_r3_cuda_phase("optimizer_step_exception", self.actor_optimizer, self.actor_module,
+                                  r3_enabled=self.config.router_replay.mode == "R3")
+                raise
+            log_r3_cuda_phase("after_optimizer_step", self.actor_optimizer, self.actor_module,
+                              r3_enabled=self.config.router_replay.mode == "R3")
             if self.eu_derpo_observer is not None:
                 log_eu_derpo_memory("after_optimizer_step", self.actor_optimizer)
                 eu_optimizer_steps += 1

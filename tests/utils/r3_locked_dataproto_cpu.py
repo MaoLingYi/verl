@@ -44,6 +44,7 @@ def run_full_actor_batch_on_cpu(data, mode, pp, forward_only=True, *, work_batch
     import time
     from functools import partial
     from types import ModuleType
+    from verl.utils.memory_utils import log_r3_cuda_phase
     from tensordict import TensorDict
     tree=ast.parse((ROOT/'verl/workers/actor/megatron_actor.py').read_text(encoding='utf-8'))
     fn=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='forward_backward_batch')
@@ -74,7 +75,7 @@ def run_full_actor_batch_on_cpu(data, mode, pp, forward_only=True, *, work_batch
     owner=NS(config=Config(router_replay=NS(mode=mode),megatron=NS(use_remove_padding=True),
                            clip_ratio=.2,entropy_coeff=0.,clip_ratio_c=3.),
              router_shift_observer=None,eu_derpo_observer=None,tf_config=NS(),hf_config=NS(),
-             actor_module=[NS()],use_fused_kernels=False,mtp_config=None)
+             actor_module=[NS()],actor_optimizer=None,use_fused_kernels=False,mtp_config=None)
     created=[]
     def local_data(**kwargs):
         local=type(data)(**kwargs)
@@ -91,6 +92,7 @@ def run_full_actor_batch_on_cpu(data, mode, pp, forward_only=True, *, work_batch
         'RouterReplayHelper':NS(is_replay_backward_action=lambda *a:False,
                                is_replay_forward_action=lambda *a:mode=='R3',
                                is_r2_record_action=lambda *a:False,get_micro_batch_router_list=lambda *a:[])}
+    ns['log_r3_cuda_phase'] = log_r3_cuda_phase
     exec(compile(ast.Module(body=[fn],type_ignores=[]),'full-actor-batch','exec',
                  flags=__import__('__future__').annotations.compiler_flag),ns)
     # Let the production import use the real model utilities and their complete module globals.

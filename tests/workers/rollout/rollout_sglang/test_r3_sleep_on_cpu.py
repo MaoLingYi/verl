@@ -27,7 +27,7 @@ class Mode(Enum):
 
 
 NS_GLOBALS = {"RolloutMode": Mode, "ReleaseMemoryOccupationReqInput": NS,
-              "ResumeMemoryOccupationReqInput": NS, "asyncio": asyncio}
+              "ResumeMemoryOccupationReqInput": NS, "asyncio": asyncio, "log_r3_cuda_phase": lambda *a, **k: None}
 SERVER = "verl/workers/rollout/sglang_rollout/async_sglang_server.py"
 WORKER = "verl/workers/rollout/sglang_rollout/sglang_rollout.py"
 sleep = method(SERVER, "SGLangHttpServer", "sleep", dict(NS_GLOBALS))
