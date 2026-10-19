@@ -76,6 +76,13 @@ def run_ppo(config, task_runner_class=None) -> None:
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
+    retry_startup = (
+        task_runner_class is None
+        and config.trainer.get("experiment_name") == "grpo_r3_qwen3_30b_a3b_base_b64_n8_16k_pp1_tp2_ep8_etp1"
+        and OmegaConf.select(config, "actor_rollout_ref.actor.router_replay.mode") == "R3"
+        and not OmegaConf.select(config, "actor_rollout_ref.actor.eu_derpo.enabled", default=False)
+    )
+    runner_options = {"max_restarts": 0, "max_task_retries": 0} if retry_startup else {}
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
 
@@ -93,9 +100,26 @@ def run_ppo(config, task_runner_class=None) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner_options["runtime_env"] = {"nsight": nsight_options}
+    if runner_options:
+        task_runner_class = task_runner_class.options(**runner_options)
+    if retry_startup:
+        for attempt in range(2):
+            runner = task_runner_class.remote()
+            try:
+                ray.get(runner.startup_ready.remote())
+                break
+            except ray.exceptions.RayActorError as exc:
+                if attempt == 1:
+                    raise
+                try:
+                    ray.kill(runner, no_restart=True)
+                except ray.exceptions.RayActorError:
+                    pass  # The failed startup actor is already dead.
+                print(f"Full R3 TaskRunner died before startup_ready; recreating once: {exc}", flush=True)
     else:
         runner = task_runner_class.remote()
+    # Never retry run(): a failure may occur after training has already changed state.
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -119,6 +143,10 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+
+    def startup_ready(self):
+        """Acknowledge actor startup without initializing any training resources."""
+        return True
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
