@@ -32,6 +32,7 @@ import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.utils.r3_host_memory import host_phase, log_host_phase
 from tqdm import tqdm
 
 from verl import DataProto
@@ -502,6 +503,7 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
+    @host_phase("validation")
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -895,6 +897,7 @@ class RayPPOTrainer:
         else:
             self._init_async_rollout_and_checkpoint_manager(actor_rollout_resource_pool)
 
+    @host_phase("checkpoint_driver")
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1005,6 +1008,17 @@ class RayPPOTrainer:
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
+        expected_r3_step = self.config.trainer.get("r3_expected_resume_step")
+        if expected_r3_step is not None:
+            if (self.global_steps != expected_r3_step
+                    or self.config.trainer.del_local_ckpt_after_load
+                    or not os.path.isfile(os.path.join(global_step_folder, "data.pt"))):
+                raise ValueError("R3 resume requires matching step, retained checkpoint and saved dataloader")
+            source = os.path.realpath(global_step_folder)
+            output = os.path.realpath(self.config.trainer.default_local_dir)
+            if os.path.commonpath([source, output]) in (source, output):
+                raise ValueError("R3 resume source and output must be disjoint")
+
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
@@ -1031,6 +1045,9 @@ class RayPPOTrainer:
                 self.raw_data_epoch = dataloader_state_dict.pop("eu_derpo_raw_data_epoch", 0)
                 self._raw_dataloader_resumed = True
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+            if expected_r3_step is not None:
+                print("R3_RESTORE TRAIN_DATA_ORDER_RESTORE=PASS EXACT_TRAJECTORY_CONTINUITY=NOT_PROVEN "
+                      "DRIVER_AND_ROLLOUT_RNG_RESTORE=UNKNOWN")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1404,7 +1421,11 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
+                        if os.getenv("R3_HOST_RAM_DIAG") == "1":
+                            log_host_phase("rollout_start", self.global_steps)
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        if os.getenv("R3_HOST_RAM_DIAG") == "1":
+                            log_host_phase("rollout_end", self.global_steps)
                         if not dynamic_sampling:
                             self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
@@ -1715,6 +1736,8 @@ class RayPPOTrainer:
                             esi_close_to_expiration=esi_close_to_expiration,
                         )
                         batch.meta_info["defer_phase_offload_for_checkpoint"] = will_save_checkpoint
+                        if os.getenv("R3_HOST_RAM_DIAG") == "1":
+                            batch.meta_info["global_steps"] = self.global_steps
                         # update actor
                         try:
                             with marked_timer("update_actor", timing_raw, color="red"):

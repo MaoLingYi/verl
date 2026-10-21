@@ -313,6 +313,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
             kwargs["stage_callback"]("after_model_restore")
             self.assertEqual(residency, {"model": False, "optimizer": False})
             events.append("optimizer_restore")
+            worker.actor_optimizer.state = {"step": 250}
 
         worker.checkpoint_mananager.load_checkpoint = load
         worker.load_checkpoint("global_step_250/actor", staged_restore=True)
@@ -328,8 +329,18 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertIn("host_reclaim", events[:bootstrap_end])
         self.assertEqual(events.count("dummy_bootstrap"), 1)
         self.assertEqual(residency, {"model": False, "optimizer": False})
-        self.assertTrue(worker._load_actor_optimizer_for_update())
-        self.assertEqual(events[-1], "optimizer_onload")
+        completed = []
+        namespace = worker.load_checkpoint.__func__.__globals__
+        for _ in range(2):
+            namespace["load_megatron_model_to_gpu"](worker.actor_module)
+            self.assertTrue(worker._load_actor_optimizer_for_update())
+            self.assertEqual(events[-1], "optimizer_onload")
+            worker.actor_optimizer.state["step"] += 1
+            completed.append(worker.actor_optimizer.state["step"])
+            namespace["offload_megatron_model_to_cpu"](worker.actor_module)
+            worker._offload_actor_optimizer()
+            self.assertEqual(residency, {"model": False, "optimizer": False})
+        self.assertEqual(completed, [251, 252])
         self.assertEqual(events.count("dummy_bootstrap"), 1)
 
     def test_bootstrap_and_restore_failures_preserve_primary_even_when_cleanup_fails(self):

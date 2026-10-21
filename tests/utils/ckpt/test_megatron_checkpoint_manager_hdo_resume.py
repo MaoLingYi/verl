@@ -260,6 +260,7 @@ def _production_methods(*, mcore_016=True):
         "DistributedOptimizer": DistributedOptimizer,
         "HybridDeviceOptimizer": HybridDeviceOptimizer,
         "os": SimpleNamespace(
+            getenv=lambda key: None,
             path=SimpleNamespace(exists=lambda path: True, join=lambda *parts: "/".join(parts)),
             remove=lambda path: None,
         ),

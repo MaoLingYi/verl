@@ -78,6 +78,7 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
     register_megatron_training_hooks,
 )
+from verl.utils.r3_host_memory import host_phase
 from verl.utils.memory_utils import log_r3_cuda_phase
 from verl.utils.memory_utils import (
     aggressive_empty_cache,
@@ -980,6 +981,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red", role="actor_update")
+    @host_phase("actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
         self._restore_actor_optimizer_copy_params_for_update()
@@ -1725,6 +1727,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @host_phase("restore")
     def load_checkpoint(
         self,
         checkpoint_path,
@@ -1915,6 +1918,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @host_phase("checkpoint")
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         checkpoint_hold = self._checkpoint_training_residency_held
         copy_params_were_partial = self._optimizer_copy_params_offloaded_for_rollout

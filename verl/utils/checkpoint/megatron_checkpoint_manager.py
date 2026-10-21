@@ -686,6 +686,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     f"Please check the checkpoint file {local_path}."
                 )
                 optimizer_state_dict = state_dict["optimizer"]
+                expected_r3_step = os.getenv("R3_EXPECTED_RESUME_STEP")
+                if expected_r3_step is not None:
+                    from verl.utils.checkpoint.r3_resume import optimizer_group_steps, require_steps
+
+                    require_steps(optimizer_group_steps(optimizer_state_dict), int(expected_r3_step))
                 _load_mcore_016_hdo_checkpoint_state(
                     self.optimizer,
                     optimizer_state_dict,
@@ -694,6 +699,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     cold_restore=cold_restore,
                     stage_callback=stage_callback,
                 )
+                if expected_r3_step is not None:
+                    from verl.utils.checkpoint.r3_resume import check_restored_optimizer
+
+                    check_restored_optimizer(self.optimizer, optimizer_state_dict, int(expected_r3_step))
                 if cold_restore:
                     state_dict.pop("optimizer", None)
                     sharded_state_dict.pop("optimizer", None)
