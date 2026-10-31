@@ -139,7 +139,10 @@ class EUDERPOConfig(BaseConfig):
         if any(not 0 <= quantile <= 1 for quantile in dppo.log_quantiles):
             raise ValueError("EU-DERPO diagnostic quantiles must be in [0, 1]")
         utility = self.routing_utility
-        if utility.lambda_u is None or utility.lambda_u <= 0:
+        if self.version == "1.7":
+            if utility.lambda_u is None or not 0 <= utility.lambda_u < float("inf"):
+                raise ValueError("EU-DERPO V1.7 requires explicit finite nonnegative lambda_u")
+        elif utility.lambda_u is None or utility.lambda_u <= 0:
             raise ValueError("EU-DERPO requires explicit positive lambda_u")
         if self.version in {"1.3", "1.4", "1.6", "1.7"}:
             if dppo.diagnostics_only or not utility.diagnostics:
