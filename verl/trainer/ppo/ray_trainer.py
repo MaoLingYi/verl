@@ -457,23 +457,40 @@ class RayPPOTrainer:
 
     def _observe_sft_initial_rollout(self, batch, reward_tensor):
         directory = self.config.trainer.get("sft_init_observation_dir")
-        if not directory or self.global_steps > 2:
-            return
+        experiment = "grpo_r3_qwen3_30b_a3b_sft_b64_n8_16k_pp1_tp2_ep8_etp1"
+        if (not directory or self.global_steps not in (1, 2)
+                or self.config.trainer.get("experiment_name") != experiment):
+            return "DISABLED"
         from pathlib import Path
 
         target = Path(directory)
-        target.mkdir(parents=True, exist_ok=True)
-        lengths = batch.batch["response_mask"].sum(-1).detach().cpu().tolist()
-        rewards = reward_tensor.sum(-1).detach().cpu().tolist()
-        responses = batch.batch["responses"]
-        # Export only CPU response slices: never materialize or move the routing batch.
-        with (target / f"step{self.global_steps}.jsonl").open("x", encoding="utf-8") as stream:
-            for i, length in enumerate(lengths):
-                ids = responses[i, :int(length)].detach().cpu().tolist()
-                row = dict(uid=str(batch.non_tensor_batch["uid"][i]), length=int(length),
-                           token_ids=ids, output=self.tokenizer.decode(ids, skip_special_tokens=False),
-                           reward=rewards[i], cap_hit=int(length) == responses.shape[-1])
-                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        expected = Path(self.config.trainer.validation_data_dir).parent / "initial_rollouts"
+        if (target.resolve() != expected.resolve()
+                or experiment + "_recompute_full_uniform1" not in target.parts):
+            print("SFT_ROLLOUT_OBSERVATION=DISABLED_INVALID_DIRECTORY", flush=True)
+            return "DISABLED_INVALID_DIRECTORY"
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            lengths = batch.batch["response_mask"].sum(-1).detach().cpu().tolist()
+            rewards = reward_tensor.sum(-1).detach().cpu().tolist()
+            responses = batch.batch["responses"]
+            path = target / f"step{self.global_steps}.jsonl"
+            # Export sample slices only; never copy DataProto, routes, or a whole decoded batch.
+            with path.open("x", encoding="utf-8") as stream:
+                for i, length in enumerate(lengths):
+                    ids = responses[i, :int(length)].detach().cpu().tolist()
+                    row = dict(uid=str(batch.non_tensor_batch["uid"][i]), length=int(length),
+                               token_ids=ids, output=self.tokenizer.decode(ids, skip_special_tokens=False),
+                               reward=rewards[i], cap_hit=int(length) == responses.shape[-1])
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            with path.with_suffix(".complete.json").open("x", encoding="utf-8") as stream:
+                json.dump(dict(status="PASS", step=self.global_steps, rows=len(lengths)), stream)
+        except (OSError, UnicodeError) as exc:
+            # Optional I/O cannot abort training or retry an update; CUDA/programming errors still propagate.
+            print(f"SFT_ROLLOUT_OBSERVATION=FAILED_IO step={self.global_steps} error={exc!r}", flush=True)
+            return "FAILED_IO"
+        print(f"SFT_ROLLOUT_OBSERVATION=PASS step={self.global_steps}", flush=True)
+        return "PASS"
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
