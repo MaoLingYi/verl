@@ -171,6 +171,7 @@ def test_actor_update_releases_loaded_backing_before_cache_allocation_only_for_e
         "release_megatron_model_cpu_data": release,
         "megatron_model_cpu_data_bytes": api["megatron_model_cpu_data_bytes"],
         "log_gpu_memory_usage": lambda *args, **kwargs: None,
+        "log_r3_cuda_phase": lambda *args, **kwargs: None,
         "log_eu_derpo_memory": lambda stage, *args, **kwargs: events.append(stage),
         "_best_effort_release_host_allocator_after_copy_param_restore": lambda: events.append("host_trim") or {},
     }

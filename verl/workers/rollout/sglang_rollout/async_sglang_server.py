@@ -195,6 +195,7 @@ class SGLangHttpServer:
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         args = {
             "model_path": self.model_config.local_path,
+            "tokenizer_path": self.model_config.local_tokenizer_path or self.model_config.local_path,
             "dtype": self.config.dtype,
             "mem_fraction_static": self.config.gpu_memory_utilization,
             "disable_cuda_graph": self.config.enforce_eager,

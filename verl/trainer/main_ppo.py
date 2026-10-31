@@ -78,7 +78,10 @@ def run_ppo(config, task_runner_class=None) -> None:
 
     retry_startup = (
         task_runner_class is None
-        and config.trainer.get("experiment_name") == "grpo_r3_qwen3_30b_a3b_base_b64_n8_16k_pp1_tp2_ep8_etp1"
+        and config.trainer.get("experiment_name") in {
+            "grpo_r3_qwen3_30b_a3b_base_b64_n8_16k_pp1_tp2_ep8_etp1",
+            "grpo_r3_qwen3_30b_a3b_sft_b64_n8_16k_pp1_tp2_ep8_etp1",
+        }
         and OmegaConf.select(config, "actor_rollout_ref.actor.router_replay.mode") == "R3"
         and not OmegaConf.select(config, "actor_rollout_ref.actor.eu_derpo.enabled", default=False)
     )
@@ -333,7 +336,8 @@ class TaskRunner:
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+            config.actor_rollout_ref.model.get("tokenizer_path") or config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
 
         # Instantiate the tokenizer and processor.

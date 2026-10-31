@@ -455,6 +455,26 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
+    def _observe_sft_initial_rollout(self, batch, reward_tensor):
+        directory = self.config.trainer.get("sft_init_observation_dir")
+        if not directory or self.global_steps > 2:
+            return
+        from pathlib import Path
+
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        lengths = batch.batch["response_mask"].sum(-1).detach().cpu().tolist()
+        rewards = reward_tensor.sum(-1).detach().cpu().tolist()
+        responses = batch.batch["responses"]
+        # Export only CPU response slices: never materialize or move the routing batch.
+        with (target / f"step{self.global_steps}.jsonl").open("x", encoding="utf-8") as stream:
+            for i, length in enumerate(lengths):
+                ids = responses[i, :int(length)].detach().cpu().tolist()
+                row = dict(uid=str(batch.non_tensor_batch["uid"][i]), length=int(length),
+                           token_ids=ids, output=self.tokenizer.decode(ids, skip_special_tokens=False),
+                           reward=rewards[i], cap_hit=int(length) == responses.shape[-1])
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -1540,6 +1560,7 @@ class RayPPOTrainer:
                                 "overlong_reward/min": float(np.min(reward_extra_infos_dict["overlong_reward"])),
                             }
                         )
+                    self._observe_sft_initial_rollout(batch, reward_tensor)
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
