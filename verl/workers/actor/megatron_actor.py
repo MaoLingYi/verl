@@ -35,6 +35,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
@@ -617,17 +618,37 @@ class MegatronPPOActor(BasePPOActor):
         """
         # broadcast from last pp rank to all other pp ranks
         # TODO: actually, we just need to control the sampling order.
-        data.to(get_device_id())
-        data.batch = data.batch.contiguous()
-        mini_batch = data
-        broadcast_dict_tensor(
-            mini_batch.batch,
-            src=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group(),
-        )
-        mini_batch.to("cpu")
-        # split into micro-batches
-        mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
+        if self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"} and mpu.get_pipeline_model_parallel_world_size() == 1:
+            # PP1 already owns every layer; stage each DPPO microbatch without a whole-batch CUDA copy.
+            mini_batch = data
+            if not use_dynamic_bsz and (
+                "multi_modal_inputs" in data.non_tensor_batch or data.batch["position_ids"].dim() == 3
+            ):
+                # Only the local containers may be mutated; tensor leaves and payloads stay shared.
+                mini_batch = DataProto(
+                    batch=TensorDict(
+                        dict(data.batch.items()), batch_size=data.batch.batch_size,
+                        device=data.batch.device, names=data.batch.names,
+                    ),
+                    non_tensor_batch=data.non_tensor_batch.copy(),
+                    meta_info=data.meta_info,
+                )
+            mini_batch = mini_batch.to("cpu")
+        else:
+            data.to(get_device_id())
+            data.batch = data.batch.contiguous()
+            mini_batch = data
+            broadcast_dict_tensor(
+                mini_batch.batch,
+                src=mpu.get_pipeline_model_parallel_last_rank(),
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+            mini_batch.to("cpu")
+        # Fixed PP1 batches can be locked; forward_step converts each attention mask locally.
+        if use_dynamic_bsz or not (
+            self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"} and mpu.get_pipeline_model_parallel_world_size() == 1
+        ):
+            mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             mini_batch.batch["multi_modal_inputs"] = mini_batch.non_tensor_batch["multi_modal_inputs"]
@@ -760,6 +781,9 @@ class MegatronPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = data.get("rollout_is_weights", None)
                     policy_loss_kwargs = {}
+                    if loss_mode in {"dppo_tv", "dppo_kl"}:
+                        policy_loss_kwargs.update(rollout_log_probs=data.get("rollout_log_probs"),
+                                                  dppo_stats=self._dppo_stats)
                     if self.config.router_shift_weighting.enabled:
                         policy_loss_kwargs["router_shift_gamma"] = data["router_shift_gamma"]
                     pg_loss, pg_metrics = policy_loss_fn(
@@ -1060,9 +1084,9 @@ class MegatronPPOActor(BasePPOActor):
         # loss_reduces contains the stats returned from loss_func
 
         if self.has_multi_modal_inputs:
-            data.batch.pop("multi_modal_inputs")
-            data.batch.pop("multi_modal_inputs_idx")
-            data.non_tensor_batch.pop("multi_modal_inputs")
+            mini_batch.batch.pop("multi_modal_inputs")
+            mini_batch.batch.pop("multi_modal_inputs_idx")
+            mini_batch.non_tensor_batch.pop("multi_modal_inputs")
 
         losses_reduced = {"output": losses_reduced}
         losses_reduced["model_forward_seconds"] = model_forward_seconds
@@ -1109,6 +1133,9 @@ class MegatronPPOActor(BasePPOActor):
             and users have to combine the output in each dp rank manually.
 
         """
+        from verl.trainer.ppo.dppo import DPPOStats
+        dppo_mode = self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"}
+        self._dppo_stats = DPPOStats() if dppo_mode else None
         metrics = {}
         router_shift_totals = {"gamma_sum": 0.0, "clip_sum": 0.0, "token_count": 0}
         rs_weight_sum = 0.0
@@ -1520,4 +1547,11 @@ class MegatronPPOActor(BasePPOActor):
                 raise RuntimeError("router-shift weighting requires at least one valid response token")
             metrics["actor/rs/weight_mean"] = [rs_weight_sum / rs_token_count]
         get_torch_device().empty_cache()
+        if dppo_mode:
+            kind = "tv" if self.config.policy_loss.loss_mode == "dppo_tv" else "kl"
+            delta = getattr(self.config.policy_loss, "dppo_delta_" + kind)
+            group = mpu.get_data_parallel_group() if mpu.get_data_parallel_world_size() > 1 else None
+            for key, value in self._dppo_stats.metrics(delta, kind, group).items():
+                metrics[key] = [value]
+            self._dppo_stats = None
         return metrics

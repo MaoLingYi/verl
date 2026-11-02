@@ -612,6 +612,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
+                    dppo_kwargs = {"rollout_log_probs": model_inputs.get("rollout_log_probs")} if loss_mode in {"dppo_tv", "dppo_kl"} else {}
                     pg_loss, pg_metrics = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -620,6 +621,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        **dppo_kwargs,
                     )
                     micro_batch_metrics.update(pg_metrics)
 

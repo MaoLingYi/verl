@@ -159,6 +159,8 @@ class SGLangHttpServer:
         return self._server_address, self._server_port
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
+        if self.config.cuda_graph_memory_saver:
+            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
         if self.nnodes > 1:
             if self.node_rank != 0:
                 assert master_address and master_port, "non-master node should provide master address and port"
@@ -311,7 +313,8 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            tags = ["kv_cache", "weights"] + (["cuda_graph"] if self.config.cuda_graph_memory_saver else [])
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -325,10 +328,12 @@ class SGLangHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            tags = ["kv_cache", "weights"] + (["cuda_graph"] if self.config.cuda_graph_memory_saver else [])
+            obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            tags = ["kv_cache", "weights"] + (["cuda_graph"] if self.config.cuda_graph_memory_saver else [])
+            obj = ReleaseMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.release_memory_occupation(obj, None)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             # In standalone mode, resume kv_cache if free_cache_engine is enabled
@@ -377,6 +382,9 @@ class SGLangHttpServer:
         )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
+        if self.config.require_behavior_log_probs:
+            from verl.trainer.ppo.dppo import validate_behavior_sampling
+            validate_behavior_sampling(sampling_params, return_logprob)
 
         request = {
             "rid": request_id,
@@ -401,6 +409,8 @@ class SGLangHttpServer:
             log_probs, token_ids = zip(
                 *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
             )
+            if self.config.require_behavior_log_probs and list(token_ids) != list(output["output_ids"]):
+                raise ValueError("SGLang behavior logprobs are not aligned with sampled token IDs")
         else:
             token_ids = output["output_ids"]
             log_probs = None

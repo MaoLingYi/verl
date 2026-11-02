@@ -625,6 +625,9 @@ class AgentLoopWorker:
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
+        if self.rollout_config.require_behavior_log_probs:
+            if output.response_logprobs is None or len(output.response_logprobs) != len(output.response_ids):
+                raise ValueError("DPPO response token/logprob lengths differ before padding")
         response_logprobs = None
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
@@ -804,6 +807,9 @@ class AgentLoopWorker:
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+        if self.rollout_config.require_behavior_log_probs:
+            if any(item.response_logprobs is None for item in inputs):
+                raise ValueError("DPPO requires behavior logprobs for every response")
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)

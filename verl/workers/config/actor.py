@@ -229,6 +229,9 @@ class PolicyLossConfig(BaseConfig):
     """
 
     loss_mode: str = "vanilla"
+    dppo_delta_tv: float = 0.20
+    dppo_delta_kl: float = 0.05
+    dppo_importance_cap: float = 5.0
     clip_cov_ratio: float = 0.0002
     clip_cov_lb: float = 1.0
     clip_cov_ub: float = 5.0

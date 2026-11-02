@@ -969,7 +969,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         preserve_hdo = self._preserve_hdo_optimizer_residency()
         if self._load_actor_optimizer_for_update():
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
-        if eu_enabled and self._is_offload_param:
+        if (eu_enabled or self.config.actor.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"}) and self._is_offload_param:
             log_eu_derpo_memory(
                 "before_actor_cpu_backing_release", self.actor_optimizer,
                 megatron_model_cpu_data_bytes(self.actor_module),
@@ -1018,6 +1018,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
         metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
         metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+        if self.config.actor.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"}:
+            metrics["perf/host_rss_gb"] = psutil.Process().memory_info().rss / (1024**3)
+            metrics["perf/host_headroom_gb"] = psutil.virtual_memory().available / (1024**3)
+
         from verl.utils.megatron.optimizer import get_megatron_last_lr
 
         metrics["actor/lr"] = get_megatron_last_lr(self.actor_optimizer)

@@ -4,6 +4,11 @@ _target_: verl.workers.config.RolloutConfig
 # actor_rollout_ref.rollout.name: hf/vllm/sglang/trtllm. The default value will be removed in the future
 name: ???
 
+# Opt-in lifecycle and strict behavior logprob validation.
+cuda_graph_memory_saver: false
+
+require_behavior_log_probs: false
+
 # sync: LLM, async: AsyncLLM
 mode: async
 

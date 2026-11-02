@@ -60,6 +60,13 @@ policy_loss:
   # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
   loss_mode: "vanilla"
 
+  # Independent token DPPO thresholds and detached importance cap.
+  dppo_delta_tv: 0.20
+
+  dppo_delta_kl: 0.05
+
+  dppo_importance_cap: 5.0
+
   # Ratio of tokens to be clipped for clip-cov loss
   clip_cov_ratio: 0.0002
 

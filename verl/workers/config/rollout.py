@@ -136,6 +136,8 @@ class CheckpointEngineConfig(BaseConfig):
 
 @dataclass
 class RolloutConfig(BaseConfig):
+    cuda_graph_memory_saver: bool = False
+    require_behavior_log_probs: bool = False
     _mutable_fields = {"max_model_len", "load_format", "expert_parallel_size", "moe_tensor_parallel_size"}
 
     name: Optional[str] = MISSING

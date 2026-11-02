@@ -649,6 +649,11 @@ class RayPPOTrainer:
                 "seed": self.config.data.get("seed", None),
                 "evaluation_timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            if self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}:
+                from verl.trainer.ppo.dppo import aime32_metrics
+                eval_metrics = aime32_metrics(sample_uids, accuracy_values)
+                record.update(eval_metrics)
+                metrics.update({"val-aime24/"+k:v for k,v in eval_metrics.items()})
             append_aime_history(history.path, record)
             metrics.update({
                 "val-aime24/correct": correct,
@@ -1526,6 +1531,26 @@ class RayPPOTrainer:
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     actor_config = self.config.actor_rollout_ref.actor
+                    if actor_config.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}:
+                        rollout = self.config.actor_rollout_ref.rollout
+                        if (rollout.temperature, rollout.top_p, rollout.top_k, rollout.do_sample) != (1.0, 1.0, -1, True):
+                            raise ValueError("DPPO requires temperature=1/top_p=1/top_k=-1 sampled training behavior")
+                        if "rollout_log_probs" not in batch.batch:
+                            raise ValueError("DPPO missing real rollout behavior logprobs")
+                        if bypass_recomputing_logprobs or actor_config.eu_derpo.enabled:
+                            raise ValueError("DPPO uses its independent loss with old recompute retained for TIM")
+                        if (actor_config.router_replay.mode != "disabled"
+                            or actor_config.megatron.router_replay.mode != "disabled"
+                            or rollout.enable_rollout_routing_replay
+                            or actor_config.router_shift_weighting.enabled
+                            or actor_config.router_shift_diagnostics.enabled
+                            or actor_config.entropy_coeff != 0 or actor_config.use_kl_loss
+                            or self.config.algorithm.use_kl_in_reward
+                            or self.config.algorithm.norm_adv_by_std_in_grpo
+                            or self.config.algorithm.get("filter_groups", {}).get("enable", False)
+                            or (rollout_corr_config and (rollout_corr_config.rollout_is is not None
+                                                        or rollout_corr_config.rollout_rs is not None))):
+                            raise ValueError("DPPO forbids replay, extra objectives, DS, or rollout correction")
                     if actor_config.eu_derpo.enabled:
                         if self.config.algorithm.use_kl_in_reward:
                             raise ValueError("EU-DERPO V1.2 forbids KL in task reward")
@@ -1778,6 +1803,11 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}:
+                    lengths = batch.batch["response_mask"].sum(-1).float()
+                    metrics["response_length/p95"] = torch.quantile(lengths, .95).item()
+                    metrics["perf/generation_tokens_per_second"] = lengths.sum().item() / max(timing_raw["gen"], 1e-9)
+
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
