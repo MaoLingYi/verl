@@ -116,7 +116,9 @@ class RewardLoopWorker:
         self._init_reward_fn()
 
     def _init_reward_fn(self):
-        input_tokenizer_local_path = copy_to_local(self.config.actor_rollout_ref.model.path)
+        input_tokenizer_local_path = copy_to_local(
+            self.config.actor_rollout_ref.model.get("tokenizer_path") or self.config.actor_rollout_ref.model.path
+        )
         self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
         self.reward_model_tokenizer = None
         if self.config.reward.reward_model.enable:
