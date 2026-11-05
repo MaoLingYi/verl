@@ -217,6 +217,8 @@ def _patched_topk_routing_with_score_function(
 
         elif routing_action == RouterReplayAction.REPLAY_FORWARD:
             if router_replay is None or router_replay.target_topk_idx is None:
+                if getattr(router_replay, "strict", False):
+                    raise RuntimeError("Full R3 forward replay target is missing")
                 # Fallback if replay data is not available
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
@@ -246,6 +248,8 @@ def _patched_topk_routing_with_score_function(
             return probs, top_indices
         elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
             if router_replay is None or not router_replay.replay_backward_list:
+                if getattr(router_replay, "strict", False):
+                    raise RuntimeError("Full R3 backward replay target is missing")
                 # Fallback if replay data is not available
                 return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 

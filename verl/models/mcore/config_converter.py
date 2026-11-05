@@ -306,6 +306,9 @@ def hf_to_mcore_config_dpskv3(
     }
     if "rope_scaling" in hf_config and hf_config.rope_scaling is not None:
         mla_rope_config.update(hf_config.rope_scaling)
+    from verl.utils.moonlight import is_moonlight
+    if is_moonlight(hf_config):
+        mla_rope_config['original_max_position_embeddings'] = hf_config.max_position_embeddings
     moe_layer_freq = [1] * hf_config.num_hidden_layers
     for i in range(min(hf_config.first_k_dense_replace, hf_config.num_hidden_layers)):
         moe_layer_freq[i] = 0
@@ -355,6 +358,8 @@ def hf_to_mcore_config_dpskv3(
         bias_activation_fusion=True,
         bias_dropout_fusion=True,
     )
+    if is_moonlight(hf_config):
+        args.update(moe_router_dtype="fp32", moe_router_bias_update_rate=0.0)
     # override_transformer_config_kwargs as kwargs shall never be none
     args.update(override_transformer_config_kwargs)
     transformer_config = check_and_construct_configs(args, MLATransformerConfig)

@@ -539,6 +539,9 @@ def convert_hf_to_mcore(
         hf_model = AutoModelForCausalLM.from_pretrained(
             hf_model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
         )
+    from verl.utils.moonlight import is_moonlight, restore_hf_expert_bias
+    if is_moonlight(hf_config):
+        restore_hf_expert_bias(hf_model, hf_model_path)
     hf_state_dict = hf_model.state_dict()
 
     pp_rank = mpu.get_pipeline_model_parallel_rank()

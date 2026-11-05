@@ -643,6 +643,10 @@ class AgentLoopWorker:
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
+        from verl.utils.moonlight import is_moonlight, validate_routes
+        if (is_moonlight(self.model_config.hf_config) and self.rollout_config.enable_rollout_routing_replay
+                and output.routed_experts is None):
+            raise ValueError("Moonlight Full R3 rollout did not return routes")
         routed_experts = None
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
@@ -663,7 +667,9 @@ class AgentLoopWorker:
                 raise ValueError("routed_experts layer/top-k shape does not match the model")
             if experts_tensor.is_floating_point() or experts_tensor.is_complex() or experts_tensor.dtype == torch.bool:
                 raise ValueError("routed_experts must contain integer expert ids")
-            num_experts = getattr(hf_config, "num_experts", getattr(hf_config, "num_local_experts", 256))
+            if is_moonlight(hf_config):
+                validate_routes(experts_tensor)
+            num_experts = getattr(hf_config, "num_experts", getattr(hf_config, "num_local_experts", getattr(hf_config, "n_routed_experts", 256)))
             if experts_tensor.numel() and (
                 int(experts_tensor.min()) < 0 or int(experts_tensor.max()) >= min(num_experts, 256)
             ):

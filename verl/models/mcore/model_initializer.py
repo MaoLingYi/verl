@@ -201,6 +201,9 @@ class DeepseekV3Model(BaseModelInitializer):
             for layer in model.decoder.layers:
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.weight.requires_grad = False
+        from verl.utils.moonlight import is_moonlight, preserve_expert_bias
+        if is_moonlight(self.hf_config):
+            preserve_expert_bias(model)
         return model
 
 

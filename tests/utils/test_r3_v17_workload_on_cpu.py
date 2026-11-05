@@ -63,6 +63,8 @@ def materialize_routes(routes, prompt_length, response_length, prompt_width=None
     width = prompt_width or prompt_length
     ns = {'self':NS(model_config=NS(hf_config=NS(num_hidden_layers=48,num_experts_per_tok=8,num_experts=128))),
           'torch':torch, 'np': __import__('numpy'),
+          'is_moonlight':function('verl/utils/moonlight.py','is_moonlight',{}),
+          'validate_routes':function('verl/utils/moonlight.py','validate_routes',{'torch':torch}),
           'output':NS(routed_experts=routes,prompt_ids=[1]*prompt_length,response_ids=[2]*response_length),
           'input_ids':torch.zeros(1,width+response_length),
           'prompt_output':{'input_ids':torch.zeros(1,width)}}
@@ -293,6 +295,8 @@ def test_agent_rejects_invalid_shape_dtype_or_global_expert_id(shape,dtype,value
                and ast.unparse(n.test)=='output.routed_experts is not None')
     ns={'self':NS(model_config=NS(hf_config=NS(num_hidden_layers=48,num_experts_per_tok=8,num_experts=128))),
         'torch':torch,'np':__import__('numpy'),'input_ids':torch.zeros(1,5),
+        'is_moonlight':function('verl/utils/moonlight.py','is_moonlight',{}),
+        'validate_routes':function('verl/utils/moonlight.py','validate_routes',{'torch':torch}),
         'output':NS(routed_experts=torch.full(shape,value,dtype=dtype),prompt_ids=[1]),
         'prompt_output':{'input_ids':torch.zeros(1,1)}}
     with pytest.raises(ValueError):exec(compile(ast.Module(body=[block],type_ignores=[]),'validate-routes','exec'),ns)
