@@ -1356,6 +1356,9 @@ class MegatronPPOActor(BasePPOActor):
                             ("u_hat", normalized[utility_count > 0]),
                             ("cluster_size", utility_count[utility_count > 0]),
                         ):
+                            # V1.8 reports raw arithmetic shift in log space below; rho is saturated.
+                            if self.config.eu_derpo.version == "1.8" and prefix == "rho_e":
+                                continue
                             values = _gather_diagnostic_values(values)
                             for key, value in distribution_stats(values, tuple(dppo.log_quantiles)).items():
                                 metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
