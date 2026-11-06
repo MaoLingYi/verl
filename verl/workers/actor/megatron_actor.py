@@ -1390,8 +1390,13 @@ class MegatronPPOActor(BasePPOActor):
                                 for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
                                     metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
                         elif self.config.eu_derpo.version in {"1.7", "1.8"}:
+                            ratio_diagnostic = (
+                                ("log_arithmetic_ratio", stats_eu.log_arithmetic_ratio[active])
+                                if self.config.eu_derpo.version == "1.8"
+                                else ("rho_e_beh", stats_eu.rho[active])
+                            )
                             for prefix, values in (
-                                ("rho_e_beh", stats_eu.rho[active]),
+                                ratio_diagnostic,
                                 ("d_beh", stats_eu.divergence[active]),
                             ):
                                 values = _gather_diagnostic_values(values)
