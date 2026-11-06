@@ -40,6 +40,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo import eu_derpo_v18
 from verl.trainer.ppo.eu_derpo import (
     P95MCTRController,
     audit_optimizer_minibatches,
@@ -330,7 +331,7 @@ class MegatronPPOActor(BasePPOActor):
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
             )
-            if self.config.eu_derpo.version in {"1.6", "1.7"}:
+            if self.config.eu_derpo.version in {"1.6", "1.7", "1.8"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
                 mctr = self.config.eu_derpo.mctr
                 self.mctr_controller = P95MCTRController(
@@ -742,7 +743,7 @@ class MegatronPPOActor(BasePPOActor):
                         raise RuntimeError("EU-DERPO loss closure is missing its actual-F route snapshot")
                     routes = eu_derpo_f_routes.to(device)
                     dppo = self.config.eu_derpo.expert_cluster_dppo
-                    eu_stats = cluster_statistics(
+                    eu_stats = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version == "1.8" else cluster_statistics)(
                         log_prob.detach(),
                         data.get("rollout_log_probs"),
                         advantages,
@@ -759,7 +760,7 @@ class MegatronPPOActor(BasePPOActor):
                         optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
                     )
                     active_total = eu_stats.active.sum((1, 2)).float()
-                    coefficient, _ = edppo_token_coefficients(
+                    coefficient, _ = (eu_derpo_v18.edppo_token_coefficients if self.config.eu_derpo.version == "1.8" else edppo_token_coefficients)(
                         eu_stats, routes, response_mask, active_total
                     )
                     if coefficient.shape != log_prob.shape or not torch.isfinite(coefficient).all():
@@ -1255,7 +1256,7 @@ class MegatronPPOActor(BasePPOActor):
                     routes = self.eu_derpo_observer.routes_for(sample_ids)
                     current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
                     dppo = self.config.eu_derpo.expert_cluster_dppo
-                    stats_eu = cluster_statistics(
+                    stats_eu = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version == "1.8" else cluster_statistics)(
                         current_log_probs,
                         data.batch["rollout_log_probs"].cpu(),
                         data.batch["advantages"].cpu(),
@@ -1284,7 +1285,7 @@ class MegatronPPOActor(BasePPOActor):
                     if self.mctr_controller is not None:
                         outward_values = stats_eu.divergence[stats_eu.directional_outward]
                         mctr_observation = _global_mctr_outward_p95(outward_values)
-                    _, objective = edppo_token_coefficients(
+                    _, objective = (eu_derpo_v18.edppo_token_coefficients if self.config.eu_derpo.version == "1.8" else edppo_token_coefficients)(
                         stats_eu, routes, data.batch["response_mask"].cpu(), active_total
                     )
                     aggregation_seconds = time.perf_counter() - aggregation_started
@@ -1388,7 +1389,7 @@ class MegatronPPOActor(BasePPOActor):
                                 values = _gather_diagnostic_values(values)
                                 for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
                                     metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
-                        elif self.config.eu_derpo.version == "1.7":
+                        elif self.config.eu_derpo.version in {"1.7", "1.8"}:
                             for prefix, values in (
                                 ("rho_e_beh", stats_eu.rho[active]),
                                 ("d_beh", stats_eu.divergence[active]),

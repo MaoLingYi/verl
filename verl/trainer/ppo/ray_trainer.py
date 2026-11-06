@@ -649,7 +649,9 @@ class RayPPOTrainer:
                 "seed": self.config.data.get("seed", None),
                 "evaluation_timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            if self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}:
+            if (self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}
+                or (self.config.actor_rollout_ref.actor.eu_derpo.enabled
+                    and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.8")):
                 from verl.trainer.ppo.dppo import aime32_metrics
                 eval_metrics = aime32_metrics(sample_uids, accuracy_values)
                 record.update(eval_metrics)
@@ -953,7 +955,7 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         if (
             self.config.actor_rollout_ref.actor.eu_derpo.enabled
-            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+            and self.config.actor_rollout_ref.actor.eu_derpo.version in {"1.7", "1.8"}
         ):
             dataloader_state_dict["eu_derpo_raw_data_epoch"] = self.raw_data_epoch
         torch.save(dataloader_state_dict, dataloader_local_path)
@@ -1031,7 +1033,7 @@ class RayPPOTrainer:
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             if (
                 self.config.actor_rollout_ref.actor.eu_derpo.enabled
-                and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+                and self.config.actor_rollout_ref.actor.eu_derpo.version in {"1.7", "1.8"}
             ):
                 self.raw_data_epoch = dataloader_state_dict.pop("eu_derpo_raw_data_epoch", 0)
                 self._raw_dataloader_resumed = True
@@ -1357,7 +1359,7 @@ class RayPPOTrainer:
         filter_groups = self.config.algorithm.get("filter_groups", None)
         no_old_recompute = (
             self.config.actor_rollout_ref.actor.eu_derpo.enabled
-            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.7"
+            and self.config.actor_rollout_ref.actor.eu_derpo.version in {"1.7", "1.8"}
         )
         dynamic_sampling = no_old_recompute and filter_groups is not None and filter_groups.get("enable", False)
         logical_timing = {}
@@ -1803,7 +1805,9 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                if self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}:
+                if (self.config.actor_rollout_ref.actor.get("policy_loss", {}).get("loss_mode", "vanilla") in {"dppo_tv", "dppo_kl"}
+                or (self.config.actor_rollout_ref.actor.eu_derpo.enabled
+                    and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.8")):
                     lengths = batch.batch["response_mask"].sum(-1).float()
                     metrics["response_length/p95"] = torch.quantile(lengths, .95).item()
                     metrics["perf/generation_tokens_per_second"] = lengths.sum().item() / max(timing_raw["gen"], 1e-9)

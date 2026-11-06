@@ -58,6 +58,7 @@ class ExpertClusterDPPOConfig(BaseConfig):
     divergence_type: str = "binary_tv"
     delta_e: Optional[float] = None
     diagnostics_only: bool = False
+    importance_cap: float = 5.0
     log_quantiles: tuple[float, ...] = (0.5, 0.75, 0.9, 0.95, 0.99)
 
 
@@ -105,7 +106,7 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
-        if self.version not in {"1.2.1", "1.3", "1.4", "1.6", "1.7"}:
+        if self.version not in {"1.2.1", "1.3", "1.4", "1.6", "1.7", "1.8"}:
             raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, 1.4, 1.6, or 1.7")
         if self.current_route_mode != "natural":
             raise ValueError("EU-DERPO current route mode must remain natural")
@@ -138,13 +139,15 @@ class EUDERPOConfig(BaseConfig):
             raise ValueError("EU-DERPO delta_e must be in (0, 1)")
         if any(not 0 <= quantile <= 1 for quantile in dppo.log_quantiles):
             raise ValueError("EU-DERPO diagnostic quantiles must be in [0, 1]")
+        if self.version == "1.8" and dppo.importance_cap != 5.0:
+            raise ValueError("V1.8 freezes token importance_cap=5")
         utility = self.routing_utility
-        if self.version == "1.7":
+        if self.version in {"1.7", "1.8"}:
             if utility.lambda_u is None or not 0 <= utility.lambda_u < float("inf"):
                 raise ValueError("EU-DERPO V1.7 requires explicit finite nonnegative lambda_u")
         elif utility.lambda_u is None or utility.lambda_u <= 0:
             raise ValueError("EU-DERPO requires explicit positive lambda_u")
-        if self.version in {"1.3", "1.4", "1.6", "1.7"}:
+        if self.version in {"1.3", "1.4", "1.6", "1.7", "1.8"}:
             if dppo.diagnostics_only or not utility.diagnostics:
                 raise ValueError("EU-DERPO V1.3/V1.4/V1.6 require the live DPPO mask and mandatory diagnostics")
         if self.version == "1.3" and (dppo.delta_e != 0.02 or utility.lambda_u != 0.10):
@@ -152,7 +155,7 @@ class EUDERPOConfig(BaseConfig):
         if utility.min_group_size < 2 or utility.eps_u <= 0 or utility.min_std < 0:
             raise ValueError("invalid Routing Utility normalization configuration")
         mctr = self.mctr
-        if self.version in {"1.6", "1.7"}:
+        if self.version in {"1.6", "1.7", "1.8"}:
             values = (mctr.beta, mctr.delta_min, mctr.delta_max, dppo.delta_e)
             if not mctr.enabled or any(value is None for value in values):
                 raise ValueError("EU-DERPO V1.6 requires explicit MCTR beta, bounds, and delta_0")

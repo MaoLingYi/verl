@@ -311,6 +311,7 @@ eu_derpo:
     divergence_type: binary_tv
     delta_e: null
     diagnostics_only: false
+    importance_cap: 5.0
     log_quantiles: [0.5, 0.75, 0.9, 0.95, 0.99]
 
   routing_utility:
