@@ -25,6 +25,8 @@ def load(name, path):
 
 eu = load("verl.trainer.ppo.eu_derpo", ROOT / "verl/trainer/ppo/eu_derpo.py")
 v18 = load("v18_execution_math", ROOT / "verl/trainer/ppo/eu_derpo_v18.py")
+sys.modules["verl.trainer.ppo.eu_derpo_v18"] = v18
+v182 = load("v182_execution_math", ROOT / "verl/trainer/ppo/eu_derpo_v182.py")
 legacy = load("v18_fit_harness", Path(__file__).with_name("test_eu_derpo_v1_7_on_cpu.py"))
 
 
@@ -35,19 +37,19 @@ def compile_function(node, namespace, filename):
     return namespace[node.name]
 
 
-def actor_loss(log_prob, behavior, advantage, mask, routes, delta):
+def actor_loss(log_prob, behavior, advantage, mask, routes, delta, version="1.8"):
     path = ROOT / "verl/workers/actor/megatron_actor.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
                   and ast.unparse(node.test) == "self.config.eu_derpo.enabled"
                   and any(isinstance(n, ast.Name) and n.id == "eu_stats" for n in ast.walk(node)))
-    cfg = SimpleNamespace(version="1.8", expert_cluster_dppo=SimpleNamespace(delta_e=delta, diagnostics_only=False),
+    cfg = SimpleNamespace(version=version, expert_cluster_dppo=SimpleNamespace(delta_e=delta, diagnostics_only=False),
                           behavior_expert_is=SimpleNamespace(behavior_source="rollout"))
     recorded = []
     observer = SimpleNamespace(num_experts=3, record_main_logprobs=lambda *args: recorded.append(args))
     def wrong_version(*args, **kwargs):
         pytest.fail("V1.8 entered geometric V1.7 math")
-    namespace = dict(torch=torch, eu_derpo_v18=v18, cluster_statistics=wrong_version,
+    namespace = dict(torch=torch, eu_derpo_v18=v18, eu_derpo_v182=v182, cluster_statistics=wrong_version,
                      edppo_token_coefficients=wrong_version,
                      self=SimpleNamespace(config=SimpleNamespace(eu_derpo=cfg), eu_derpo_observer=observer,
                                           mctr_controller=object(), _eu_derpo_delta_current=delta),
@@ -72,8 +74,9 @@ def mcore_schedule(monkeypatch):
     return compile_function(node, {"torch": torch}, source)
 
 
+@pytest.mark.parametrize("version", ["1.8", "1.8.2"])
 @pytest.mark.parametrize("dp_size", [1, 4])
-def test_actual_actor_backward_and_mcore_response_scaling(monkeypatch, dp_size):
+def test_actual_actor_backward_and_mcore_response_scaling(monkeypatch, dp_size, version):
     schedule = mcore_schedule(monkeypatch)
     batch, tokens = 8, 3
     behavior = torch.full((batch, tokens), .01).log()
@@ -87,7 +90,7 @@ def test_actual_actor_backward_and_mcore_response_scaling(monkeypatch, dp_size):
     local_batch = batch // dp_size
     for i in range(batch):
         loss, _ = schedule(None, current[i:i+1],
-            lambda z: actor_loss(z, behavior[i:i+1], advantages[i:i+1], mask[i:i+1], routes[i:i+1], .012),
+            lambda z: actor_loss(z, behavior[i:i+1], advantages[i:i+1], mask[i:i+1], routes[i:i+1], .012, version),
             config, None, False, local_batch, [], cp_group_size=1, is_last_stage=True)
         # Dense DDP average; MCore applies the same effective 1/DP to expert gradients.
         (loss / dp_size).backward()
@@ -101,13 +104,16 @@ def test_actual_actor_backward_and_mcore_response_scaling(monkeypatch, dp_size):
             outward = (a > 0 and r.mean() > 1) or (a < 0 and r.mean() < 1)
             tv = (current.detach()[i, support].exp() - behavior[i, support].exp()).abs().mean()
             if not (outward and tv > .012):
-                expected[i, support] -= a * r.clamp(max=5) / (batch * len(clusters) * support.sum())
+                denominator = (sum(int(s.sum()) for s in clusters) if version == "1.8.2"
+                               else len(clusters) * support.sum())
+                expected[i, support] -= a * r.clamp(max=5) / (batch * denominator)
     torch.testing.assert_close(current.grad, expected, rtol=2e-6, atol=2e-7)
     assert current.grad[~mask].eq(0).all()
 
 
-def test_v18_fit_uses_existing_ds_before_real_unnormalized_grpo(monkeypatch):
-    trainer, run, updates, seen, logs = legacy.fit_harness(monkeypatch, "1.8", [24, 40], target=64)
+@pytest.mark.parametrize("version", ["1.8", "1.8.2"])
+def test_v18_fit_uses_existing_ds_before_real_unnormalized_grpo(monkeypatch, version):
+    trainer, run, updates, seen, logs = legacy.fit_harness(monkeypatch, version, [24, 40], target=64)
     trainer.config.algorithm.filter_groups.enable = True
     trainer.config.algorithm.norm_adv_by_std_in_grpo = False
     # The existing harness exposes the actual fit globals via its closure.
@@ -137,3 +143,14 @@ def test_v18_fit_uses_existing_ds_before_real_unnormalized_grpo(monkeypatch):
     assert logs[0]["dynamic_sampling/generation_rounds"] == 2
     assert logs[0]["dynamic_sampling/accepted_groups"] == 64
     assert "old_log_probs" not in updates[0].batch
+
+
+def test_v182_actual_actor_masks_nan_padding_before_loss():
+    z=torch.tensor([[-3.,float("nan")]],requires_grad=True)
+    b=torch.tensor([[-4.,float("nan")]])
+    mask=torch.tensor([[True,False]])
+    routes=torch.tensor([[[[0,1]],[[-1,-1]]]])
+    loss,_=actor_loss(z,b,torch.ones_like(z),mask,routes,1.,"1.8.2")
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert z.grad[0,1]==0 and z.grad[0,0]!=0
