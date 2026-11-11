@@ -40,7 +40,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.trainer.ppo import eu_derpo_v18, eu_derpo_v182
+from verl.trainer.ppo import eu_derpo_v18, eu_derpo_v182, eu_derpo_v183
 from verl.trainer.ppo.eu_derpo import (
     P95MCTRController,
     audit_optimizer_minibatches,
@@ -331,7 +331,7 @@ class MegatronPPOActor(BasePPOActor):
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
             )
-            if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2"}:
+            if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
                 mctr = self.config.eu_derpo.mctr
                 self.mctr_controller = P95MCTRController(
@@ -743,7 +743,7 @@ class MegatronPPOActor(BasePPOActor):
                         raise RuntimeError("EU-DERPO loss closure is missing its actual-F route snapshot")
                     routes = eu_derpo_f_routes.to(device)
                     dppo = self.config.eu_derpo.expert_cluster_dppo
-                    eu_stats = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2"} else cluster_statistics)(
+                    eu_stats = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"} else cluster_statistics)(
                         log_prob.detach(),
                         data.get("rollout_log_probs"),
                         advantages,
@@ -760,7 +760,12 @@ class MegatronPPOActor(BasePPOActor):
                         optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
                     )
                     active_total = eu_stats.active.sum((1, 2)).float()
-                    if self.config.eu_derpo.version == "1.8.2":
+                    if self.config.eu_derpo.version == "1.8.3":
+                        coefficient = eu_derpo_v183.schedule_coefficients(
+                            eu_stats, routes, response_mask, mini_batch.meta_info["v183_global_tokens"],
+                            n_micro_batch, mpu.get_data_parallel_world_size(),
+                        )
+                    elif self.config.eu_derpo.version == "1.8.2":
                         coefficient, _ = eu_derpo_v182.edppo_token_coefficients(eu_stats, routes, response_mask)
                     else:
                         coefficient, _ = (eu_derpo_v18.edppo_token_coefficients if self.config.eu_derpo.version == "1.8" else edppo_token_coefficients)(
@@ -774,7 +779,7 @@ class MegatronPPOActor(BasePPOActor):
                     # The schedule averages these per-microbatch surrogates. Its scalar value
                     # differs from J_E-DPPO; its pure-math test checks the first-order gradient.
                     main_log_prob = (log_prob.masked_fill(~response_mask.bool(), 0)
-                                     if self.config.eu_derpo.version == "1.8.2" else log_prob)
+                                     if self.config.eu_derpo.version in {"1.8.2", "1.8.3"} else log_prob)
                     pg_loss = -(coefficient * main_log_prob.float()).sum()
                     pg_metrics = {"actor/eu_derpo/surrogate_loss": pg_loss.detach().item()}
                 else:
@@ -1261,7 +1266,7 @@ class MegatronPPOActor(BasePPOActor):
                     routes = self.eu_derpo_observer.routes_for(sample_ids)
                     current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
                     dppo = self.config.eu_derpo.expert_cluster_dppo
-                    stats_eu = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2"} else cluster_statistics)(
+                    stats_eu = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"} else cluster_statistics)(
                         current_log_probs,
                         data.batch["rollout_log_probs"].cpu(),
                         data.batch["advantages"].cpu(),
@@ -1290,7 +1295,10 @@ class MegatronPPOActor(BasePPOActor):
                     if self.mctr_controller is not None:
                         outward_values = stats_eu.divergence[stats_eu.directional_outward]
                         mctr_observation = _global_mctr_outward_p95(outward_values)
-                    if self.config.eu_derpo.version == "1.8.2":
+                    global_token_mean = self.config.eu_derpo.version == "1.8.3"
+                    if global_token_mean:
+                        objective = eu_derpo_v183.objective_numerator(stats_eu, routes, data.batch["response_mask"].cpu())
+                    elif self.config.eu_derpo.version == "1.8.2":
                         _, objective = eu_derpo_v182.edppo_token_coefficients(stats_eu, routes, data.batch["response_mask"].cpu())
                     else:
                         _, objective = (eu_derpo_v18.edppo_token_coefficients if self.config.eu_derpo.version == "1.8" else edppo_token_coefficients)(
@@ -1340,9 +1348,17 @@ class MegatronPPOActor(BasePPOActor):
                     objective_device = objective.to(get_device_id())
                     if mpu.get_data_parallel_world_size() > 1:
                         torch.distributed.all_reduce(objective_device, group=mpu.get_data_parallel_group())
-                        objective_device /= mpu.get_data_parallel_world_size()
+                        if not global_token_mean:
+                            objective_device /= mpu.get_data_parallel_world_size()
                         torch.distributed.all_reduce(auxiliary_objective, group=mpu.get_data_parallel_group())
                         auxiliary_objective /= mpu.get_data_parallel_world_size()
+                    if global_token_mean:
+                        tokens = data.meta_info["v183_global_tokens"]
+                        responses = data.meta_info["v183_global_responses"]
+                        objective_device /= tokens
+                        metrics["actor/v183/global_valid_response_tokens"] = [tokens]
+                        metrics["actor/v183/global_accepted_responses"] = [responses]
+                        metrics["actor/v183/mean_response_tokens"] = [tokens / responses]
                     objective_log = objective_device.item()
                     auxiliary_metrics["utility_objective"] = auxiliary_objective.item()
                     metrics["actor/eu_derpo/objective_edppo"] = [objective_log]
@@ -1365,7 +1381,7 @@ class MegatronPPOActor(BasePPOActor):
                             ("cluster_size", utility_count[utility_count > 0]),
                         ):
                             # V1.8 reports raw arithmetic shift in log space below; rho is saturated.
-                            if self.config.eu_derpo.version in {"1.8", "1.8.2"} and prefix == "rho_e":
+                            if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"} and prefix == "rho_e":
                                 continue
                             values = _gather_diagnostic_values(values)
                             for key, value in distribution_stats(values, tuple(dppo.log_quantiles)).items():
@@ -1400,10 +1416,10 @@ class MegatronPPOActor(BasePPOActor):
                                 values = _gather_diagnostic_values(values)
                                 for key, value in distribution_stats(values, (0.5, 0.9, 0.95, 0.99)).items():
                                     metrics[f"actor/eu_derpo/{prefix}_{key}"] = [value]
-                        elif self.config.eu_derpo.version in {"1.7", "1.8", "1.8.2"}:
+                        elif self.config.eu_derpo.version in {"1.7", "1.8", "1.8.2", "1.8.3"}:
                             ratio_diagnostic = (
                                 ("log_arithmetic_ratio", stats_eu.log_arithmetic_ratio[active])
-                                if self.config.eu_derpo.version in {"1.8", "1.8.2"}
+                                if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"}
                                 else ("rho_e_beh", stats_eu.rho[active])
                             )
                             for prefix, values in (

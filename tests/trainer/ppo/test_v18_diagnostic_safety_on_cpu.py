@@ -15,7 +15,7 @@ def diagnostic(version, rho, log_ratio):
     loop=next(n for n in ast.walk(tree) if isinstance(n,ast.For) and isinstance(n.iter,ast.Tuple)
               and any(isinstance(x,ast.Constant) and x.value=="rho_e" for x in ast.walk(n.iter)))
     branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and isinstance(n.test,ast.Compare)
-                and ast.unparse(n.test)=="self.config.eu_derpo.version in {'1.7', '1.8', '1.8.2'}"
+                and ast.unparse(n.test)=="self.config.eu_derpo.version in {'1.7', '1.8', '1.8.2', '1.8.3'}"
                 and any(isinstance(x,ast.Name) and x.id=="ratio_diagnostic" for x in ast.walk(n)))
     gather=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="_gather_diagnostic_values")
     ns={"get_device_id":lambda:"cpu","torch":torch,"mpu":NS(get_pipeline_model_parallel_world_size=lambda:1,get_data_parallel_world_size=lambda:1,get_pipeline_model_parallel_group=lambda:None,get_data_parallel_group=lambda:None),
@@ -29,7 +29,7 @@ def diagnostic(version, rho, log_ratio):
     return ns["metrics"]
 
 
-@pytest.mark.parametrize("version",["1.8","1.8.2"])
+@pytest.mark.parametrize("version",["1.8","1.8.2","1.8.3"])
 @pytest.mark.parametrize("value",[2.,1.25e38])
 def test_actual_diagnostic_loops(value,version):
     rho=torch.full((1,1,8),value)

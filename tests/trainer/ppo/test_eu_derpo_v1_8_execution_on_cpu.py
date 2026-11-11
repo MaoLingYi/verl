@@ -27,6 +27,8 @@ eu = load("verl.trainer.ppo.eu_derpo", ROOT / "verl/trainer/ppo/eu_derpo.py")
 v18 = load("v18_execution_math", ROOT / "verl/trainer/ppo/eu_derpo_v18.py")
 sys.modules["verl.trainer.ppo.eu_derpo_v18"] = v18
 v182 = load("v182_execution_math", ROOT / "verl/trainer/ppo/eu_derpo_v182.py")
+sys.modules["verl.trainer.ppo.eu_derpo_v182"] = v182
+v183 = load("v183_execution_math", ROOT / "verl/trainer/ppo/eu_derpo_v183.py")
 legacy = load("v18_fit_harness", Path(__file__).with_name("test_eu_derpo_v1_7_on_cpu.py"))
 
 
@@ -37,7 +39,7 @@ def compile_function(node, namespace, filename):
     return namespace[node.name]
 
 
-def actor_loss(log_prob, behavior, advantage, mask, routes, delta, version="1.8"):
+def actor_loss(log_prob, behavior, advantage, mask, routes, delta, version="1.8", *, counts=None, return_stats=False):
     path = ROOT / "verl/workers/actor/megatron_actor.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
@@ -56,8 +58,14 @@ def actor_loss(log_prob, behavior, advantage, mask, routes, delta, version="1.8"
                      log_prob=log_prob, data={"rollout_log_probs": behavior}, advantages=advantage,
                      response_mask=mask, eu_derpo_f_routes=routes, eu_derpo_sample_ids=torch.tensor([0]),
                      device=torch.device("cpu"))
+    if counts is not None:
+        total, local, dp = counts
+        namespace.update(eu_derpo_v183=v183, mini_batch=SimpleNamespace(meta_info={"v183_global_tokens": total}),
+                         n_micro_batch=local, mpu=SimpleNamespace(get_data_parallel_world_size=lambda: dp))
     exec(compile(ast.Module(body=branch.body, type_ignores=[]), str(path), "exec"), namespace)
     assert recorded and not namespace["coefficient"].requires_grad
+    if return_stats:
+        return namespace["eu_stats"]
     return namespace["pg_loss"], namespace["pg_metrics"]
 
 
@@ -111,7 +119,7 @@ def test_actual_actor_backward_and_mcore_response_scaling(monkeypatch, dp_size, 
     assert current.grad[~mask].eq(0).all()
 
 
-@pytest.mark.parametrize("version", ["1.8", "1.8.2"])
+@pytest.mark.parametrize("version", ["1.8", "1.8.2", "1.8.3"])
 def test_v18_fit_uses_existing_ds_before_real_unnormalized_grpo(monkeypatch, version):
     trainer, run, updates, seen, logs = legacy.fit_harness(monkeypatch, version, [24, 40], target=64)
     trainer.config.algorithm.filter_groups.enable = True
