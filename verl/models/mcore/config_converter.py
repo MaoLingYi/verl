@@ -358,11 +358,16 @@ def hf_to_mcore_config_dpskv3(
         bias_activation_fusion=True,
         bias_dropout_fusion=True,
     )
+    replay_enabled = None
     if is_moonlight(hf_config):
+        # veRL's patched TopKRouter reads this instance attribute after MLA construction.
+        replay_enabled = override_transformer_config_kwargs.pop("enable_routing_replay", None)
         args.update(moe_router_dtype="fp32", moe_router_bias_update_rate=0.0)
     # override_transformer_config_kwargs as kwargs shall never be none
     args.update(override_transformer_config_kwargs)
     transformer_config = check_and_construct_configs(args, MLATransformerConfig)
+    if replay_enabled is not None:
+        transformer_config.enable_routing_replay = replay_enabled
     # MTP
     if "num_nextn_predict_layers" in hf_config:
         transformer_config.mtp_num_layers = hf_config.num_nextn_predict_layers

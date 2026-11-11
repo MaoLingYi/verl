@@ -172,7 +172,8 @@ def test_source_bias_restore_replaces_hf_bf16_rounding_without_changing_source(t
     assert torch.equal(original,before)
 
 
-def test_actual_mla_config_arguments_are_native8192_and_fp32_router():
+@pytest.mark.parametrize('enabled',[True,False,None])
+def test_actual_mla_config_arguments_are_native8192_and_fp32_router(enabled):
     tree=ast.parse((ROOT/'verl/models/mcore/config_converter.py').read_text())
     fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='hf_to_mcore_config_dpskv3')
     # Only unavailable import/constructor boundaries are supplied; execute the actual config body.
@@ -184,15 +185,59 @@ def test_actual_mla_config_arguments_are_native8192_and_fp32_router():
         rope_theta=50000.,max_position_embeddings=8192,moe_intermediate_size=1408,n_shared_experts=2,
         num_experts_per_tok=6,routed_scaling_factor=2.446,aux_loss_alpha=.001)
     ns={'set_experimental_flag':lambda *a:None,'AttnBackend':N(fused='fused'),'apply_patch':lambda:None,
-        'is_moonlight':helpers.is_moonlight,'MLATransformerConfig':object,
-        '_get_base_transformer_config':lambda **kw:{k:v for k,v in kw.items() if k not in ('hf_config','dtype')},'check_and_construct_configs':lambda args,cls:args}
+        'is_moonlight':helpers.is_moonlight,
+        '_get_base_transformer_config':lambda **kw:{k:v for k,v in kw.items() if k not in ('hf_config','dtype')}}
     exec(compile(ast.Module(body=[mla,fn],type_ignores=[]),'real-mla-config','exec',flags=__import__('__future__').annotations.compiler_flag),ns)
-    result=ns[fn.name](cfg,torch.bfloat16)
-    assert result['max_position_embeddings']==8192 and result['rotary_base']==50000.
-    assert result['rope_type']=='rope' and result['rotary_scaling_factor']==1
-    assert result['q_lora_rank'] is None and result['moe_layer_freq']==[0]+[1]*26
-    assert result['moe_router_dtype']=='fp32' and result['moe_router_bias_update_rate']==0
-    assert result['num_moe_experts']==64 and result['moe_router_topk']==6
+    # Exercise the actual field filter with a config class that has no legacy replay field.
+    from dataclasses import dataclass
+    from functools import wraps
+    import inspect
+    import warnings
+
+    @dataclass
+    class BaseConfig:
+        moe_layer_freq: object = None
+
+    @dataclass
+    class MLAConfig(BaseConfig):
+        rotary_base: float = 0
+        rope_type: str = ''
+        rotary_scaling_factor: float = 0
+        q_lora_rank: object = None
+        moe_router_dtype: str = ''
+        moe_router_bias_update_rate: float = -1
+        num_moe_experts: int = 0
+        moe_router_topk: int = 0
+
+    class Router(torch.nn.Module):
+        def __init__(self,config):
+            super().__init__()
+            self.config=config
+
+    api=replay_api()
+    patch=function('verl/utils/megatron/router_replay_patch.py','apply_router_replay_patch',
+        dict(TransformerConfig=BaseConfig,TopKRouter=Router,RouterReplay=api['RouterReplay'],
+             MoEAlltoAllTokenDispatcher=None,patched_routing=None,inspect=inspect,wraps=wraps))
+    patch()
+    ns['MLATransformerConfig']=MLAConfig
+    check=function('verl/models/mcore/config_converter.py','check_and_construct_configs',
+                   dict(torch=torch,warnings=warnings,mapping_string_to_attn_backend=lambda args:args))
+    def construct(args,cls):
+        assert args['max_position_embeddings']==8192
+        return check(args,cls)
+    ns['check_and_construct_configs']=construct
+    overrides={} if enabled is None else {'enable_routing_replay':enabled}
+    result=ns[fn.name](cfg,torch.bfloat16,**overrides)
+    assert getattr(result,'enable_routing_replay',False) is bool(enabled)
+    assert result.rotary_base==50000. and result.rope_type=='rope' and result.rotary_scaling_factor==1
+    assert result.q_lora_rank is None and result.moe_layer_freq==[0]+[1]*26
+    assert result.moe_router_dtype=='fp32' and result.moe_router_bias_update_rate==0
+    assert result.num_moe_experts==64 and result.moe_router_topk==6
+    layers=torch.nn.ModuleList(Router(result) if moe else torch.nn.Linear(1,1) for moe in result.moe_layer_freq)
+    registered=api['RouterReplay'].router_instances
+    assert len(registered)==(26 if enabled else 0)
+    assert not hasattr(layers[0],'router_replay')
+    assert [r.router_replay for r in list(layers)[1:]]==(registered if enabled else [None]*26)
 
 
 def test_real_activation_checkpoint_recompute_consumes_backward_replay_once():
