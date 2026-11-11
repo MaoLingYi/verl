@@ -15,6 +15,7 @@
 
 import argparse
 import os
+import re
 import warnings
 from contextlib import contextmanager
 from importlib.metadata import version
@@ -35,7 +36,6 @@ except ImportError:
 from accelerate import init_empty_weights
 from megatron.core import dist_checkpointing
 from megatron.core import parallel_state as mpu
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.serialization import StrictHandling
 from megatron.core.models.gpt.gpt_model import ModelType
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -70,51 +70,58 @@ def _init_args():
     return args
 
 
-def test_conversion(megatron_model_provider, tfconfig, output_path, model):
-    ########### test ###########
-    # load model
-    model_test = get_model(
-        model_provider_func=megatron_model_provider,
-        model_type=ModelType.encoder_or_decoder,
-        wrap_with_ddp=False,
-        transformer_config=tfconfig,
-    )
-    ref_state_dict = model_test[0].module.sharded_state_dict()
-    dist_checkpointing.load(ref_state_dict, output_path, strict=StrictHandling.ASSUME_OK_UNEXPECTED)
+def _conversion_model(megatron_model_provider, tfconfig):
+    context: Callable[..., ContextManager] = init_empty_weights if tfconfig.use_cpu_initialization else noop_context
+    with context():
+        model = get_model(
+            model_provider_func=megatron_model_provider,
+            model_type=ModelType.encoder_or_decoder,
+            wrap_with_ddp=False,
+            transformer_config=tfconfig,
+        )
 
-    dut_state_dict = model[0].module.state_dict()
-    for name in dut_state_dict.keys():
-        if dut_state_dict[name] is None:
-            print(f"[Warning] {name} is none in dut_state_dict")
-            continue
-        dut_data = dut_state_dict[name].data
-        if name in ref_state_dict:
-            ref_data = ref_state_dict[name]
-            if isinstance(ref_data, ShardedTensor):
-                ref_data = ref_data.data.view(ref_data.local_shape)
-            else:
-                ref_data = ref_data.data
-            assert dut_data.shape == ref_data.shape, f"{name=} {dut_data.shape=} {ref_data.shape=}"
-            assert (dut_data == ref_data).all(), f"{name} is not equal"
-            print(f"{name} is equal")
-        else:
-            print(f"[Warning] {name} is not in ref_state_dict")
-    for name in ref_state_dict.keys():
-        if ref_state_dict[name] is None:
-            print(f"[Warning] {name} is none in ref_state_dict")
-            continue
-        ref_data = ref_state_dict[name]
-        if isinstance(ref_data, ShardedTensor):
-            ref_data = ref_data.data.view(ref_data.local_shape)
-        else:
-            ref_data = ref_data.data
-        if name in dut_state_dict:
-            dut_data = dut_state_dict[name].data
-            assert dut_data.shape == ref_data.shape, f"{name=} {dut_data.shape=} {ref_data.shape=}"
-            assert (dut_data == ref_data).all(), f"{name} is not equal"
-            print(f"{name} is equal")
-        else:
-            print(f"[Warning] {name} is not in dut_state_dict")
+    if tfconfig.use_cpu_initialization:
+        # convert meta device to empty tensor so it can use `copy_` function
+        model[0].module = model[0].module.to_empty(device="cpu")
+    return model
+
+
+def test_conversion(megatron_model_provider, tfconfig, output_path, model):
+    reload_module = _conversion_model(megatron_model_provider, tfconfig)[0].module
+    loaded = dist_checkpointing.load(
+        reload_module.sharded_state_dict(), output_path, strict=StrictHandling.ASSUME_OK_UNEXPECTED
+    )
+    expected = model[0].module.state_dict()
+    for name in expected.keys() | loaded.keys():
+        original, saved = expected.get(name), loaded.get(name)
+        if original is None or saved is None:
+            if re.fullmatch(r"[A-Za-z0-9_.]+\._extra_state[0-9]*", name):
+                continue
+            side = "converted model" if original is None else "reloaded DCP"
+            raise ValueError(f"{name}: missing or None in {side}")
+        # load_state_dict can cast or reshape inputs. Check the saved representation first.
+        if original.shape != saved.shape or original.dtype != saved.dtype:
+            raise ValueError(f"{name}: converted {original.shape} {original.dtype} {original.device}, "
+                             f"DCP {saved.shape} {saved.dtype} {saved.device}")
+
+    incompatible = reload_module.load_state_dict(loaded, strict=False)
+    for name in incompatible.missing_keys + incompatible.unexpected_keys:
+        if not re.fullmatch(r"[A-Za-z0-9_.]+\._extra_state[0-9]*", name):
+            raise ValueError(f"{name}: could not load DCP state into reload model")
+    actual = reload_module.state_dict()
+    compared = 0
+    for name, original in expected.items():
+        if original is None or loaded.get(name) is None:
+            continue  # Only the checked TE metadata exception can reach here.
+        restored = actual[name]
+        left, right = original, restored
+        if left.device != right.device:
+            left, right = left.cpu(), right.cpu()
+        if left.dtype != right.dtype or not torch.equal(left, right):
+            raise ValueError(f"{name} is not equal: converted {original.shape} {original.dtype} {original.device}, "
+                             f"reloaded {restored.shape} {restored.dtype} {restored.device}")
+        compared += 1
+    print(f"Compared {compared} reloaded tensors exactly.")
     print("Conversion test passed!")
 
 
@@ -513,18 +520,7 @@ def convert_hf_to_mcore(
         )
         return parallel_model
 
-    context: Callable[..., ContextManager] = init_empty_weights if use_cpu_initialization else noop_context
-    with context():
-        model = get_model(
-            model_provider_func=megatron_model_provider,
-            model_type=ModelType.encoder_or_decoder,
-            wrap_with_ddp=False,
-            transformer_config=tfconfig,
-        )
-
-    if use_cpu_initialization:
-        # convert meta device to empty tensor so it can use `copy_` function
-        model[0].module = model[0].module.to_empty(device="cpu")
+    model = _conversion_model(megatron_model_provider, tfconfig)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
