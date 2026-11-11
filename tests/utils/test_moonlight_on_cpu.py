@@ -92,7 +92,7 @@ def test_moonlight_strict_replay_never_falls_back_when_target_missing(action):
         api['_patched_topk_routing_with_score_function'](torch.randn(2,64),6,True,None,None,'sigmoid',torch.zeros(64),False,router,2.446)
 
 
-def test_real_27_layer_converter_and_inverse_cover_dense_shared64_experts_and_fp32_bias():
+def test_real_27_layer_converter_and_inverse_cover_dense_shared64_experts_and_fp32_bias(monkeypatch):
     def module(**values):
         m=torch.nn.Module()
         for key,value in values.items(): setattr(m,key,value)
@@ -150,6 +150,91 @@ def test_real_27_layer_converter_and_inverse_cover_dense_shared64_experts_and_fp
     assert set(exported)==set(original)
     assert all(torch.equal(original[name],value) for name,value in exported.items())
     assert exported['model.layers.26.mlp.gate.e_score_correction_bias'].dtype==torch.float32
+    check_online_export_tp2_ep8(mg, hf, inverse, strict_zip, monkeypatch)
+
+
+def check_online_export_tp2_ep8(mg, hf, inverse, strict_zip, monkeypatch):
+    """Use real exporter/concat/name mapping with CPU rank tensors at collective boundaries."""
+    import sys
+
+    def selected(name):
+        return '.layers.' not in name or '.layers.0.' in name or '.layers.1.' in name
+
+    source = {k: v for k, v in mg.state_dict().items() if selected(k)}
+    expected = {k: v for k, v in hf.state_dict().items() if selected(k)}
+    cfg = N(model_type='deepseek_v3', num_hidden_layers=27, n_routed_experts=64,
+            kv_lora_rank=2, qk_rope_head_dim=1, hidden_size=4, tie_word_embeddings=False)
+    inverse.hf_config = cfg
+    inverse.mcore_config = N(num_moe_experts=64)
+    mpu = N(get_pipeline_model_parallel_rank=lambda: 0, get_pipeline_model_parallel_world_size=lambda: 1,
+            get_pipeline_model_parallel_group=lambda: 'pp', get_expert_model_parallel_world_size=lambda: 8,
+            get_expert_model_parallel_group=lambda: 'ep', get_expert_tensor_parallel_world_size=lambda: 1,
+            get_expert_tensor_parallel_group=lambda: 'etp', get_tensor_model_parallel_world_size=lambda: 2,
+            get_tensor_model_parallel_group=lambda: 'tp')
+    monkeypatch.setitem(sys.modules, 'megatron.core', N(mpu=mpu, parallel_state=mpu))
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda group: 2)
+    monkeypatch.setattr(torch.distributed, 'all_gather_object',
+                        lambda object_list, obj, group: object_list.__setitem__(0, obj))
+    utils = 'verl/utils/megatron_utils.py'
+    tp = 'verl/utils/megatron/tensor_parallel.py'
+    tp_namespace = {}
+    is_parallel = function(tp, 'is_tensor_parallel_param', tp_namespace)
+    partition_dim = function(tp, 'get_tensor_parallel_partition_dim', tp_namespace)
+    ns = dict(torch=torch, zip=strict_zip, is_moonlight=helpers.is_moonlight, unwrap_model=lambda m: m,
+              normalize_model_name=lambda name, *args: name, get_device_id=lambda: 'cpu',
+              broadcast_str_from_megatron_pp=lambda name: name, broadcast_from_megatron_pp=lambda t: t,
+              tp_utils=N(is_tensor_parallel_param=is_parallel, get_tensor_parallel_partition_dim=partition_dim))
+    ns['default_tp_concat_fn'] = function(utils, 'default_tp_concat_fn', ns)
+    export = function(utils, 'per_tensor_generator', ns)
+    mapping = dict(qkv_layer_name='self_attention.linear_qkv.', gate_proj_layer_name='linear_fc1.')
+    for rank in range(2):
+        local, groups = {}, {}
+        for name, full in source.items():
+            if '.mlp.experts.' in name:
+                prefix, index = name.rsplit('weight', 1)
+                if int(index) >= 8:
+                    continue
+                parts = [source[f'{prefix}weight{ep * 8 + int(index)}'] for ep in range(8)]
+                local[name] = parts[rank]
+                groups[id(local[name])] = ('ep', parts)
+                continue
+
+            if name.endswith('linear_kv_down_proj.weight'):
+                # TE 2.12 sets is_parallel=True, dim=0 even for duplicated TELinear.
+                parts, dim = [full, full], 0
+            elif name.endswith('linear_fc1.weight'):
+                gate, up = full.chunk(2)
+                parts = [torch.cat(pair) for pair in zip(gate.chunk(2), up.chunk(2))]
+                dim = 0
+            elif name.endswith(('linear_proj.weight', 'linear_fc2.weight')):
+                dim = 1
+                parts = full.chunk(2, dim)
+            elif name.endswith(('linear_q_proj.weight', 'linear_kv_up_proj.weight',
+                                'word_embeddings.weight', 'output_layer.weight')):
+                dim = 0
+                parts = full.chunk(2, dim)
+            else:
+                local[name] = full
+                continue
+            local[name] = parts[rank]
+            local[name].tensor_model_parallel = True
+            local[name].partition_dim = dim
+            groups[id(local[name])] = ('tp', parts)
+
+        def gather(output, tensor, group):
+            required_group, pieces = groups[id(tensor)]
+            assert group == required_group and len(output) == len(pieces)
+            for dest, src in zip(output, pieces):
+                dest.copy_(src)
+
+        monkeypatch.setattr(torch.distributed, 'all_gather', gather)
+        model = N(named_parameters=lambda: ((k, v) for k, v in local.items() if not k.endswith('expert_bias')),
+                  state_dict=lambda: local)
+        actual = dict(export([model], cfg, inverse, None, mapping))
+        assert actual.keys() == expected.keys()
+        for name, weight in expected.items():
+            assert actual[name].shape == weight.shape, name
+            assert actual[name].dtype == weight.dtype and torch.equal(actual[name], weight), name
 
 
 def test_source_bias_restore_replaces_hf_bf16_rounding_without_changing_source(tmp_path,monkeypatch):

@@ -42,6 +42,7 @@ import verl.utils.megatron.tensor_parallel as tp_utils
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
+from verl.utils.moonlight import is_moonlight
 from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import HFModelConfig, McoreEngineConfig
 
@@ -1222,7 +1223,15 @@ def per_tensor_generator(
             continue
 
         # tp all gather
-        if tp_utils.is_tensor_parallel_param(broad_pp_tensor):
+        # MCore's MLA TELinear duplicates KV-A on TP ranks. TE 2.12 still tags its
+        # full weight as tensor-parallel, but SGLang's ReplicatedLinear needs one copy.
+        replicated_kv_a = (
+            cur_name.endswith(".self_attention.linear_kv_down_proj.weight")
+            and is_moonlight(model_config)
+            and broad_pp_tensor.shape
+            == (model_config.kv_lora_rank + model_config.qk_rope_head_dim, model_config.hidden_size)
+        )
+        if tp_utils.is_tensor_parallel_param(broad_pp_tensor) and not replicated_kv_a:
             # allocate a new tensor with proper size
             if all_gather_group_size <= 1:
                 infer_params = [broad_pp_tensor]
