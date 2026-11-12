@@ -257,18 +257,75 @@ def test_source_bias_restore_replaces_hf_bf16_rounding_without_changing_source(t
     assert torch.equal(original,before)
 
 
+@pytest.fixture
+def moonlight_hf_config():
+    class Config(dict): __getattr__=dict.__getitem__
+    return Config(model_type='deepseek_v3',num_hidden_layers=27,n_routed_experts=64,first_k_dense_replace=1,num_nextn_predict_layers=0,
+        q_lora_rank=None,kv_lora_rank=512,qk_nope_head_dim=128,qk_rope_head_dim=64,v_head_dim=128,
+        rope_theta=50000.,max_position_embeddings=8192,moe_intermediate_size=1408,n_shared_experts=2,
+        num_experts_per_tok=6,routed_scaling_factor=2.446,aux_loss_alpha=.001)
+
+
+def test_moonlight_no_mtp_postprocess(moonlight_hf_config, monkeypatch):
+    pytest.importorskip("megatron.core")
+    from megatron.core import tensor_parallel
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from tests.utils.r3_locked_dataproto_cpu import function as nested_function
+    from megatron.core.transformer import MLATransformerConfig
+    from verl.models.mcore import config_converter
+    from verl.models.mcore.model_initializer import BaseModelInitializer, DeepseekV3Model
+
+    # Run the native MLA constructor without a distributed actor/process group.
+    def base_config(hf_config, dtype, **kwargs):
+        return dict(num_layers=hf_config.num_hidden_layers, hidden_size=2048, num_attention_heads=16,
+                    gated_linear_unit=True, activation_func=torch.nn.functional.silu, **kwargs)
+
+    monkeypatch.setattr(config_converter, '_get_base_transformer_config', base_config)
+    cfg = config_converter.hf_to_mcore_config_dpskv3(moonlight_hf_config, torch.bfloat16)
+    assert isinstance(cfg, MLATransformerConfig)
+
+    def build_model(self, **kwargs):
+        assert 'mtp_block_spec' not in kwargs
+        return torch.nn.Module()
+
+    monkeypatch.setattr(BaseModelInitializer, 'initialize', build_model)
+    DeepseekV3Model(cfg, moonlight_hf_config).initialize(freeze_moe_router=False)
+
+    # Small CPU output head; exercise MCore's unmodified labels=None and loss branches.
+    hidden = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3).div(24).requires_grad_()
+    weight = torch.arange(15, dtype=torch.float32).reshape(3, 5).div(15)
+    model = N(config=cfg, share_embeddings_and_output_weights=False, post_process=True,
+              output_layer=lambda x, **kwargs: (x @ weight, None))
+    model.compute_language_model_loss = GPTModel.compute_language_model_loss.__get__(model)
+    monkeypatch.setattr(tensor_parallel, 'vocab_parallel_cross_entropy', lambda x, y:
+                        torch.nn.functional.cross_entropy(x.flatten(0, 1), y.flatten(), reduction='none').view_as(y))
+    args = dict(hidden_states=hidden, input_ids=None, position_ids=None, rotary_pos_emb=None,
+                rotary_pos_cos=None, rotary_pos_sin=None)
+    logits = GPTModel._postprocess(model, labels=None, **args)
+    assert cfg.mtp_num_layers is None
+    expected = hidden.transpose(0, 1) @ weight
+    torch.testing.assert_close(logits, expected)
+    labels = torch.tensor([[1, 2, 3, 4], [4, 0, 2, 1]])
+    loss = GPTModel._postprocess(model, labels=labels, **args)
+    log_probs = expected.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(loss, -log_probs)
+    slice_responses = nested_function('verl/workers/actor/megatron_actor.py', 'compute_logprobs_fn', {})
+    response_ids = labels[:, 1:3]
+    actual = slice_responses({'log_probs': logits.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)},
+                             {'responses': response_ids})
+    torch.testing.assert_close(actual['log_probs'], log_probs[:, 1:3])
+    loss.mean().backward()
+    assert hidden.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize('enabled',[True,False,None])
-def test_actual_mla_config_arguments_are_native8192_and_fp32_router(enabled):
+def test_actual_mla_config_arguments_are_native8192_and_fp32_router(enabled,moonlight_hf_config):
     tree=ast.parse((ROOT/'verl/models/mcore/config_converter.py').read_text())
     fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='hf_to_mcore_config_dpskv3')
     # Only unavailable import/constructor boundaries are supplied; execute the actual config body.
     fn.body=[n for n in fn.body if not isinstance(n,(ast.Import,ast.ImportFrom))]
     mla=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_get_mla_transformer_config')
-    class Config(dict): __getattr__=dict.__getitem__
-    cfg=Config(model_type='deepseek_v3',num_hidden_layers=27,n_routed_experts=64,first_k_dense_replace=1,
-        q_lora_rank=None,kv_lora_rank=512,qk_nope_head_dim=128,qk_rope_head_dim=64,v_head_dim=128,
-        rope_theta=50000.,max_position_embeddings=8192,moe_intermediate_size=1408,n_shared_experts=2,
-        num_experts_per_tok=6,routed_scaling_factor=2.446,aux_loss_alpha=.001)
+    cfg=moonlight_hf_config
     ns={'set_experimental_flag':lambda *a:None,'AttnBackend':N(fused='fused'),'apply_patch':lambda:None,
         'is_moonlight':helpers.is_moonlight,
         '_get_base_transformer_config':lambda **kw:{k:v for k,v in kw.items() if k not in ('hf_config','dtype')}}
@@ -313,6 +370,7 @@ def test_actual_mla_config_arguments_are_native8192_and_fp32_router(enabled):
     ns['check_and_construct_configs']=construct
     overrides={} if enabled is None else {'enable_routing_replay':enabled}
     result=ns[fn.name](cfg,torch.bfloat16,**overrides)
+    assert result.mtp_num_layers is None
     assert getattr(result,'enable_routing_replay',False) is bool(enabled)
     assert result.rotary_base==50000. and result.rope_type=='rope' and result.rotary_scaling_factor==1
     assert result.q_lora_rank is None and result.moe_layer_freq==[0]+[1]*26

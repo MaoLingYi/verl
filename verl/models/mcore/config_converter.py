@@ -370,7 +370,9 @@ def hf_to_mcore_config_dpskv3(
         transformer_config.enable_routing_replay = replay_enabled
     # MTP
     if "num_nextn_predict_layers" in hf_config:
-        transformer_config.mtp_num_layers = hf_config.num_nextn_predict_layers
+        mtp_layers = hf_config.num_nextn_predict_layers
+        # MCore 0.16 enters MTP postprocessing for any non-None layer count, including zero.
+        transformer_config.mtp_num_layers = None if mtp_layers == 0 and is_moonlight(hf_config) else mtp_layers
         transformer_config.mtp_loss_scaling_factor = 0.1
 
     return transformer_config
