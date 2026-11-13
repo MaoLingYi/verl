@@ -118,6 +118,7 @@ def _load_mcore_016_hdo_checkpoint_state(
             if fp32_param is not None:
                 fp32_param.data.copy_(value["master_param"])
 
+    restored_param_states = set()
     hdos = [distributed.optimizer for distributed in distributed_hdos]
     method_name = "_update_fp32_params_by_new_state"
     setter_name = "_set_main_param_and_optimizer_states"
@@ -135,6 +136,8 @@ def _load_mcore_016_hdo_checkpoint_state(
                     if stage_callback is not None:
                         stage_callback("before_optimizer_common_restore")
                     saved_groups = common["param_groups"]
+                    if hdo.state and not any("step" in group for group in saved_groups):
+                        raise ValueError("HDO cold restore is missing the checkpoint common optimizer step")
                     if len(saved_groups) != len(hdo.param_groups):
                         raise ValueError("HDO cold restore param-group count mismatch")
                     # MCore supplies the existing state here, with checkpoint step already restored.
@@ -167,6 +170,7 @@ def _load_mcore_016_hdo_checkpoint_state(
                     if stage_callback is not None:
                         stage_callback("before_optimizer_param_state_restore")
                     result = original(payload)
+                    restored_param_states.add(id(dist))
                     dist.optimizer._update_fp32_params_by_new_state()
                     if stage_callback is not None:
                         stage_callback("after_optimizer_param_state_restore")
@@ -194,6 +198,8 @@ def _load_mcore_016_hdo_checkpoint_state(
                 set_main_param_and_optimizer_states.__get__(distributed, type(distributed)),
             )
         optimizer.load_state_dict(state_dict)
+        if cold_restore and any(id(dist) not in restored_param_states for dist in distributed_hdos):
+            raise ValueError("HDO cold restore is missing a dp_reshardable optimizer payload")
     finally:
         for instance, name, previous_method in reversed(previous_methods):
             if previous_method is missing:
@@ -586,6 +592,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             else:
                 sharded_sd_metadata = self._build_sharded_state_dict_metadata()
 
+        requested_cold_restore = cold_restore
         cold_restore = bool(
             cold_restore
             and load_model
@@ -594,6 +601,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             and load_extra
             and _mcore_016_hdo_resume_optimizers(self.optimizer, sharded_sd_metadata, True)
         )
+
+        if requested_cold_restore and not cold_restore:
+            raise ValueError("HDO cold restore requires compatible dp_reshardable checkpoint metadata")
 
         sharded_state_dict = None
         state_dict = None

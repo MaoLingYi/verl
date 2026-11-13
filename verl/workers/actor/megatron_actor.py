@@ -1250,38 +1250,40 @@ class MegatronPPOActor(BasePPOActor):
                     mini_batch_size=self.config.ppo_mini_batch_size,
                 )
                 if self.eu_derpo_observer is not None:
-                    for memory_stage in (
-                        "after_actual_f",
-                        "after_main_backward",
-                        "after_native_finalize",
-                        "after_eu_cache_complete",
-                    ):
-                        log_eu_derpo_memory(
-                            memory_stage, self.actor_optimizer, megatron_model_cpu_data_bytes(self.actor_module)
-                        )
+                    log_eu_derpo_memory("post_backward_before_statistics", self.actor_optimizer,
+                                        megatron_model_cpu_data_bytes(self.actor_module))
                     main_finished = time.perf_counter()
                     utility_sum, utility_sum_sq, utility_count, eu_metrics = self.eu_derpo_observer.finish_main_batch()
                     aggregation_started = time.perf_counter()
                     sample_ids = eu_state
-                    routes = self.eu_derpo_observer.routes_for(sample_ids)
-                    current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
                     dppo = self.config.eu_derpo.expert_cluster_dppo
-                    stats_eu = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"} else cluster_statistics)(
-                        current_log_probs,
-                        data.batch["rollout_log_probs"].cpu(),
-                        data.batch["advantages"].cpu(),
-                        data.batch["response_mask"].cpu(),
-                        routes,
-                        self.eu_derpo_observer.num_experts,
-                        self._eu_derpo_delta_current if self.mctr_controller is not None else dppo.delta_e,
-                        dppo.diagnostics_only,
-                        aligned_old_logp=(
-                            data.batch["old_log_probs"].cpu()
-                            if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}
-                            else None
-                        ),
-                        optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
-                    )
+                    global_token_mean = self.config.eu_derpo.version == "1.8.3"
+                    if global_token_mean:
+                        stats_eu, objective = eu_derpo_v183.post_backward_statistics(
+                            self.eu_derpo_observer.consume_post_backward_rows(sample_ids),
+                            data.batch["rollout_log_probs"], data.batch["advantages"], data.batch["response_mask"],
+                            self.eu_derpo_observer.num_experts, self._eu_derpo_delta_current,
+                            dppo.diagnostics_only, self.config.eu_derpo.behavior_expert_is.behavior_source,
+                        )
+                    else:
+                        routes = self.eu_derpo_observer.routes_for(sample_ids)
+                        current_log_probs = self.eu_derpo_observer.current_logprobs_for(sample_ids)
+                        stats_eu = (eu_derpo_v18.cluster_statistics if self.config.eu_derpo.version in {"1.8", "1.8.2", "1.8.3"} else cluster_statistics)(
+                            current_log_probs,
+                            data.batch["rollout_log_probs"].cpu(),
+                            data.batch["advantages"].cpu(),
+                            data.batch["response_mask"].cpu(),
+                            routes,
+                            self.eu_derpo_observer.num_experts,
+                            self._eu_derpo_delta_current if self.mctr_controller is not None else dppo.delta_e,
+                            dppo.diagnostics_only,
+                            aligned_old_logp=(
+                                data.batch["old_log_probs"].cpu()
+                                if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}
+                                else None
+                            ),
+                            optimization_anchor=self.config.eu_derpo.behavior_expert_is.behavior_source,
+                        )
                     if self.config.eu_derpo.version in {"1.3", "1.4", "1.6"}:
                         if self._eu_derpo_rollout_routes is None or self._eu_derpo_rollout_route_mask is None:
                             raise RuntimeError("EU-DERPO V1.3 current-route diagnostic payload is missing")
@@ -1295,12 +1297,9 @@ class MegatronPPOActor(BasePPOActor):
                     if self.mctr_controller is not None:
                         outward_values = stats_eu.divergence[stats_eu.directional_outward]
                         mctr_observation = _global_mctr_outward_p95(outward_values)
-                    global_token_mean = self.config.eu_derpo.version == "1.8.3"
-                    if global_token_mean:
-                        objective = eu_derpo_v183.objective_numerator(stats_eu, routes, data.batch["response_mask"].cpu())
-                    elif self.config.eu_derpo.version == "1.8.2":
+                    if self.config.eu_derpo.version == "1.8.2":
                         _, objective = eu_derpo_v182.edppo_token_coefficients(stats_eu, routes, data.batch["response_mask"].cpu())
-                    else:
+                    elif not global_token_mean:
                         _, objective = (eu_derpo_v18.edppo_token_coefficients if self.config.eu_derpo.version == "1.8" else edppo_token_coefficients)(
                             stats_eu, routes, data.batch["response_mask"].cpu(), active_total
                         )
@@ -1323,6 +1322,8 @@ class MegatronPPOActor(BasePPOActor):
                         utility_cfg.min_group_size,
                         utility_cfg.min_std,
                     )
+                    log_eu_derpo_memory("post_statistics_before_step_e", self.actor_optimizer,
+                                        megatron_model_cpu_data_bytes(self.actor_module))
                     auxiliary_started = time.perf_counter()
                     auxiliary_metrics = self.eu_derpo_observer.run_router_only_step_e(
                         sample_ids,

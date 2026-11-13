@@ -1029,16 +1029,26 @@ class RayPPOTrainer:
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        require_ds_cursor = (
+            self.config.trainer.resume_mode == "resume_path"
+            and self.config.actor_rollout_ref.actor.eu_derpo.enabled
+            and self.config.actor_rollout_ref.actor.eu_derpo.version == "1.8.3"
+        )
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             if (
                 self.config.actor_rollout_ref.actor.eu_derpo.enabled
                 and self.config.actor_rollout_ref.actor.eu_derpo.version in {"1.7", "1.8", "1.8.2", "1.8.3"}
             ):
+                if require_ds_cursor and ("eu_derpo_raw_data_epoch" not in dataloader_state_dict
+                                          or len(dataloader_state_dict) < 2):
+                    raise ValueError("V1.8.3 resume requires saved raw epoch and StatefulDataLoader state")
                 self.raw_data_epoch = dataloader_state_dict.pop("eu_derpo_raw_data_epoch", 0)
                 self._raw_dataloader_resumed = True
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
+            if require_ds_cursor:
+                raise FileNotFoundError(dataloader_local_path)
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _start_profiling(self, do_profile: bool) -> None:

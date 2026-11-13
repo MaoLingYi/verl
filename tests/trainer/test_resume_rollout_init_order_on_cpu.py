@@ -163,7 +163,8 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
             },
         )
 
-        for resume_mode, expected_staged in (("auto", False), ("resume_path", True)):
+        for resume_mode, expected_staged, version in (("auto", False, "1.7"), ("resume_path", True, "1.7"),
+                                                      ("resume_path", True, "1.8.3")):
             calls = []
             dataloader_states = []
             trainer_config = ConfigNode(
@@ -176,7 +177,7 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
             trainer = SimpleNamespace(
                 config=ConfigNode(
                     trainer=trainer_config,
-                    actor_rollout_ref=ConfigNode(actor=ConfigNode(eu_derpo=ConfigNode(enabled=True, version="1.7"))),
+                    actor_rollout_ref=ConfigNode(actor=ConfigNode(eu_derpo=ConfigNode(enabled=True, version=version))),
                 ),
                 actor_rollout_wg=SimpleNamespace(
                     load_checkpoint=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -193,6 +194,15 @@ class TestResumeRolloutInitOrder(unittest.TestCase):
             self.assertEqual(trainer.global_steps, 100)
             self.assertEqual(trainer.raw_data_epoch, 7)
             self.assertTrue(trainer._raw_dataloader_resumed)
+            if version == "1.8.3":
+                self.assertFalse(calls[0][1]["del_local_after_load"])
+                fake_os.path.exists = lambda path: False
+                with self.assertRaises(FileNotFoundError):
+                    load_checkpoint(trainer)
+                fake_os.path.exists = lambda path: True
+                load_checkpoint.__globals__["torch"].load = lambda *args, **kwargs: {"cursor": 100}
+                with self.assertRaisesRegex(ValueError, "raw epoch"):
+                    load_checkpoint(trainer)
 
     def test_fresh_run_keeps_rollout_initialization_before_checkpoint_load(self):
         events = ["actor_init"]

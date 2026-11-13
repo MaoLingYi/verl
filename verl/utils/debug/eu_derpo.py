@@ -536,6 +536,11 @@ class EUDERPOObserver:
         except KeyError as exc:
             raise RuntimeError(f"missing EU-DERPO actual-F route for sample {exc.args[0]}") from exc
 
+    def consume_post_backward_rows(self, sample_ids):
+        """The V1.8.3 logger is the last reader of these two full-response caches."""
+        for sample_id in sample_ids.tolist():
+            yield self.route_cache.pop(sample_id), self.current_logprob_cache.pop(sample_id)
+
     def _ordered_routes_for(self, sample_ids: torch.Tensor) -> torch.Tensor:
         try:
             return torch.stack([self._ordered_route_cache[int(sample_id)] for sample_id in sample_ids.tolist()])
@@ -837,9 +842,16 @@ class EUDERPOObserver:
     @torch.no_grad()
     def record_main_logprobs(self, sample_ids, routes, current_logprobs):
         ids = self._ids(sample_ids, current_logprobs.shape[0])
-        cached = self.routes_for(sample_ids)
-        if not torch.equal(cached.long().sort(-1).values, routes.detach().cpu().long().sort(-1).values):
-            raise RuntimeError("EU-DERPO loss closure did not receive its same-F route snapshot")
+        for row, sample_id in enumerate(ids):
+            cached = self.route_cache[sample_id]
+            supplied = routes[row].detach().cpu()
+            if cached.shape != supplied.shape:
+                raise RuntimeError("EU-DERPO loss closure route shape differs from actual F")
+            if not torch.equal(cached, supplied):
+                # Ordering may differ; validate the selected set without widening all layers.
+                for layer in range(cached.shape[1]):
+                    if not torch.equal(cached[:, layer].sort(-1).values, supplied[:, layer].sort(-1).values):
+                        raise RuntimeError("EU-DERPO loss closure did not receive its same-F route snapshot")
         if current_logprobs.ndim != 2 or not torch.isfinite(current_logprobs).all():
             raise RuntimeError("EU-DERPO actual-F current logprob is missing or non-finite")
         for row, sample_id in enumerate(ids):
@@ -891,10 +903,10 @@ class EUDERPOObserver:
                 raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
             copy_started = time.perf_counter()
             self._hidden_cache[index][start:end].copy_(
-                flat_hidden[valid].to(device="cpu", dtype=torch.bfloat16), non_blocking=False
+                flat_hidden[valid], non_blocking=False
             )
             self._support_cache[index][start:end].copy_(
-                selected_support.to(device="cpu", dtype=torch.uint8), non_blocking=False
+                selected_support.to(dtype=torch.uint8), non_blocking=False
             )
             self._d2h_seconds += time.perf_counter() - copy_started
             self._cache_cursor_by_layer[index] = end
@@ -1281,7 +1293,10 @@ class EUDERPOObserver:
                 )
                 if use_pinned:
                     gpu_memory_peak = max(gpu_memory_peak, torch.cuda.memory_allocated(device))
+                del support  # a slice would retain this entire layer's CPU storage
                 cursor = end
+            self._hidden_cache[layer] = None
+            self._support_cache[layer] = None
 
             for name, parameter in parameters:
                 auxiliary_grad = accumulators[name]

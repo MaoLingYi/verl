@@ -380,6 +380,27 @@ def _cold_restore_case(*, fail_common=False):
 
 
 class TestMegatronCheckpointManagerHDOResume(unittest.TestCase):
+    def test_cold_restore_rejects_common_only_checkpoint(self):
+        chain, dist, hdo, params, checkpoint, events = _cold_restore_case()
+        # MCore skips the sharded loader if the checkpoint has no param_state.
+        chain.load_state_dict = lambda common: None
+        del checkpoint["param_state"]
+        with self.assertRaisesRegex(ValueError, "dp_reshardable optimizer payload"):
+            _production_methods()["_load_mcore_016_hdo_checkpoint_state"](
+                chain, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True, cold_restore=True)
+
+    def test_cold_restore_rejects_bootstrap_step_without_checkpoint_common_step(self):
+        chain, dist, hdo, params, checkpoint, events = _cold_restore_case()
+        # MCore can leave dummy state intact when no param group has a step.
+        for group in checkpoint["optimizer"]["param_groups"]:
+            del group["step"]
+        def missing_step(payload):
+            hdo.load_state_dict({"param_groups": payload["optimizer"]["param_groups"], "state": {}})
+        chain.load_state_dict = missing_step
+        with self.assertRaisesRegex(ValueError, "common optimizer step"):
+            _production_methods()["_load_mcore_016_hdo_checkpoint_state"](
+                chain, checkpoint, {"distrib_optim_sharding_type": "dp_reshardable"}, True, cold_restore=True)
+
     def test_cold_restore_skips_generic_cast_preserves_groups_mappings_and_tensor_ownership(self):
         chain, distributed, hdo, params, checkpoint, events = _cold_restore_case()
         helper = _production_methods()["_load_mcore_016_hdo_checkpoint_state"]
