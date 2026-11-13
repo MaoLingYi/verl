@@ -538,20 +538,22 @@ def test_real_fit_restored_loader_position_is_not_reseeded(monkeypatch):
     assert [entry["training/global_step"] for entry in logs] == [2, 3]
 
 
-def test_explicit_resume_250_runs_updates_251_through_absolute_target_370(monkeypatch):
+@pytest.mark.parametrize(("version", "source_step"), [("1.7", 250), ("1.8.3", 100)])
+def test_explicit_resume_runs_remaining_updates_to_absolute_target_370(monkeypatch, version, source_step):
     trainer, run, updates, _, logs = fit_harness(
-        monkeypatch, "1.7", [1] * 120, steps=370, target=1, batches_per_epoch=1, epochs=130,
+        monkeypatch, version, [1] * (370-source_step), steps=370, target=1, batches_per_epoch=1, epochs=371,
     )
 
+    trainer.config.algorithm.filter_groups.enable = True
     def restore():
-        trainer.global_steps = 250
+        trainer.global_steps = source_step
         trainer.raw_data_epoch = 0
         trainer._raw_dataloader_resumed = True
 
     trainer._load_checkpoint = restore
     run()
-    assert len(updates) == 120
-    assert [entry["training/global_step"] for entry in logs] == list(range(251, 371))
+    assert len(updates) == 370-source_step
+    assert [entry["training/global_step"] for entry in logs] == list(range(source_step+1, 371))
 
 
 @pytest.mark.parametrize("version", ["1.6", "1.7"])
@@ -572,7 +574,7 @@ def test_production_dataloader_checkpoint_blocks_preserve_state_and_raw_epoch(ve
         train_dataloader=types.SimpleNamespace(state_dict=lambda: {"iterator_position": 2},
                                              load_state_dict=lambda state: restored.update(state)),
     )
-    namespace = {"self": trainer, "dataloader_local_path": "unused",
+    namespace = {"self": trainer, "require_ds_cursor": False, "dataloader_local_path": "unused",
                  "torch": types.SimpleNamespace(save=lambda state, path: saved.update(state),
                                                 load=lambda *args, **kwargs: dict(saved))}
     exec(compile(ast.Module(body=save.body[start:start + 3], type_ignores=[]), "save.data", "exec"), namespace)
