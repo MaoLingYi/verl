@@ -330,6 +330,9 @@ class MegatronPPOActor(BasePPOActor):
                 diagnostics=self.config.eu_derpo.routing_utility.diagnostics,
                 route_attribution=self.config.eu_derpo.route_attribution,
                 staging_mib=self.config.eu_derpo.staging_mib,
+                cache_backend=self.config.eu_derpo.cache_backend,
+                cache_root=self.config.eu_derpo.cache_root,
+                cache_attempt_id=self.config.eu_derpo.cache_attempt_id,
             )
             if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo

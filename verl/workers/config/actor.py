@@ -95,6 +95,8 @@ class EUDERPOConfig(BaseConfig):
     hidden_source: str = "actual_f"
     support_source: str = "actual_f"
     cache_backend: str = "cpu_pageable"
+    cache_root: Optional[str] = None
+    cache_attempt_id: Optional[str] = None
     staging_mib: int = 64
     natural_topk_step_e: bool = False
     full_aux_forward: bool = False
@@ -116,15 +118,19 @@ class EUDERPOConfig(BaseConfig):
             self.step_e_implementation,
             self.hidden_source,
             self.support_source,
-            self.cache_backend,
             self.staging_mib,
             self.natural_topk_step_e,
             self.full_aux_forward,
         )
         if step_e_contract != (
-            "actual_f_router_only", "actual_f", "actual_f", "cpu_pageable", 64, False, False
+            "actual_f_router_only", "actual_f", "actual_f", 64, False, False
         ):
             raise ValueError("EU-DERPO V1.2.1 Step E contract is frozen to actual-F Router-only replay")
+        if self.cache_backend != "cpu_pageable" and not (
+            self.version == "1.8.3" and self.cache_backend == "nfs_direct"
+            and self.cache_root and self.cache_attempt_id
+        ):
+            raise ValueError("nfs_direct requires V1.8.3, cache_root and a unique cache_attempt_id")
         if not self.behavior_expert_is.enabled or not self.expert_cluster_dppo.enabled or not self.routing_utility.enabled:
             raise ValueError("EU-DERPO requires behavior ExpertIS, Expert-cluster DPPO, and Routing Utility")
         expected_source = "aligned_old" if self.version == "1.3" else "rollout"

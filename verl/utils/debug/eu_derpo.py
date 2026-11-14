@@ -283,7 +283,8 @@ def _route_attribution_summary(valid, order_only, set_mismatch):
 class EUDERPOObserver:
     """Capture actual-F state and apply deferred Router-only utility gradients."""
 
-    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64):
+    def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64,
+                 cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -333,6 +334,11 @@ class EUDERPOObserver:
         self.num_experts = self.routers[0].weight.shape[0]
         self.hidden_size = self.routers[0].weight.shape[1]
         self.staging_mib = int(staging_mib)
+        self.cache_backend = cache_backend
+        self.cache_root = cache_root
+        self.cache_attempt_id = cache_attempt_id
+        self._file_store = None
+        self._capture_io_error = None
         if self.topk != 8 or self.num_experts != 128:
             raise ValueError("EU-DERPO V1.2.1 Qwen3 recipe requires 128 Experts and Top-K=8")
         if any(
@@ -640,6 +646,16 @@ class EUDERPOObserver:
             )
         return decision
 
+    def _check_store_error(self, stage, error):
+        # As in the HDO transition, every owner votes at the same phase boundary.
+        failed = error is not None
+        if torch.distributed.is_initialized():
+            flag = torch.tensor(int(failed), device=self.routers[0].weight.device)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            failed = bool(flag.item())
+        if failed:
+            raise RuntimeError(f"HiddenStore {stage} failed (local error: {error!r})") from error
+
     def wrap_native_finalize(self, original_finalize):
         if original_finalize is None:
             raise RuntimeError("EU-DERPO requires MCore native finalize_model_grads")
@@ -697,16 +713,42 @@ class EUDERPOObserver:
             mpu.get_tensor_model_parallel_rank(),
         )
         byte_plan = _cache_byte_plan(plan["rows"], len(self.routers), self.hidden_size, self.topk)
-        ram = self._coordinated_ram_preflight(sum(byte_plan.values()))
-        self._hidden_cache = [
-            torch.empty((plan["rows"], self.hidden_size), dtype=torch.bfloat16)
-            for _ in self.routers
-        ]
+        resident = sum(byte_plan.values())
+        file_mode = self.cache_backend == "nfs_direct"
+        if file_mode:
+            from verl.utils.debug.eu_hidden_store import DirectHiddenStore, WRITE_BYTES
+
+            rows = plan["rows"]
+            write_bytes = min(rows, WRITE_BYTES // (2 * self.hidden_size)) * self.hidden_size * 2
+            stage_rows = max(1, min(rows, _staging_chunk_rows(self.staging_mib, self.hidden_size, self.topk)))
+            replay_bytes = stage_rows * (2 * self.hidden_size + 5 * self.topk)
+            resident = byte_plan["support"] + byte_plan["metadata"] + max(write_bytes, replay_bytes)
+        ram = self._coordinated_ram_preflight(resident)
+        if file_mode:
+            shared = torch.tensor(byte_plan["hidden"], dtype=torch.int64, device=device)
+            rank = 0
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(shared, op=torch.distributed.ReduceOp.SUM)
+                rank = torch.distributed.get_rank()
+            error = None
+            try:
+                self._file_store = DirectHiddenStore(
+                    self.cache_root, self.cache_attempt_id, rank, optimizer_generation, rows,
+                    self.hidden_size, len(self.routers), shared.item(),
+                )
+            except Exception as exc:
+                error = exc
+            self._check_store_error("open", error)
+        else:
+            self._hidden_cache = [
+                torch.empty((plan["rows"], self.hidden_size), dtype=torch.bfloat16)
+                for _ in self.routers
+            ]
         self._support_cache = [
             torch.empty((plan["rows"], self.topk), dtype=torch.uint8)
             for _ in self.routers
         ]
-        if any(tensor.is_pinned() for tensor in self._hidden_cache + self._support_cache):
+        if any(tensor.is_pinned() for tensor in (self._hidden_cache or []) + self._support_cache):
             raise RuntimeError("EU-DERPO full cache must use pageable CPU memory")
         self._provenance = {
             key: plan[key] for key in ("sample_row", "sample_id", "response_position")
@@ -720,13 +762,18 @@ class EUDERPOObserver:
             "hidden_cache_bytes": byte_plan["hidden"],
             "support_cache_bytes": byte_plan["support"],
             "semantic_metadata_bytes": byte_plan["metadata"],
-            "pageable_cache_peak_bytes": sum(byte_plan.values()),
-            "eu_cache_required_bytes": sum(byte_plan.values()),
+            "pageable_cache_peak_bytes": (byte_plan["support"] + byte_plan["metadata"] + write_bytes
+                                         if file_mode else resident),
+            "eu_cache_required_bytes": resident,
             "node_required_cache_bytes": ram["node_required"],
             "mem_available_before_allocation_bytes": ram["mem_available"],
             "mem_available_before_actor_update_bytes": ram["mem_available"],
             "host_safety_margin_bytes": ram["safety_margin"],
         }
+        if file_mode:
+            self._cache_metrics.update(hidden_write_buffer_bytes=write_bytes,
+                                       step_e_staging_budget_bytes=replay_bytes,
+                                       shared_hidden_file_bytes=shared.item())
         self._native_finalize_count = 0
         self._native_finalize_completed = False
         self._optimizer_generation = int(optimizer_generation)
@@ -902,9 +949,14 @@ class EUDERPOObserver:
             ):
                 raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
             copy_started = time.perf_counter()
-            self._hidden_cache[index][start:end].copy_(
-                flat_hidden[valid], non_blocking=False
-            )
+            if self._file_store is None:
+                self._hidden_cache[index][start:end].copy_(flat_hidden[valid], non_blocking=False)
+            elif self._capture_io_error is None:
+                try:
+                    self._file_store.write_rows(index, start, end, flat_hidden, valid)
+                except Exception as exc:
+                    # The hook runs inside model collectives. All ranks report at seal.
+                    self._capture_io_error = exc.with_traceback(None)
             self._support_cache[index][start:end].copy_(
                 selected_support.to(dtype=torch.uint8), non_blocking=False
             )
@@ -1035,6 +1087,17 @@ class EUDERPOObserver:
     @torch.no_grad()
     def finish_main_batch(self):
         self._assert_native_finalize()
+        if self._file_store is not None:
+            error = self._capture_io_error
+            if error is None:
+                try:
+                    self._file_store.seal_capture()
+                except Exception as exc:
+                    error = exc
+            self._check_store_error("seal", error)
+            self._cache_metrics.update(hidden_file_written_bytes=self._file_store.header["written_bytes"],
+                                       hidden_file_allocated_bytes=self._file_store.header["allocated_bytes"],
+                                       hidden_file_reserved_bytes=0)
         if self._pending_alpha:
             raise RuntimeError("EU-DERPO has unconsumed actual-alpha records")
         if any(self._pending_recompute):
@@ -1192,7 +1255,8 @@ class EUDERPOObserver:
             raise RuntimeError("EU-DERPO V1.2.1 Step E observed a forbidden full-A/routing call")
         if self._step_e_started:
             raise RuntimeError("EU-DERPO Router-only Step E was invoked more than once")
-        if self._hidden_cache is None or self._support_cache is None or self._provenance is None:
+        if ((self._hidden_cache is None and self._file_store is None)
+                or self._support_cache is None or self._provenance is None):
             raise RuntimeError("EU-DERPO Router-only Step E is missing actual-F cache")
         if not torch.equal(sample_ids.detach().cpu().long(), self._sample_ids_by_row.detach().cpu().long()):
             raise RuntimeError("EU-DERPO Router-only Step E sample ordering changed")
@@ -1234,6 +1298,7 @@ class EUDERPOObserver:
                 for name, parameter in parameters
             }
             cursor = 0
+            io_error = None
             while cursor < rows:
                 end = min(rows, cursor + chunk_rows)
                 length = end - cursor
@@ -1250,7 +1315,14 @@ class EUDERPOObserver:
                     support,
                     len(sample_ids),
                 )
-                hidden_stage[:length].copy_(self._hidden_cache[layer][cursor:end])
+                if self._file_store is None:
+                    hidden_stage[:length].copy_(self._hidden_cache[layer][cursor:end])
+                else:
+                    try:
+                        self._file_store.read_rows_into(layer, cursor, end, hidden_stage[:length])
+                    except Exception as exc:
+                        io_error = exc
+                        break
                 support_stage[:length].copy_(support)
                 coefficient_stage[:length].copy_(coefficient)
                 transfer_started = time.perf_counter()
@@ -1295,7 +1367,17 @@ class EUDERPOObserver:
                     gpu_memory_peak = max(gpu_memory_peak, torch.cuda.memory_allocated(device))
                 del support  # a slice would retain this entire layer's CPU storage
                 cursor = end
-            self._hidden_cache[layer] = None
+            if self._file_store is None:
+                self._hidden_cache[layer] = None
+            else:
+                if io_error is None:
+                    try:
+                        self._file_store.release_layer(layer)
+                        if layer == len(self.routers) - 1:
+                            self._file_store.close()
+                    except Exception as exc:
+                        io_error = exc
+                self._check_store_error(f"replay layer {layer}", io_error)
             self._support_cache[layer] = None
 
             for name, parameter in parameters:
@@ -1643,6 +1725,10 @@ class EUDERPOObserver:
         return metrics
 
     def clear(self):
+        if self._file_store is not None:
+            self._file_store.abort()
+            self._file_store = None
+        self._capture_io_error = None
         self.mode = None
         self.route_cache.clear()
         self._ordered_route_cache.clear()
