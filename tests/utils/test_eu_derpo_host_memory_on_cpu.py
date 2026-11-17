@@ -48,6 +48,68 @@ def test_parse_proc_kib_and_missing_fields():
     assert parsed == {"VmRSS": 1024**2, "RssAnon": 512 * 1024}
 
 
+def test_post_step_e_measures_page_release_independently_of_trim_return(monkeypatch):
+    events = []
+    snapshots = iter((
+        {"rss_bytes": 500, "mem_available_bytes": 200},
+        {"rss_bytes": 500, "mem_available_bytes": 180},
+    ))
+
+    def snapshot(_):
+        events.append("snapshot")
+        return next(snapshots)
+
+    def reclaim():
+        events.append("reclaim")
+        return {"gc_collected": 3, "malloc_trim_rc": 1}
+
+    monkeypatch.setattr(memory_utils, "_host_reclaim_snapshot", snapshot)
+    monkeypatch.setattr(memory_utils, "best_effort_release_host_allocator", reclaim)
+    result = memory_utils.post_step_e_host_reclaim(generation=2, hidden_storage={"storage_bytes": 0})
+    assert events == ["snapshot", "reclaim", "snapshot"]
+    assert result["trim_supported"] and result["trim_rc"] == 1 and result["gc_collected"] == 3
+    assert result["rss_drop_bytes"] == 0 and result["available_gain_bytes"] == -20
+    assert result["generation"] == 2 and result["hidden_storage"]["storage_bytes"] == 0
+
+
+def test_reclaim_snapshot_keeps_ray_scopes_and_unknown_counters_distinct(monkeypatch):
+    monkeypatch.setattr(memory_utils.sys, "platform", "linux")
+    monkeypatch.setattr(
+        memory_utils, "_read_proc_kib", lambda path: {"MemAvailable": 400} if path.endswith("meminfo") else {}
+    )
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(is_initialized=lambda: True))
+    monkeypatch.setitem(
+        sys.modules, "ray._private.utils", SimpleNamespace(get_system_memory=lambda: 700, get_used_memory=lambda: 310)
+    )
+    counters = memory_utils._host_reclaim_snapshot((950, 1000))
+    assert counters["rss_bytes"] is counters["pss_bytes"] is counters["rss_anon_bytes"] is None
+    assert (counters["ray_python_used_bytes"], counters["ray_python_total_bytes"]) == (310, 700)
+    assert (counters["raylet_linux_used_bytes"], counters["raylet_threshold_bytes"]) == (600, 950)
+    monkeypatch.setitem(sys.modules, "ray", None)
+    counters = memory_utils._host_reclaim_snapshot(None)
+    assert counters["ray_python_used_bytes"] is counters["raylet_linux_used_bytes"] is None
+
+
+def test_reclaim_snapshot_reads_pinned_counters_only_after_cuda_initialization(monkeypatch):
+    current = {"allocated_bytes.current": 32, "reserved_bytes.current": 128}
+    calls = []
+
+    def pinned_stats():
+        calls.append(True)
+        return current
+
+    monkeypatch.setattr(torch.cuda.memory, "host_memory_stats", pinned_stats, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    cold = memory_utils._host_reclaim_snapshot(None)
+    assert not calls and cold["pinned_allocated_bytes"] is cold["pinned_reserved_bytes"] is None
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    warm = memory_utils._host_reclaim_snapshot(None)
+    assert len(calls) == 1 and (warm["pinned_allocated_bytes"], warm["pinned_reserved_bytes"]) == (32, 128)
+    current.clear()
+    unknown = memory_utils._host_reclaim_snapshot(None)
+    assert unknown["pinned_allocated_bytes"] is unknown["pinned_reserved_bytes"] is None
+
+
 def test_missing_smaps_uses_rss_for_pss(monkeypatch):
     monkeypatch.setattr(
         memory_utils,

@@ -306,6 +306,20 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
                 assert capture["node_hidden_ram_approved_bytes"] == ram
                 assert capture["node_hidden_future_hdo_reserve_bytes"] == 3 * 4 * 16
             obs.validate_before_optimizer_step(0)
+            if backend == "ram_nfs_hybrid":
+                snapshot = obs._parameter_snapshot
+                grad_buffers = [r.weight.main_grad for r in case.model.routers]
+                event = obs.reclaim_step_e_payloads()
+                owned = event["hidden_storage"]
+                assert owned["hidden_at_seal_live_storage_bytes"] == ram
+                assert owned["hidden_at_seal_live_storage_blocks"] > 0
+                assert all(owned[key] == 0 for key in
+                           ("logical_ram_bytes", "live_storage_bytes", "live_storage_blocks",
+                            "resident_entries", "span_entries"))
+                assert obs._file_store is obs._provenance is obs._support_cache is None
+                assert obs._parameter_snapshot is snapshot
+                assert all(r.weight.main_grad is grad for r, grad in zip(case.model.routers, grad_buffers))
+                obs.validate_before_optimizer_step(0)
             added = torch.stack([r.weight.main_grad for r in case.model.routers]) - native
             assert native.abs().sum() > 0 and (added.abs().sum().item() > 0) == bool(weight)
             obs.finish_optimizer_step(1)

@@ -299,11 +299,12 @@ def test_selective_source_explicitly_allocates_pageable_cpu_storage():
 
 
 def _host_reclaim_helper(*, trim_result=1, load_error=None):
-    tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
+    source = ROOT / "verl/utils/memory_utils.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
     function = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_best_effort_release_host_allocator_after_copy_param_restore"
+        and node.name == "best_effort_release_host_allocator"
     )
 
     class Trim:
@@ -327,7 +328,7 @@ def _host_reclaim_helper(*, trim_result=1, load_error=None):
         "logger": SimpleNamespace(warning=lambda *args: warnings.append(args)),
         "sys": SimpleNamespace(platform="linux"),
     }
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(WORKER), "exec"), namespace)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     return namespace[function.name](), warnings
 
 
@@ -411,9 +412,10 @@ def test_selective_restore_reclaims_host_only_after_cuda_restore_and_sanity():
 
 def test_host_reclaim_is_selective_only_and_does_not_allocate_cpu_tensors():
     worker_source = WORKER.read_text(encoding="utf-8")
-    start = worker_source.index("def _best_effort_release_host_allocator_after_copy_param_restore")
-    end = worker_source.index("\n\ndef ", start + 4)
-    helper = worker_source[start:end]
+    memory_source = (ROOT / "verl/utils/memory_utils.py").read_text(encoding="utf-8")
+    start = memory_source.index("def best_effort_release_host_allocator")
+    end = memory_source.index("\n\ndef ", start + 4)
+    helper = memory_source[start:end]
     restore_start = worker_source.index("    def _restore_actor_optimizer_copy_params_for_update")
     restore_end = worker_source.index("    def _load_actor_optimizer_for_update", restore_start)
     restore = worker_source[restore_start:restore_end]
@@ -485,6 +487,7 @@ def test_post_cache_reclaim_precedes_preflight_and_cpu_allocation(checkpoint_hol
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(WORKER), "exec"), namespace)
     worker = SimpleNamespace(
         actor=SimpleNamespace(eu_derpo_observer=observer), actor_module=object(), actor_optimizer=object(),
+        _offload_actor_model_for_rollout=namespace["offload_megatron_model_to_cpu"],
         _optimizer_copy_params_offloaded_for_rollout=False, _is_offload_param=True,
         _is_offload_optimizer=True, _checkpoint_training_residency_held=checkpoint_hold,
         _selective_optimizer_copy_param_offload_enabled=lambda: True,

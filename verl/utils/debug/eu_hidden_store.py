@@ -416,6 +416,28 @@ class HybridHiddenStore(DirectHiddenStore):
                 runs.popleft()
             cursor = stop
 
+    def ram_storage_snapshot(self):
+        """Count BF16 storages once across the resident index and replay spans."""
+        storages = {}
+        for spans in (self._resident.values(), *self._spans):
+            for span in spans:
+                if not isinstance(span.payload, int):
+                    storage = span.payload.untyped_storage()
+                    storages[storage.data_ptr()] = storage.nbytes()
+        return {
+            "logical_ram_bytes": self.ram_hidden_bytes,
+            "live_storage_bytes": sum(storages.values()),
+            "live_storage_blocks": len(storages),
+            "resident_entries": len(self._resident),
+            "span_entries": sum(map(len, self._spans)),
+        }
+
+    def close(self):
+        # Called in the existing final-layer I/O error vote, before optimizer admission.
+        if self.ram_hidden_bytes or self._resident or any(self._spans):
+            raise RuntimeError("HiddenStore replay left resident blocks or spans")
+        super().close()
+
     def abort(self):
         self._resident.clear()
         self._spans.clear()

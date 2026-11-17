@@ -1194,6 +1194,11 @@ class EUDERPOObserver:
                     error = exc
             self._check_store_error("seal", error)
             self._cache_metrics["ram_hidden_bytes_at_seal"] = self._file_store.ram_hidden_bytes
+            if self.cache_backend == "ram_nfs_hybrid":
+                self._cache_metrics.update({
+                    f"hidden_at_seal_{name}": value
+                    for name, value in self._file_store.ram_storage_snapshot().items()
+                })
             self._cache_metrics["pageable_cache_peak_bytes"] += self._file_store.ram_high_water_bytes
             self._cache_metrics.update(hidden_file_written_bytes=self._file_store.header["written_bytes"],
                                        hidden_file_allocated_bytes=self._file_store.header["allocated_bytes"],
@@ -1594,6 +1599,29 @@ class EUDERPOObserver:
         if any(value != 1 for value in self._aux_reduce_count + self._main_grad_add_count):
             raise RuntimeError("EU-DERPO Router auxiliary reduce/add ledger is incomplete")
 
+    def reclaim_step_e_payloads(self):
+        """After Step E and scalar diagnostics. Keep finalize, parameter and generation audits."""
+        from verl.utils.memory_utils import post_step_e_host_reclaim
+
+        if not self._step_e_complete or not self._file_store.closed:
+            raise RuntimeError("Cannot release a HiddenStore before replay completes")
+        ownership = self._file_store.ram_storage_snapshot()
+        ownership.update({k: v for k, v in self._cache_metrics.items() if k.startswith("hidden_at_seal_")})
+        self._file_store = None
+        self._discard_replay_inputs()
+        return post_step_e_host_reclaim(generation=self._optimizer_generation, hidden_storage=ownership,
+                                        ray_limit=_raylet_linux_memory_limit())
+
+    def _discard_replay_inputs(self):
+        self._hidden_cache = None
+        self._support_cache = None
+        self._provenance = None
+        self._planned_spans = None
+        self._utility_sum = None
+        self._utility_sum_sq = None
+        self._utility_count = None
+        self._alpha_summary.clear()
+
     def finish_optimizer_step(self, optimizer_generation):
         if int(optimizer_generation) != self._optimizer_generation + 1:
             raise RuntimeError("EU-DERPO optimizer step generation did not advance exactly once")
@@ -1887,9 +1915,7 @@ class EUDERPOObserver:
         self._prepass_ids = None
         self._sample_row.clear()
         self._prompt_group_by_sample.clear()
-        self._utility_sum = None
-        self._utility_sum_sq = None
-        self._utility_count = None
+        self._discard_replay_inputs()
         self._edge_count_by_layer = None
         self._main_hook_count_by_layer = None
         self._route_mismatch_by_layer = None
@@ -1902,14 +1928,9 @@ class EUDERPOObserver:
         self._aux_attribution = None
         self._aux_attribution_counts = None
         self._aux_first_set_mismatch = None
-        self._alpha_summary.clear()
         self._alpha_min = None
         self._invalid_flag = None
         self._center_residual_max = None
-        self._hidden_cache = None
-        self._support_cache = None
-        self._provenance = None
-        self._planned_spans = None
         self._cache_cursor_by_layer = None
         self._cache_consumed_by_layer = None
         self._cache_plan = None

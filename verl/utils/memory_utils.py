@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import gc
 import inspect
 import logging
 import os
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -49,6 +52,101 @@ def _read_proc_kib(path: str) -> dict[str, int]:
             return _parse_proc_kib(stream.read())
     except OSError:
         return {}
+
+
+def best_effort_release_host_allocator():
+    """Release unreachable Python objects and free glibc heap pages in this process."""
+    collected = gc.collect()
+    attempted = sys.platform.startswith("linux")
+    rc = None
+    if attempted:
+        try:
+            malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+            rc = int(malloc_trim(0))
+        except (AttributeError, OSError) as error:
+            logger.warning("EU-DERPO malloc_trim unavailable: %r", error)
+    return {"gc_collected": collected, "malloc_trim_attempted": int(attempted), "malloc_trim_rc": rc}
+
+
+def _host_reclaim_snapshot(ray_limit):
+    status = _read_proc_kib("/proc/self/status")
+    rollup = _read_proc_kib("/proc/self/smaps_rollup")
+    meminfo = _read_proc_kib("/proc/meminfo")
+    rss = status.get("VmRSS", rollup.get("Rss"))
+    available = meminfo.get("MemAvailable")
+    if sys.platform == "win32":
+        import psutil
+
+        rss = psutil.Process().memory_info().rss
+        available = psutil.virtual_memory().available
+
+    pinned = {}
+    if torch.cuda.is_initialized():
+        host_memory_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
+        if host_memory_stats is not None:
+            try:
+                pinned = host_memory_stats()
+            except (AttributeError, RuntimeError) as exc:
+                logger.warning("CUDA host allocator counters unavailable: %r", exc)
+
+    ray_used = ray_total = None
+    ray = sys.modules.get("ray")
+    if ray is not None and ray.is_initialized():
+        try:
+            from ray._private.utils import get_system_memory, get_used_memory
+
+            ray_used = get_used_memory()
+            ray_total = get_system_memory()
+        except (ImportError, AttributeError, OSError, ValueError, RuntimeError) as exc:
+            logger.warning("Ray Python memory counters unavailable: %r", exc)
+    # Only the existing raylet probe supplies a limit verified against the physical
+    # Linux accounting scope. The Python working set can follow a different cgroup.
+    threshold, total = ray_limit if ray_limit is not None else (None, None)
+    return {
+        "rss_bytes": rss,
+        "pss_bytes": rollup.get("Pss"),
+        "rss_anon_bytes": status.get("RssAnon"),
+        "mem_available_bytes": available,
+        "pinned_allocated_bytes": pinned.get("allocated_bytes.current"),
+        "pinned_reserved_bytes": pinned.get("reserved_bytes.current"),
+        "ray_python_used_bytes": ray_used,
+        "ray_python_total_bytes": ray_total,
+        "raylet_linux_used_bytes": total - available if total is not None and available is not None else None,
+        "raylet_threshold_bytes": threshold,
+        "raylet_total_bytes": total,
+    }
+
+
+def post_step_e_host_reclaim(*, generation, hidden_storage, ray_limit=None):
+    """Per-actor measurements and reclaim after Step E releases its final replay buffers."""
+    before = _host_reclaim_snapshot(ray_limit)
+    start = time.perf_counter()
+    reclaimed = best_effort_release_host_allocator()
+    elapsed = time.perf_counter() - start
+    after = _host_reclaim_snapshot(ray_limit)
+    rss_drop = available_gain = None
+    if before["rss_bytes"] is not None and after["rss_bytes"] is not None:
+        rss_drop = before["rss_bytes"] - after["rss_bytes"]
+    if before["mem_available_bytes"] is not None and after["mem_available_bytes"] is not None:
+        available_gain = after["mem_available_bytes"] - before["mem_available_bytes"]
+    result = {
+        "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else None,
+        "pid": os.getpid(),
+        "generation": generation,
+        "hidden_storage": hidden_storage,
+        "before": before,
+        "after": after,
+        "rss_drop_bytes": rss_drop,
+        "available_gain_bytes": available_gain,
+        "gc_collected": reclaimed["gc_collected"],
+        "trim_supported": reclaimed["malloc_trim_rc"] is not None,
+        "trim_rc": reclaimed["malloc_trim_rc"],
+        "elapsed_seconds": elapsed,
+    }
+    logger.warning("EU-DERPO post_step_e_host_reclaim %s", result)
+    return result
 
 
 def _read_cgroup_memory():

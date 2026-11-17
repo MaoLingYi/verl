@@ -417,7 +417,7 @@ def mcore_model_parallel_config(
 
 
 @torch.no_grad()
-def offload_megatron_model_to_cpu(models):
+def offload_megatron_model_to_cpu(models, *, reuse_pinned_backing=False):
     """
     In megatron, the model and optimizer storage are:
     - bf16 parameter data chunked in model parallel group
@@ -432,7 +432,17 @@ def offload_megatron_model_to_cpu(models):
                 for buffer in buffers:
                     # offload parameters
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
+                        data = buffer.param_data
+                        if reuse_pinned_backing:
+                            # Actor update drops its old CPU backing. Rollout onload retains it for reuse.
+                            backing = getattr(data, "cpu_data", None)
+                            if backing is None:
+                                backing = torch.empty_like(data, device="cpu", pin_memory=True)
+                            # The D2H must finish before releasing the source device storage.
+                            backing.copy_(data.detach(), non_blocking=False)
+                            data.cpu_data = backing
+                        else:
+                            data.cpu_data = data.data.cpu().pin_memory()
                         buffer.param_data_size = buffer.param_data.storage().size()
                         buffer.param_data.storage().resize_(0)
 

@@ -1300,8 +1300,9 @@ class MegatronPPOActor(BasePPOActor):
                     active_total = stats_eu.active.sum((1, 2)).float()
                     mctr_observation = None
                     if self.mctr_controller is not None:
-                        outward_values = stats_eu.divergence[stats_eu.directional_outward]
-                        mctr_observation = _global_mctr_outward_p95(outward_values)
+                        mctr_observation = _global_mctr_outward_p95(
+                            stats_eu.divergence[stats_eu.directional_outward]
+                        )
                     if self.config.eu_derpo.version == "1.8.2":
                         _, objective = eu_derpo_v182.edppo_token_coefficients(stats_eu, routes, data.batch["response_mask"].cpu())
                     elif not global_token_mean:
@@ -1540,6 +1541,13 @@ class MegatronPPOActor(BasePPOActor):
                 self.eu_derpo_observer.validate_before_optimizer_step(
                     self._eu_derpo_optimizer_generation
                 )
+                if global_token_mean and self.eu_derpo_observer.cache_backend == "ram_nfs_hybrid":
+                    # All CPU consumers have finished. Only scalars, including the P95
+                    # observation, are needed across optimizer.step and its HDO allocations.
+                    del stats_eu, active_total, utility_sum, utility_sum_sq, utility_count, normalized, skipped
+                    if utility_cfg.diagnostics:
+                        del active, cluster_utility, outward, positive, negative, valid_uhat, ratio_diagnostic
+                    self.eu_derpo_observer.reclaim_step_e_payloads()
                 log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             if self.eu_derpo_observer is not None:

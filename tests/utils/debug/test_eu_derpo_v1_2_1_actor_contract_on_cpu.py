@@ -98,12 +98,16 @@ class TestEUDERPOV121ActorContract(unittest.TestCase):
         wrapped = source.index("wrap_native_finalize")
         main = source.index("metric_micro_batch = self.forward_backward_batch")
         step_e = source.index("run_router_only_step_e")
+        store_metrics = source.index("hidden_store_metrics(")
         validate = source.index("validate_before_optimizer_step")
+        reclaim = source.index("reclaim_step_e_payloads()")
         optimizer = source.index("self.actor_optimizer.step()")
         self.assertLess(wrapped, main)
         self.assertLess(main, step_e)
-        self.assertLess(step_e, validate)
-        self.assertLess(validate, optimizer)
+        self.assertLess(step_e, store_metrics)
+        self.assertLess(store_metrics, validate)
+        self.assertLess(validate, reclaim)
+        self.assertLess(reclaim, optimizer)
         self.assertEqual(source.count("self.actor_optimizer.step()"), 1)
 
     def test_config_is_frozen_to_v121_actual_f_router_only(self):

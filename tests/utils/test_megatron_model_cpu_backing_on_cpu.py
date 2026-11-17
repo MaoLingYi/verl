@@ -1,4 +1,5 @@
 import ast
+import copy
 import gc
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,9 @@ class DeviceTensor:
 
     def cpu(self):
         return SimpleNamespace(pin_memory=lambda: self.values.detach().clone())
+
+    def detach(self):
+        return self.values.detach()
 
     def copy_(self, source, **kwargs):
         with torch.no_grad():
@@ -121,6 +125,83 @@ def test_loaded_backing_release_preserves_model_gradient_and_rebuilds_next_offlo
         torch.testing.assert_close(values, expected * 0.8)
 
 
+@pytest.mark.parametrize("resume_step", [0, 100])
+def test_hybrid_phase_offload_reuses_one_direct_destination_across_weight_sync(resume_step):
+    api = helpers([])
+    allocated = []
+
+    def allocate(data, *, device, pin_memory):
+        assert device == "cpu" and pin_memory is True
+        result = torch.empty_like(data.values)
+        allocated.append(result.data_ptr())
+        return result
+
+    api["torch"].empty_like = allocate
+    reference = torch.nn.Parameter(torch.tensor([1., 2., 3.]))
+    uninterrupted = torch.optim.Adam([reference], lr=0.01)
+    for _ in range(resume_step):
+        uninterrupted.zero_grad()
+        reference.square().sum().backward()
+        uninterrupted.step()
+    param = torch.nn.Parameter(reference.detach().clone())
+    data = DeviceTensor(param)
+    model = DDP(data, DeviceTensor(torch.zeros_like(param)))
+    data.cpu = lambda: pytest.fail("materialized an intermediate pageable CPU tensor")
+    optimizer = torch.optim.Adam([param], lr=0.01)
+    if resume_step:
+        optimizer.load_state_dict(copy.deepcopy(uninterrupted.state_dict()))
+    for step in (1, 2):
+        uninterrupted.zero_grad()
+        reference.square().sum().backward()
+        uninterrupted.step()
+        optimizer.zero_grad()
+        param.square().sum().backward()
+        optimizer.step()
+        state = optimizer.state[param]
+        moment_ptr = state["exp_avg"].data_ptr()
+        expected = param.detach().clone()
+        # First phase transition after optimizer update creates exactly one host destination.
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=True)
+        assert data.capacity == 0 and len(allocated) == step
+        pointer = data.cpu_data.data_ptr()
+        torch.testing.assert_close(data.cpu_data, expected)
+        api["load_megatron_model_to_gpu"]([model], load_grad=False)
+        # Make stale/copy-skipping behavior observable without a real GPU.
+        data.cpu_data.fill_(float("nan"))
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=True)
+        assert len(allocated) == step and data.cpu_data.data_ptr() == pointer
+        torch.testing.assert_close(data.cpu_data, expected)
+        assert state["step"].item() == resume_step + step and state["exp_avg"].data_ptr() == moment_ptr
+        torch.testing.assert_close(param, reference, rtol=0, atol=0)
+        for key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(state[key], uninterrupted.state[reference][key], rtol=0, atol=0)
+        api["load_megatron_model_to_gpu"]([model])
+        assert api["release_megatron_model_cpu_data"]([model]) == expected.numel() * expected.element_size()
+
+
+@pytest.mark.parametrize("enabled,version,backend,expected", [
+    (True, "1.8.3", "ram_nfs_hybrid", True),
+    (True, "1.8.3", "nfs_direct", False),
+    (True, "1.8.2", "cpu_pageable", False),
+    (False, "1.8.3", "ram_nfs_hybrid", False),
+])
+def test_only_hybrid_uses_reusable_backing_at_rollout_phase_boundaries(enabled, version, backend, expected):
+    path = ROOT / "verl/workers/megatron_workers.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    worker = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    methods = {node.name: node for node in worker.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    name = "_offload_actor_model_for_rollout"
+    for stage in ("rollout_mode", "_finish_actor_update_residency", "_release_checkpoint_residency_hold"):
+        assert any(isinstance(node, ast.Call) and getattr(node.func, "attr", None) == name
+                   for node in ast.walk(methods[stage]))
+    calls = []
+    namespace = {"offload_megatron_model_to_cpu": lambda model, **kwargs: calls.append((model, kwargs))}
+    exec(compile(ast.Module(body=[methods[name]], type_ignores=[]), str(path), "exec"), namespace)
+    cfg = SimpleNamespace(enabled=enabled, version=version, cache_backend=backend)
+    namespace[name](SimpleNamespace(config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=cfg))), worker)
+    assert calls == [(worker, {"reuse_pinned_backing": expected})]
+
+
 def test_release_validates_all_buffers_and_failed_sync_keeps_source_owners():
     events = []
     api = helpers(events)
@@ -193,7 +274,8 @@ def test_actor_update_releases_loaded_backing_before_cache_allocation_only_for_e
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned-host allocator")
-def test_real_cuda_backing_release_and_rebuild():
+@pytest.mark.parametrize("reuse_backing", [False, True])
+def test_real_cuda_backing_release_and_rebuild(reuse_backing):
     api = helpers([], real_cuda=True)
     data = torch.arange(16, device="cuda", dtype=torch.float32)
     expected = data.clone()
@@ -201,7 +283,12 @@ def test_real_cuda_backing_release_and_rebuild():
     active_pointer = active_optimizer_state.data_ptr()
     model = DDP(data, torch.zeros_like(data))
     for _ in range(3):
-        api["offload_megatron_model_to_cpu"]([model])
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=reuse_backing)
+        pointer = data.cpu_data.data_ptr()
+        api["load_megatron_model_to_gpu"]([model], load_grad=False)
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=reuse_backing)
+        if reuse_backing:
+            assert pointer == data.cpu_data.data_ptr() and data.cpu_data.is_pinned()
         reference = weakref.ref(data.cpu_data)
         api["load_megatron_model_to_gpu"]([model])
         gpu_pointer = data.data_ptr()

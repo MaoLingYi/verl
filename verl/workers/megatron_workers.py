@@ -15,12 +15,9 @@
 The main entry point to run the PPO algorithm
 """
 
-import ctypes
 import datetime
-import gc
 import logging
 import os
-import sys
 import time
 
 import psutil
@@ -80,6 +77,7 @@ from verl.utils.megatron_utils import (
 )
 from verl.utils.memory_utils import (
     aggressive_empty_cache,
+    best_effort_release_host_allocator as _best_effort_release_host_allocator_after_copy_param_restore,
     estimate_hdo_memory,
     estimate_optimizer_phase_offload_memory,
     log_eu_derpo_memory,
@@ -107,21 +105,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _GIB = 1024**3
 _RESUME_MAX_HOST_MEMORY_PERCENT = 80.0
 _RESUME_MIN_HOST_AVAILABLE_BYTES = 200 * _GIB
-
-
-def _best_effort_release_host_allocator_after_copy_param_restore():
-    collected = gc.collect()
-    attempted = sys.platform.startswith("linux")
-    rc = None
-    if attempted:
-        try:
-            malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
-            malloc_trim.argtypes = [ctypes.c_size_t]
-            malloc_trim.restype = ctypes.c_int
-            rc = int(malloc_trim(0))
-        except (AttributeError, OSError) as error:
-            logger.warning("EU-DERPO malloc_trim unavailable after copy-param restore: %r", error)
-    return {"gc_collected": collected, "malloc_trim_attempted": int(attempted), "malloc_trim_rc": rc}
 
 
 _CHECKPOINT_MIN_CUDA_FREE_BYTES = 16 * _GIB
@@ -931,7 +914,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 extra={"update_weights_elapsed_s": time.perf_counter() - update_weights_started},
             )
         if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor.actor_module)
+            self._offload_actor_model_for_rollout(self.actor.actor_module)
         cache_released = self._release_actor_cuda_cache_before_rollout_wakeup()
         if not cache_released:
             aggressive_empty_cache(force_sync=True)
@@ -1380,6 +1363,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         )
         return True
 
+    def _offload_actor_model_for_rollout(self, models):
+        eu = self.config.actor.eu_derpo
+        offload_megatron_model_to_cpu(
+            models, reuse_pinned_backing=eu.enabled and eu.version == "1.8.3" and eu.cache_backend == "ram_nfs_hybrid"
+        )
+
     def _finish_actor_update_residency(self, defer_phase_offload, eu_enabled, preserve_hdo=False):
         if defer_phase_offload:
             if self._checkpoint_training_residency_held:
@@ -1414,7 +1403,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     extra={"predicted_optimizer_host_increment_gib": predicted_host_increment / _GIB},
                 )
             if self._is_offload_param:
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
             if eu_enabled:
                 log_eu_derpo_memory(
@@ -1481,7 +1470,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_reoffload("post_ckpt_reoffload_before")
             if self._is_offload_param and not is_megatron_model_offloaded(self.actor_module):
                 try:
-                    offload_megatron_model_to_cpu(self.actor_module)
+                    self._offload_actor_model_for_rollout(self.actor_module)
                 except Exception as error:
                     first_error = error
             log_reoffload("post_ckpt_after_param_offload")

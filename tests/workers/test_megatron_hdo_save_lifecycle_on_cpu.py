@@ -153,6 +153,7 @@ def _save_checkpoint_method(
             )
         ),
         checkpoint_mananager=CheckpointManager(),
+        _offload_actor_model_for_rollout=offload_model,
         _checkpoint_training_residency_held=held,
         _hdo_optimizer_residency_preserved=False,
         _optimizer_copy_params_offloaded_for_rollout=copy_params_partial,
@@ -225,6 +226,7 @@ def _finish_update_method(events, residency, *, selective_copy_param_offload=Fal
     worker = SimpleNamespace(
         _is_offload_param=True,
         _is_offload_optimizer=True,
+        _offload_actor_model_for_rollout=namespace["offload_megatron_model_to_cpu"],
         _checkpoint_training_residency_held=False,
         actor_module=object(),
         actor_optimizer=object(),
