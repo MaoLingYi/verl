@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import socket
 import stat
+import time
+from collections import deque
 from contextlib import ExitStack, contextmanager
 
 WRITE_BYTES = 4 * 1024**2
@@ -138,6 +140,11 @@ class DirectHiddenStore:
                 or shared_bytes < rows * width * 2 * layers):
             raise ValueError("Invalid HiddenStore dimensions")
         self.rows, self.width, self.layers = rows, width, layers
+        self.logical_hidden_bytes = rows * width * 2 * layers
+        self.ram_hidden_bytes = self.ram_high_water_bytes = 0
+        self.spill_written_bytes = self.spill_read_bytes = 0
+        self.d2h_copy_seconds = self.nas_write_seconds = self.nas_read_seconds = 0.0
+        self._disk_rows = [0] * layers
         self.written = [0] * layers
         self.consumed = [0] * layers
         self.inodes = {}
@@ -195,27 +202,55 @@ class DirectHiddenStore:
             raise RuntimeError("HiddenStore planned/captured rows differ")
         if start == end:
             return
-        for first in range(0, end - start, len(self.stage)):
+        while self.written[layer] < end:
+            cursor = self.written[layer]
+            first = cursor - start
             indices = positions[first:first + len(self.stage)]
-            block = self.stage[:len(indices)]
-            # Only the selected rows of this I/O block cross from GPU to CPU.
-            if hidden.device.type == "cpu" and hidden.dtype == block.dtype:
-                torch.index_select(hidden.detach(), 0, indices, out=block)
-            else:
-                block.copy_(hidden.detach().index_select(0, indices), non_blocking=False)
-            _transfer(self.fds[layer], block, (start + first) * self.width * 2, write=True)
-        self.written[layer] = end
+            self.written[layer] += self._capture_block(layer, cursor, hidden, indices)
+
+    def _copy_rows(self, block, hidden, indices):
+        import torch
+
+        if hidden.device.type == "cpu" and hidden.dtype == block.dtype:
+            torch.index_select(hidden.detach(), 0, indices, out=block)
+        else:
+            selected = hidden.detach().index_select(0, indices)
+            started = time.perf_counter()
+            block.copy_(selected, non_blocking=False)
+            if hidden.device.type != "cpu":
+                self.d2h_copy_seconds += time.perf_counter() - started
+
+    def _append_spill(self, layer, block):
+        offset = self._disk_rows[layer]
+        fd = self.fds[layer]
+        if self.sealed and os.fstat(fd).st_size != offset * self.width * 2:
+            raise OSError(errno.EIO, "Sealed HiddenStore file changed before eviction")
+        started = time.perf_counter()
+        _transfer(fd, block, offset * self.width * 2, write=True)
+        self.nas_write_seconds += time.perf_counter() - started
+        self.spill_written_bytes += block.numel() * 2
+        self._disk_rows[layer] += len(block)
+        if self.sealed:
+            self._allocated[layer] = os.fstat(fd).st_blocks * 512
+            self.header.update(written_bytes=self.spill_written_bytes, allocated_bytes=sum(self._allocated))
+        return offset
+
+    def _capture_block(self, layer, start, hidden, indices):
+        block = self.stage[:len(indices)]
+        self._copy_rows(block, hidden, indices)
+        self._append_spill(layer, block)
+        return len(block)
 
     def seal_capture(self):
         if self.closed or self.sealed or any(n != self.rows for n in self.written):
             raise RuntimeError("HiddenStore capture is incomplete or already sealed")
         sizes = [os.fstat(fd) for fd in self.fds.values()]
-        if any(s.st_size != self.rows * self.width * 2 for s in sizes):
+        if any(s.st_size != self._disk_rows[layer] * self.width * 2 for layer, s in enumerate(sizes)):
             raise OSError(errno.EIO, "HiddenStore payload length differs from complete captured rows")
         self.stage = None
         self.sealed = True
-        self.header.update(written_bytes=sum(s.st_size for s in sizes),
-                           allocated_bytes=sum(s.st_blocks * 512 for s in sizes))
+        self._allocated = [s.st_blocks * 512 for s in sizes]
+        self.header.update(written_bytes=self.spill_written_bytes, allocated_bytes=sum(self._allocated))
         self._snapshot()
 
     def read_rows_into(self, layer, start, end, destination):
@@ -226,8 +261,17 @@ class DirectHiddenStore:
                 or destination.dtype != torch.bfloat16 or destination.device.type != "cpu"
                 or not destination.is_contiguous()):
             raise RuntimeError("HiddenStore replay order/shape mismatch")
-        _transfer(self.fds[layer], destination, start * self.width * 2, write=False)
+        self._read_range(layer, start, end, destination)
         self.consumed[layer] = end
+
+    def _read_spill(self, layer, offset, destination):
+        started = time.perf_counter()
+        _transfer(self.fds[layer], destination, offset * self.width * 2, write=False)
+        self.nas_read_seconds += time.perf_counter() - started
+        self.spill_read_bytes += destination.numel() * 2
+
+    def _read_range(self, layer, start, end, destination):
+        self._read_spill(layer, start, destination)
 
     def _remove_layer(self, layer):
         if layer in self.fds:
@@ -274,6 +318,109 @@ class DirectHiddenStore:
             except OSError:
                 LOG.exception("Could not close HiddenStore parent at %s", self.location)
             self.closed = True
+
+
+class _Span:
+    __slots__ = ("start", "end", "payload")
+
+    def __init__(self, start, end, payload):
+        self.start, self.end = start, end
+        self.payload = payload  # Independent CPU tensor, or first row in the compact spill file.
+
+
+class HybridHiddenStore(DirectHiddenStore):
+    """One owner of a node-granted quota. Synchronous capture, pressure eviction and replay."""
+
+    def __init__(self, root, attempt, rank, generation, rows, width, layers, shared_bytes, *,
+                 ram_limit_bytes, pressure):
+        if ram_limit_bytes < 0:
+            raise ValueError("HiddenStore RAM quota must be nonnegative")
+        self.ram_limit_bytes = ram_limit_bytes
+        self._pressure = pressure
+        self._spilling = False
+        self._spans = [deque() for _ in range(layers)]
+        self._resident = {}
+        super().__init__(root, attempt, rank, generation, rows, width, layers, shared_bytes)
+        try:
+            self.header.update(backend="ram_nfs_hybrid", ram_limit_bytes=ram_limit_bytes)
+            self._snapshot()
+        except BaseException:
+            self.abort()
+            raise
+
+    def poll_pressure(self):
+        """Below the reserved headroom, stop admission and spill at most one bounded block per poll."""
+        if not self.ram_limit_bytes:
+            return
+        slack = self._pressure()
+        if slack <= 0:
+            self._spilling = True
+        elif slack >= 1024**3:
+            self._spilling = False
+        if self._spilling and self._resident:
+            layer, original_start = key = next(reversed(self._resident))
+            span = self._resident[key]
+            unread = max(self.consumed[layer], original_start)
+            tensor = span.payload
+            offset = self._append_spill(layer, tensor[unread - original_start:])
+            span.start, span.payload = unread, offset
+            del self._resident[key]
+            self.ram_hidden_bytes -= tensor.numel() * 2
+
+    def _capture_block(self, layer, start, hidden, indices):
+        import torch
+
+        self.poll_pressure()
+        free_rows = (self.ram_limit_bytes - self.ram_hidden_bytes) // (self.width * 2)
+        runs = self._spans[layer]
+        if free_rows and not self._spilling:
+            count = min(free_rows, len(indices))
+            block = torch.empty((count, self.width), device="cpu", dtype=torch.bfloat16)
+            self._copy_rows(block, hidden, indices[:count])
+            span = _Span(start, start + count, block)
+            runs.append(span)
+            self._resident[layer, start] = span
+            self.ram_hidden_bytes += block.numel() * 2
+            self.ram_high_water_bytes = max(self.ram_hidden_bytes, self.ram_high_water_bytes)
+            return count
+
+        offset = self._disk_rows[layer]
+        count = super()._capture_block(layer, start, hidden, indices)
+        # With a full/zero quota, adjacent writes replay in one transfer per original Step E chunk.
+        if (runs and isinstance(runs[-1].payload, int)
+                and runs[-1].payload + start - runs[-1].start == offset):
+            runs[-1].end = start + count
+        else:
+            runs.append(_Span(start, start + count, offset))
+        return count
+
+    def _read_range(self, layer, start, end, destination):
+        self.poll_pressure()
+        runs = self._spans[layer]
+        cursor = start
+        while cursor < end:
+            span = runs[0]
+            stop = min(end, span.end)
+            if not span.start <= cursor < stop:
+                raise RuntimeError("HiddenStore replay coverage mismatch")
+            dest = destination[cursor - start:stop - start]
+            first = cursor - span.start
+            if isinstance(span.payload, int):
+                self._read_spill(layer, span.payload + first, dest)
+            else:
+                dest.copy_(span.payload[first:first + len(dest)])
+                if stop == span.end:
+                    self.ram_hidden_bytes -= span.payload.numel() * 2
+                    del self._resident[layer, span.start]
+            if stop == span.end:
+                runs.popleft()
+            cursor = stop
+
+    def abort(self):
+        self._resident.clear()
+        self._spans.clear()
+        self.ram_hidden_bytes = 0
+        super().abort()
 
 
 def manage_orphans(root, attempt, unlink_one=None):

@@ -1,6 +1,7 @@
 """Exercise the production store. Only mount discovery and OS syscalls are emulated off NFS."""
 import contextlib
 import errno
+from functools import partial
 import importlib.util
 import json
 import os
@@ -215,6 +216,22 @@ def test_attempt_listing_and_single_registered_orphan(local, capsys):
         s.abort()
 
 
+def configure_hybrid_fixture(obs, monkeypatch, quota):
+    # Use the real planner and tensor inventory. Only the OS/Ray readings and HDO topology are fixtures.
+    monkeypatch.setitem(sys.modules, "verl.utils.device",
+                        SimpleNamespace(get_torch_device=lambda: torch.device("cpu"), is_cuda_available=False))
+    for full in ("verl.utils.memory_utils", "verl.utils.debug.eu_hidden_budget"):
+        spec = importlib.util.spec_from_file_location(full, ROOT / (full.replace(".", "/") + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, full, mod)
+        spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "HiddenMemoryHeadroom", lambda limit: lambda: 1024**4)
+    obs.cache_ram_node_bytes = quota
+    cpu_master = torch.zeros(16)
+    return SimpleNamespace(optimizer=SimpleNamespace(param_to_inner_param={0: cpu_master},
+                           gpu_params_map_cpu_copy={0: cpu_master}, sub_optimizers=[]))
+
+
 def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
     """Run real F/R hooks and Step E on both stores with the same differentiable toy model."""
     import test_eu_derpo_observer_on_cpu as harness
@@ -239,8 +256,9 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
             load_math("eu_derpo_v182")
             v183 = load_math("eu_derpo_v183")
             groups = torch.tensor([4, 4])
-            obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0)
-            if backend == "nfs_direct":
+            optimizer = configure_hybrid_fixture(obs, monkeypatch, 152) if backend == "ram_nfs_hybrid" else None
+            obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0, optimizer)
+            if backend != "cpu_pageable":
                 assert obs._hidden_cache is None
             gamma, objectives, masks, population = [], [], [], []
             for i, sample in enumerate(case.sample_ids):
@@ -267,7 +285,8 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
             for r in case.model.routers:
                 r.weight.main_grad = r.weight.grad.clone()
             obs.wrap_native_finalize(lambda: None)()
-            teacher, squares, counts, _ = obs.finish_main_batch()
+            teacher, squares, counts, capture = obs.finish_main_batch()
+            assert len(list(obs.consume_post_backward_rows(case.sample_ids))) == 2
             normalized, _ = eu.normalize_group_utility(teacher, counts, groups, 1e-6, 2, 5e-7)
             stats = SimpleNamespace(count=counts, mask=torch.cat(masks))
             with mock.patch.object(case.observer_module, "_staging_chunk_rows", return_value=2):
@@ -275,6 +294,17 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
                     (counts > 0).sum((1,2)), weight, 0)
             assert metrics["aux_reduce_count_by_layer"] == metrics["main_grad_add_count_by_layer"] == [1]*48
             assert metrics["step_e_max_chunk_rows"] == 2
+            measured = obs.hidden_store_metrics(capture, metrics, .25)
+            logical = 48 * 3 * 4 * 2
+            ram = {"cpu_pageable": logical, "nfs_direct": 0, "ram_nfs_hybrid": 152}[backend]
+            assert measured["hidden_node_logical_hidden_bytes"] == logical
+            assert measured["hidden_node_ram_hidden_bytes_at_seal"] == ram
+            assert measured["hidden_node_ram_hidden_bytes_after_step_e"] == 0
+            assert measured["hidden_node_spill_written_bytes"] == measured["hidden_node_spill_read_bytes"] == logical - ram
+            assert measured["hidden_rank_max_statistics_seconds"] == .25
+            if backend == "ram_nfs_hybrid":
+                assert capture["node_hidden_ram_approved_bytes"] == ram
+                assert capture["node_hidden_future_hdo_reserve_bytes"] == 3 * 4 * 16
             obs.validate_before_optimizer_step(0)
             added = torch.stack([r.weight.main_grad for r in case.model.routers]) - native
             assert native.abs().sum() > 0 and (added.abs().sum().item() > 0) == bool(weight)
@@ -286,8 +316,10 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
 
     with local_transport(), mock.patch.object(store, "WRITE_BYTES", 8):
         for weight in (0., .2):
-            reference, actual = run("cpu_pageable", weight), run("nfs_direct", weight)
-            assert all(torch.equal(left, right) for left, right in zip(reference, actual))
+            reference = run("cpu_pageable", weight)
+            for backend in ("nfs_direct", "ram_nfs_hybrid"):
+                actual = run(backend, weight)
+                assert all(torch.equal(left, right) for left, right in zip(reference, actual))
             assert not list(tmp_path.rglob("*.bin"))
 
 
@@ -318,6 +350,61 @@ def test_io_error_reaches_observer_before_optimizer(local, monkeypatch, phase):
     finally:
         case.tearDown()
     assert not list(local.rglob("*.bin"))
+
+
+def test_hybrid_statistics_spill_failure_reaches_actor(local, monkeypatch):
+    import test_eu_derpo_observer_on_cpu as harness
+
+    case = harness.TestEUDERPOObserver()
+    case.setUp()
+    try:
+        obs = case.observer
+        obs.cache_backend, obs.cache_root, obs.cache_attempt_id = "ram_nfs_hybrid", str(local), "post-stats"
+        monkeypatch.setitem(sys.modules, "verl.utils.debug.eu_hidden_store", store)
+        # run_main_backward supplies no optimizer. Wrap only the fixture call to supply its HDO inventory.
+        optimizer = configure_hybrid_fixture(obs, monkeypatch, 152)
+        monkeypatch.setattr(obs, "start_main_batch", partial(obs.start_main_batch, optimizer=optimizer))
+        case.run_main_backward()
+        obs.finish_main_batch()
+        assert obs._file_store.ram_hidden_bytes == 152
+        obs._file_store._pressure = lambda: -1
+        with mock.patch.object(os, "pwritev", side_effect=OSError(errno.ENOSPC, "injected")):
+            with pytest.raises(RuntimeError, match="post-backward pressure spill") as err:
+                list(obs.consume_post_backward_rows(case.sample_ids))
+        assert err.value.__cause__.errno == errno.ENOSPC
+        with pytest.raises(RuntimeError, match="optimizer step attempted before"):
+            obs.validate_before_optimizer_step(0)
+        assert obs._aux_reduce_count == obs._main_grad_add_count == [0]*48
+    finally:
+        case.tearDown()
+
+
+def test_hybrid_node_plan_uses_all_owner_demands(local, monkeypatch):
+    import test_eu_derpo_observer_on_cpu as harness
+
+    case = harness.TestEUDERPOObserver()
+    case.setUp()
+    try:
+        obs = case.observer
+        optimizer = configure_hybrid_fixture(obs, monkeypatch, 80)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 7)
+        def gather(destinations, sample):
+            for rank, dest in enumerate(destinations):
+                dest.copy_(sample)
+                dest[0] = [0, 0, 0, 0, 0, 0, 64, 256][rank]
+        monkeypatch.setattr(torch.distributed, "all_gather", gather)
+        local_quota, _, values = obs._hybrid_budget(256, 64, 2, 2, optimizer)
+        assert local_quota == 64
+        assert values["node_hidden_ram_approved_bytes"] == 80
+        assert values["node_hidden_future_hdo_reserve_bytes"] == 8 * 16 * 12
+        # An unknown HDO inventory still joins the collective and authorizes zero payload.
+        monkeypatch.setattr(sys.modules["verl.utils.memory_utils"], "estimate_hdo_memory",
+                            mock.Mock(side_effect=RuntimeError("unavailable inventory")))
+        assert obs._hybrid_budget(256, 64, 2, 2, optimizer)[0] == 0
+    finally:
+        case.tearDown()
 
 
 def test_peer_error_vote_rejects_successful_local_io(monkeypatch):

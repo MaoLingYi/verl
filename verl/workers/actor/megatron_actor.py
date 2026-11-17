@@ -333,6 +333,7 @@ class MegatronPPOActor(BasePPOActor):
                 cache_backend=self.config.eu_derpo.cache_backend,
                 cache_root=self.config.eu_derpo.cache_root,
                 cache_attempt_id=self.config.eu_derpo.cache_attempt_id,
+                cache_ram_node_bytes=self.config.eu_derpo.cache_ram_node_bytes,
             )
             if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
@@ -1203,6 +1204,7 @@ class MegatronPPOActor(BasePPOActor):
                     data.batch["response_mask"].cpu(),
                     data.batch["responses"].shape[1],
                     self._eu_derpo_optimizer_generation,
+                    optimizer=self.actor_optimizer,
                 )
                 self.tf_config.finalize_model_grads_func = self.eu_derpo_observer.wrap_native_finalize(
                     original_finalize
@@ -1325,6 +1327,7 @@ class MegatronPPOActor(BasePPOActor):
                         utility_cfg.min_group_size,
                         utility_cfg.min_std,
                     )
+                    statistics_seconds = time.perf_counter() - aggregation_started
                     log_eu_derpo_memory("post_statistics_before_step_e", self.actor_optimizer,
                                         megatron_model_cpu_data_bytes(self.actor_module))
                     auxiliary_started = time.perf_counter()
@@ -1336,6 +1339,10 @@ class MegatronPPOActor(BasePPOActor):
                         utility_cfg.lambda_u,
                         self._eu_derpo_optimizer_generation,
                     )
+                    if global_token_mean:
+                        auxiliary_metrics.update(self.eu_derpo_observer.hidden_store_metrics(
+                            eu_metrics, auxiliary_metrics, statistics_seconds
+                        ))
                     log_eu_derpo_memory("after_step_e", self.actor_optimizer)
                     auxiliary_objective = torch.tensor(
                         auxiliary_metrics["utility_objective"], dtype=torch.float32, device=get_device_id()

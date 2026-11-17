@@ -284,7 +284,7 @@ class EUDERPOObserver:
     """Capture actual-F state and apply deferred Router-only utility gradients."""
 
     def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64,
-                 cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None):
+                 cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None, cache_ram_node_bytes=0):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -335,6 +335,7 @@ class EUDERPOObserver:
         self.hidden_size = self.routers[0].weight.shape[1]
         self.staging_mib = int(staging_mib)
         self.cache_backend = cache_backend
+        self.cache_ram_node_bytes = cache_ram_node_bytes
         self.cache_root = cache_root
         self.cache_attempt_id = cache_attempt_id
         self._file_store = None
@@ -544,8 +545,17 @@ class EUDERPOObserver:
 
     def consume_post_backward_rows(self, sample_ids):
         """The V1.8.3 logger is the last reader of these two full-response caches."""
+        hybrid = self.cache_backend == "ram_nfs_hybrid"
+        error = None
         for sample_id in sample_ids.tolist():
+            if hybrid and error is None:
+                try:
+                    self._file_store.poll_pressure()
+                except Exception as exc:
+                    error = exc.with_traceback(None)
             yield self.route_cache.pop(sample_id), self.current_logprob_cache.pop(sample_id)
+        if hybrid:
+            self._check_store_error("post-backward pressure spill", error)
 
     def _ordered_routes_for(self, sample_ids: torch.Tensor) -> torch.Tensor:
         try:
@@ -646,6 +656,77 @@ class EUDERPOObserver:
             )
         return decision
 
+    def _hybrid_budget(self, planned_bytes, resident, responses, tokens, optimizer):
+        from verl.utils.debug.eu_hidden_budget import HiddenMemoryHeadroom, hdo_growth_reserve, hidden_ram_quotas
+        from verl.utils.memory_utils import estimate_hdo_memory, estimate_optimizer_phase_offload_memory
+
+        measure = HiddenMemoryHeadroom(_raylet_linux_memory_limit())
+        headroom = measure()
+        try:
+            inventory = estimate_hdo_memory(optimizer)
+            hdo_growth = hdo_growth_reserve(inventory)
+            phase_bytes = estimate_optimizer_phase_offload_memory(optimizer)["optimizer_phase_cuda_total_bytes"]
+            # GPU-Adam moments may first materialize after admission.
+            phase_bytes += max(0, 8 * inventory["hdo_gpu_param_numel"] - inventory["hdo_gpu_exp_avg_bytes"]
+                               - inventory["hdo_gpu_exp_avg_sq_bytes"])
+        except (AttributeError, KeyError, TypeError, RuntimeError, ValueError) as exc:
+            # This inventory only authorizes optional payload RAM. Peers must still meet in all_gather.
+            hdo_growth, phase_bytes = None, 0
+            print(f"EU-DERPO HiddenStore optimizer inventory unavailable: {exc!r}", flush=True)
+        layers = len(self.routers)
+        edges = tokens * layers * self.topk
+        # Full padded route IDs + current logprobs are retained per local response.
+        routes = responses * (edges + tokens * 4)
+        # One response's sort (including int64 indices), masked routes and gather temporaries.
+        stats_scratch = edges * 16 + tokens * self.topk * 64
+        # FP32 teacher/moments/normalization, compact cluster stats and diagnostics.
+        cluster_workspace = responses * layers * self.num_experts * 64
+        nonhidden = resident + routes + stats_scratch + cluster_workspace
+        # Missing HDO topology cannot authorize optional payload RAM on any owner.
+        record = [planned_bytes, headroom if hdo_growth is not None else 0, nonhidden, hdo_growth or 0, phase_bytes]
+        rank = 0
+        records = [record]
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            local = torch.tensor(record, dtype=torch.int64, device=self.routers[0].weight.device)
+            gathered = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(gathered, local)
+            records = torch.stack(gathered).cpu().tolist()
+        demand, headrooms, overhead, growth, phase = zip(*records)
+        reserves = [sum(items) for items in zip(overhead, growth, phase)]
+        low = sum(reserves) + HOST_RAM_SAFETY_MARGIN_BYTES
+        quotas = hidden_ram_quotas(demand, self.cache_ram_node_bytes, headrooms, reserves,
+                                  HOST_RAM_SAFETY_MARGIN_BYTES + GIB, self.hidden_size * 2)
+        sampled_at = time.monotonic()
+        slack = headroom - low
+
+        def pressure():
+            # Sample OS accounting independently. Router hooks must never join a collective.
+            nonlocal sampled_at, slack
+            now = time.monotonic()
+            if now - sampled_at >= .25:
+                slack = measure() - low
+                sampled_at = now
+            return slack
+
+        if hdo_growth is None or not headroom:
+            print(f"EU-DERPO HiddenStore rank={rank} effective_headroom={headroom} "
+                  f"accounting={getattr(measure, 'unavailable_reason', None)} hdo_growth={hdo_growth}", flush=True)
+        if rank == 0:
+            print(f"EU-DERPO HiddenStore node_cap={self.cache_ram_node_bytes} approved={sum(quotas)} "
+                  f"owner_quotas={quotas} min_headroom={min(headrooms)} nonpayload={sum(overhead)} "
+                  f"future_hdo={sum(growth)} optimizer_phase={sum(phase)} safety={HOST_RAM_SAFETY_MARGIN_BYTES}",
+                  flush=True)
+        return quotas[rank], pressure, {
+            "node_hidden_ram_configured_bytes": self.cache_ram_node_bytes,
+            "node_hidden_ram_approved_bytes": sum(quotas),
+            "owner_hidden_ram_quota_bytes": quotas[rank],
+            "node_hidden_effective_headroom_bytes": min(headrooms),
+            "node_hidden_nonpayload_reserve_bytes": sum(overhead),
+            "node_hidden_future_hdo_reserve_bytes": sum(growth),
+            "node_optimizer_phase_reserve_bytes": sum(phase),
+        }
+
     def _check_store_error(self, stage, error):
         # As in the HDO transition, every owner votes at the same phase boundary.
         failed = error is not None
@@ -685,6 +766,7 @@ class EUDERPOObserver:
         response_mask: torch.Tensor,
         response_length: int,
         optimizer_generation: int,
+        optimizer=None,
     ):
         ids = self._ids(sample_ids, sample_ids.numel())
         if len(set(ids)) != len(ids):
@@ -714,7 +796,9 @@ class EUDERPOObserver:
         )
         byte_plan = _cache_byte_plan(plan["rows"], len(self.routers), self.hidden_size, self.topk)
         resident = sum(byte_plan.values())
-        file_mode = self.cache_backend == "nfs_direct"
+        hybrid = self.cache_backend == "ram_nfs_hybrid"
+        file_mode = hybrid or self.cache_backend == "nfs_direct"
+        budget_metrics = {}
         if file_mode:
             from verl.utils.debug.eu_hidden_store import DirectHiddenStore, WRITE_BYTES
 
@@ -730,12 +814,20 @@ class EUDERPOObserver:
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(shared, op=torch.distributed.ReduceOp.SUM)
                 rank = torch.distributed.get_rank()
+            args = (self.cache_root, self.cache_attempt_id, rank, optimizer_generation, rows,
+                    self.hidden_size, len(self.routers), shared.item())
+            if hybrid:
+                from verl.utils.debug.eu_hidden_store import HybridHiddenStore
+
+                quota, pressure, budget_metrics = self._hybrid_budget(
+                    byte_plan["hidden"], resident, len(ids), response_length, optimizer
+                )
             error = None
             try:
-                self._file_store = DirectHiddenStore(
-                    self.cache_root, self.cache_attempt_id, rank, optimizer_generation, rows,
-                    self.hidden_size, len(self.routers), shared.item(),
-                )
+                if hybrid:
+                    self._file_store = HybridHiddenStore(*args, ram_limit_bytes=quota, pressure=pressure)
+                else:
+                    self._file_store = DirectHiddenStore(*args)
             except Exception as exc:
                 error = exc
             self._check_store_error("open", error)
@@ -758,6 +850,7 @@ class EUDERPOObserver:
         self._cache_consumed_by_layer = [0] * len(self.routers)
         self._cache_plan = byte_plan
         self._cache_metrics = {
+            **budget_metrics,
             "planned_valid_rows": plan["rows"],
             "hidden_cache_bytes": byte_plan["hidden"],
             "support_cache_bytes": byte_plan["support"],
@@ -948,19 +1041,24 @@ class EUDERPOObserver:
                 or not (selected_support.sort(-1).values.diff(dim=-1) > 0).all()
             ):
                 raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
-            copy_started = time.perf_counter()
             if self._file_store is None:
-                self._hidden_cache[index][start:end].copy_(flat_hidden[valid], non_blocking=False)
+                selected_hidden = flat_hidden[valid]
+                copy_started = time.perf_counter()
+                self._hidden_cache[index][start:end].copy_(selected_hidden, non_blocking=False)
+                if flat_hidden.device.type != "cpu":
+                    self._d2h_seconds += time.perf_counter() - copy_started
+                del selected_hidden
             elif self._capture_io_error is None:
                 try:
                     self._file_store.write_rows(index, start, end, flat_hidden, valid)
                 except Exception as exc:
                     # The hook runs inside model collectives. All ranks report at seal.
                     self._capture_io_error = exc.with_traceback(None)
-            self._support_cache[index][start:end].copy_(
-                selected_support.to(dtype=torch.uint8), non_blocking=False
-            )
-            self._d2h_seconds += time.perf_counter() - copy_started
+            support_bytes = selected_support.to(dtype=torch.uint8)
+            copy_started = time.perf_counter()
+            self._support_cache[index][start:end].copy_(support_bytes, non_blocking=False)
+            if flat_hidden.device.type != "cpu":
+                self._d2h_seconds += time.perf_counter() - copy_started
             self._cache_cursor_by_layer[index] = end
             self._forward_routes[index] = actual_set.detach().to(torch.uint8)
             if self.route_attribution:
@@ -1095,6 +1193,8 @@ class EUDERPOObserver:
                 except Exception as exc:
                     error = exc
             self._check_store_error("seal", error)
+            self._cache_metrics["ram_hidden_bytes_at_seal"] = self._file_store.ram_hidden_bytes
+            self._cache_metrics["pageable_cache_peak_bytes"] += self._file_store.ram_high_water_bytes
             self._cache_metrics.update(hidden_file_written_bytes=self._file_store.header["written_bytes"],
                                        hidden_file_allocated_bytes=self._file_store.header["allocated_bytes"],
                                        hidden_file_reserved_bytes=0)
@@ -1132,7 +1232,9 @@ class EUDERPOObserver:
             "captured_valid_rows": self._cache_plan["hidden"] // (
                 len(self.routers) * self.hidden_size * 2
             ),
-            "d2h_capture_seconds": self._d2h_seconds,
+            "d2h_capture_seconds": self._d2h_seconds + (
+                self._file_store.d2h_copy_seconds if self._file_store is not None else 0.0
+            ),
             **self._cache_metrics,
         }
         if any(cursor != self._cache_metrics["planned_valid_rows"] for cursor in self._cache_cursor_by_layer):
@@ -1291,6 +1393,7 @@ class EUDERPOObserver:
         gpu_memory_before = torch.cuda.memory_allocated(device) if use_pinned else 0
         gpu_memory_peak = gpu_memory_before
         replay_started = time.perf_counter()
+        compute_seconds = 0.0
         for layer, router in enumerate(self.routers):
             parameters = self._router_parameters(router)
             accumulators = {
@@ -1306,6 +1409,7 @@ class EUDERPOObserver:
                     raise RuntimeError("EU-DERPO Step E cache consumption cursor mismatch")
                 support = self._support_cache[layer][cursor:end]
                 sample_rows = self._provenance["sample_row"][cursor:end]
+                coefficient_started = time.perf_counter()
                 coefficient = _build_edge_coefficients(
                     stats,
                     normalized_utility,
@@ -1315,6 +1419,7 @@ class EUDERPOObserver:
                     support,
                     len(sample_ids),
                 )
+                compute_seconds += time.perf_counter() - coefficient_started
                 if self._file_store is None:
                     hidden_stage[:length].copy_(self._hidden_cache[layer][cursor:end])
                 else:
@@ -1335,6 +1440,7 @@ class EUDERPOObserver:
                 self._h2d_seconds += time.perf_counter() - transfer_started
                 if hidden_device.requires_grad or coefficient_device.requires_grad:
                     raise RuntimeError("EU-DERPO Step E hidden/coefficient must be detached")
+                compute_started = time.perf_counter()
                 with torch.enable_grad():
                     logits = router._verl_eu_derpo_original_gating(hidden_device)
                     loss, objective = _selected_support_loss(
@@ -1354,6 +1460,7 @@ class EUDERPOObserver:
                 for (name, _), gradient in zip(parameters, gradients):
                     accumulators[name].add_(gradient.float())
                 objective_total += objective.detach().float().item()
+                compute_seconds += time.perf_counter() - compute_started
                 self._cache_consumed_by_layer[layer] = end
                 max_gpu_chunk_bytes = max(
                     max_gpu_chunk_bytes,
@@ -1443,7 +1550,41 @@ class EUDERPOObserver:
             "step_e_gpu_memory_allocated_delta_bytes": max(0, gpu_memory_peak - gpu_memory_before),
             "h2d_replay_seconds": self._h2d_seconds,
             "router_only_step_e_seconds": time.perf_counter() - replay_started,
+            "step_e_compute_seconds": compute_seconds,
         }
+
+    def hidden_store_metrics(self, capture, replay, statistics_seconds):
+        """One node/world8. Sum disjoint owner bytes; critical-rank elapsed times use MAX."""
+        store = self._file_store
+        logical = self._cache_plan["hidden"]
+        local = {
+            "logical_hidden_bytes": logical,
+            "ram_hidden_bytes_at_seal": capture.get("ram_hidden_bytes_at_seal", logical),
+            "owner_high_water_bytes": store.ram_high_water_bytes if store is not None else logical,
+            "ram_hidden_bytes_after_step_e": store.ram_hidden_bytes if store is not None else 0,
+            "spill_written_bytes": store.spill_written_bytes if store is not None else 0,
+            "spill_read_bytes": store.spill_read_bytes if store is not None else 0,
+        }
+        times = {
+            "d2h_copy_seconds": capture["d2h_capture_seconds"],
+            "nas_write_seconds": store.nas_write_seconds if store is not None else 0.,
+            "nas_read_seconds": store.nas_read_seconds if store is not None else 0.,
+            "step_e_compute_seconds": replay["step_e_compute_seconds"],
+            "step_e_total_seconds": replay["router_only_step_e_seconds"],
+            "statistics_seconds": statistics_seconds,
+        }
+        device = self.routers[0].weight.device
+        totals = torch.tensor([*local.values(), *times.values()], dtype=torch.float64, device=device)
+        maxima = totals.clone()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+        keys = (*local, *times)
+        result = {f"hidden_rank_max_{key}": val for key, val in zip(keys, maxima.tolist())}
+        for key, val in zip(keys, totals.tolist()):
+            prefix = "hidden_rank_sum_" if key in times or key == "owner_high_water_bytes" else "hidden_node_"
+            result[prefix + key] = val
+        return result
 
     def validate_before_optimizer_step(self, optimizer_generation):
         self._assert_native_finalize()
