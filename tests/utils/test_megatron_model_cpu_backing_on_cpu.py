@@ -1,8 +1,9 @@
 import ast
 import copy
+from contextlib import nullcontext
 import gc
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 import weakref
 
 import pytest
@@ -10,6 +11,12 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def pinned_cpu_fixture(value):
+    # Only the CUDA pinned-allocation facility is substituted in these CPU tests.
+    value.is_pinned = lambda: True
+    return value
 
 
 class DDP:
@@ -30,7 +37,10 @@ class DeviceTensor:
         return SimpleNamespace(size=lambda: self.capacity, resize_=lambda size: setattr(self, "capacity", size))
 
     def cpu(self):
-        return SimpleNamespace(pin_memory=lambda: self.values.detach().clone())
+        return SimpleNamespace(pin_memory=lambda: pinned_cpu_fixture(self.values.detach().clone()))
+
+    def __getattr__(self, name):
+        return getattr(self.values, name)
 
     def detach(self):
         return self.values.detach()
@@ -54,7 +64,7 @@ def helpers(events, *, real_cuda=False):
     device = torch.cuda if real_cuda else SimpleNamespace(
         synchronize=lambda: events.append("synchronize"), empty_cache=lambda: None)
     torch_api = torch if real_cuda else SimpleNamespace(
-        _C=SimpleNamespace(_host_emptyCache=lambda: events.append("empty_host_cache")))
+        Tensor=torch.Tensor, _C=SimpleNamespace(_host_emptyCache=lambda: events.append("empty_host_cache")))
     namespace = {"DDP": DDP, "torch": torch_api, "gc": gc, "get_torch_device": lambda: device, "get_device_id": lambda: 0}
     namespace["logger"] = SimpleNamespace(warning=lambda message, *args: events.append(("warning", message % args)))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
@@ -132,7 +142,7 @@ def test_hybrid_phase_offload_reuses_one_direct_destination_across_weight_sync(r
 
     def allocate(data, *, device, pin_memory):
         assert device == "cpu" and pin_memory is True
-        result = torch.empty_like(data.values)
+        result = pinned_cpu_fixture(torch.empty_like(data.values))
         allocated.append(result.data_ptr())
         return result
 
@@ -325,11 +335,12 @@ def test_cold_phase_offload_allocation_ledger_and_bitwise_equal(existing_backing
                 return SimpleNamespace(pin_memory=pin)
 
         data = CopySource(values)
-        original = torch.zeros_like(values) if existing_backing else None
+        original = pinned_cpu_fixture(torch.zeros_like(values)) if existing_backing else None
         if original is not None:
             data.cpu_data = original
         api["torch"].empty_like = lambda source, **kwargs: (
-            ledger.append(("direct_pinned_fixture", payload_bytes)) or torch.empty_like(source.values))
+            ledger.append(("direct_pinned_fixture", payload_bytes))
+            or pinned_cpu_fixture(torch.empty_like(source.values)))
         model = DDP(data, DeviceTensor(torch.zeros_like(values)))
         api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=reuse)
         assert data.capacity == 0
@@ -349,11 +360,11 @@ def test_failed_direct_copy_retains_device_authority_before_offload(existing_bac
     data = DeviceTensor(torch.arange(8, dtype=torch.float32))
     model = DDP(data, DeviceTensor(torch.zeros(8)))
     original = data.values.clone()
-    class Destination:
-        def copy_(self, source, **kwargs):
-            assert kwargs == {"non_blocking": False}
-            raise RuntimeError("D2H failed")
-    destination = Destination()
+    destination = pinned_cpu_fixture(torch.zeros(8))
+    def failed_copy(source, **kwargs):
+        assert kwargs == {"non_blocking": False}
+        raise RuntimeError("D2H failed")
+    destination.copy_ = failed_copy
     if existing_backing:
         data.cpu_data = destination
     api["torch"].empty_like = lambda *args, **kwargs: destination
@@ -366,16 +377,121 @@ def test_failed_direct_copy_retains_device_authority_before_offload(existing_bac
         assert data.cpu_data is destination
 
 
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "device", "grad", "unpinned", "offset", "storage", "stride", "object"])
+def test_retained_backing_metadata_rejected_before_any_buffer_copy(invalid):
+    api = helpers([])
+    first = DeviceTensor(torch.arange(8, dtype=torch.float32))
+    second = DeviceTensor(torch.arange(8, dtype=torch.float32) + 10)
+    first.cpu_data = pinned_cpu_fixture(torch.zeros(8))
+    copies = []
+    first.cpu_data.copy_ = lambda *args, **kwargs: copies.append(True)
+    if invalid == "shape":
+        backing = torch.zeros(1, 8)  # copy_ would broadcast the source's shape (8,) into (1, 8).
+    elif invalid == "dtype":
+        backing = torch.zeros(8, dtype=torch.float64)
+    elif invalid == "device":
+        backing = torch.empty(8, device="meta")
+    elif invalid == "grad":
+        backing = torch.zeros(8, requires_grad=True)
+    elif invalid == "offset":
+        backing = torch.zeros(9)[1:]
+    elif invalid == "storage":
+        backing = torch.zeros(16)[:8]
+    elif invalid == "stride":
+        backing = torch.zeros(16)[::2]
+    elif invalid == "object":
+        backing = object()
+    else:
+        backing = torch.zeros(8)
+    if isinstance(backing, torch.Tensor) and invalid != "unpinned":
+        pinned_cpu_fixture(backing)
+    second.cpu_data = backing
+    models = [DDP(first, DeviceTensor(torch.zeros(8))), DDP(second, DeviceTensor(torch.zeros(8)))]
+    with pytest.raises(RuntimeError, match="Invalid retained"):
+        api["offload_megatron_model_to_cpu"](models, reuse_pinned_backing=True)
+    assert copies == []
+    assert first.capacity == second.capacity == 8
+    assert all(model.buffers[0].grad_data.capacity == 8 for model in models)
+    assert second.cpu_data is backing
+
+
+def test_distinct_gpu_buffers_cannot_share_one_retained_cpu_destination():
+    api = helpers([])
+    first = DeviceTensor(torch.arange(8, dtype=torch.float32))
+    second = DeviceTensor(torch.arange(8, dtype=torch.float32) + 10)
+    shared = pinned_cpu_fixture(torch.zeros(8))
+    first.cpu_data = second.cpu_data = shared
+    models = [DDP(first, DeviceTensor(torch.zeros(8))), DDP(second, DeviceTensor(torch.zeros(8)))]
+    with pytest.raises(RuntimeError, match="multiple buffer owners"):
+        api["offload_megatron_model_to_cpu"](models, reuse_pinned_backing=True)
+    assert first.capacity == second.capacity == 8
+    assert torch.count_nonzero(shared) == 0
+
+
 def test_all_init_and_checkpoint_actor_recold_paths_use_scoped_helper():
     tree = ast.parse((ROOT / "verl/workers/megatron_workers.py").read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
     methods = {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
-    for name, expected_calls in (("init_model", 1), ("load_checkpoint", 6)):
+    for name, expected_calls in (("init_model", 1), ("load_checkpoint", 6),
+                                 ("compute_log_prob", 1), ("save_checkpoint", 1)):
         calls = [node for node in ast.walk(methods[name]) if isinstance(node, ast.Call)]
         assert sum(getattr(node.func, "attr", None) == "_offload_actor_model_for_rollout" for node in calls) == expected_calls
         assert not any(isinstance(node.func, ast.Name) and node.func.id == "offload_megatron_model_to_cpu"
                        and any(isinstance(arg, ast.Attribute) and arg.attr == "actor_module" for arg in node.args)
                        for node in calls)
+
+    direct = [node for node in ast.walk(cls) if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name) and node.func.id == "offload_megatron_model_to_cpu"]
+    # Actor helper delegates once, while Ref remains on its unchanged default path.
+    assert sorted(ast.unparse(call.args[0]) for call in direct) == ["models", "self.ref_module", "self.ref_module"]
+
+
+@pytest.mark.parametrize("version,backend,reuse", [("1.8.3", "ram_nfs_hybrid", True),
+                                                  ("1.8.3", "nfs_direct", False),
+                                                  ("1.7", "cpu_pageable", False)])
+def test_compute_log_prob_actual_worker_uses_scoped_backing_helper(version, backend, reuse):
+    path = ROOT / "verl/workers/megatron_workers.py"
+    cls = next(node for node in ast.parse(path.read_text(encoding="utf-8")).body
+               if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    names = {"compute_log_prob", "_offload_actor_model_for_rollout"}
+    functions = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    for node in functions:
+        node.decorator_list = []
+    class Proto:
+        def __init__(self, tensors=None, meta_info=None):
+            self.batch = tensors or {}
+            self.meta_info = meta_info or {}
+        @classmethod
+        def from_dict(cls, **kwargs):
+            return cls(**kwargs)
+        def to(self, device):
+            assert device == "cpu"
+            return self
+    events = []
+    expected = torch.tensor([[1., 2.]])
+    namespace = {
+        "DataProto": Proto, "nullcontext": nullcontext,
+        "load_megatron_model_to_gpu": lambda model, **kw: events.append(("load", model, kw)),
+        "offload_megatron_model_to_cpu": lambda model, **kw: events.append(("offload", model, kw)),
+        "log_gpu_memory_usage": lambda *args, **kw: None,
+        "aggressive_empty_cache": lambda **kw: events.append(("cache", kw)), "logger": None,
+        "policy_prepass_tensors": lambda out, ent, eu: {"old_log_probs": out},
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
+    worker = SimpleNamespace(
+        _is_actor=True, _is_offload_param=True, actor_module=object(), enable_routing_replay=False,
+        config=SimpleNamespace(
+            actor=SimpleNamespace(eu_derpo=SimpleNamespace(enabled=True, version=version, cache_backend=backend),
+                                  router_replay=SimpleNamespace(mode="disabled")),
+            rollout=SimpleNamespace(log_prob_micro_batch_size_per_gpu=1, log_prob_max_token_len_per_gpu=4096,
+                                    log_prob_use_dynamic_bsz=False, temperature=1.)),
+        actor=SimpleNamespace(compute_log_prob=lambda **kw: (expected, torch.zeros_like(expected), None)),
+    )
+    worker._offload_actor_model_for_rollout = MethodType(namespace["_offload_actor_model_for_rollout"], worker)
+    result = namespace["compute_log_prob"](worker, Proto())
+    assert result.batch["old_log_probs"] is expected
+    assert [event[0] for event in events] == ["load", "offload", "cache"]
+    assert events[1] == ("offload", worker.actor_module, {"reuse_pinned_backing": reuse})
 
 
 def benchmark_cpu_backing_fixture(reuse, size_mib):
@@ -406,7 +522,7 @@ def benchmark_cpu_backing_fixture(reuse, size_mib):
                 return result
             return SimpleNamespace(pin_memory=pin)
     data = Source(torch.full((count,), 3., dtype=torch.bfloat16))
-    data.cpu_data = torch.zeros_like(data.values)
+    data.cpu_data = pinned_cpu_fixture(torch.zeros_like(data.values))
     model = DDP(data, DeviceTensor(torch.zeros(1)))
     original_pointer = data.cpu_data.data_ptr()
     sample()

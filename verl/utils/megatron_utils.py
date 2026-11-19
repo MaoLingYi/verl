@@ -425,6 +425,36 @@ def offload_megatron_model_to_cpu(models, *, reuse_pinned_backing=False):
     - fp32 main_parameter chunked in model and dp group
     - fp32 optimizer state chunked in model and dp group
     """
+    if reuse_pinned_backing:
+        owners = {}
+        # Validate all retained destinations before copying or releasing any GPU buffer.
+        for model_chunk in models:
+            if not isinstance(model_chunk, DDP):
+                continue
+            for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+                for buffer in buffers:
+                    data = buffer.param_data
+                    backing = getattr(data, "cpu_data", None)
+                    if backing is None:
+                        continue
+                    elements = data.storage().size() or buffer.param_data_size
+                    size = elements * data.element_size()
+                    if (
+                        not isinstance(backing, torch.Tensor)
+                        or backing.device.type != "cpu"
+                        or backing.shape != data.shape
+                        or backing.dtype != data.dtype
+                        or backing.requires_grad
+                        or not backing.is_contiguous()
+                        or backing.storage_offset() != 0
+                        or backing.untyped_storage().nbytes() != size
+                        or (size and not backing.is_pinned())
+                    ):
+                        raise RuntimeError("Invalid retained Megatron model CPU backing")
+                    pointer = backing.untyped_storage().data_ptr()
+                    if size and pointer in owners and owners[pointer] is not data:
+                        raise RuntimeError("Megatron model CPU backing has multiple buffer owners")
+                    owners[pointer] = data
     for model_chunk in models:
         if isinstance(model_chunk, DDP):
             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]

@@ -1665,7 +1665,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 RouterReplay.clear_global_router_replay_action()
         # clear kv cache
         if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
+            self._offload_actor_model_for_rollout(self.actor_module)
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
         return output
@@ -1934,7 +1934,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self._release_checkpoint_residency_hold()
             else:
                 if model_loaded:
-                    offload_megatron_model_to_cpu(self.actor_module)
+                    self._offload_actor_model_for_rollout(self.actor_module)
                 if optimizer_loaded:
                     self._offload_actor_optimizer()
                 elif copy_params_were_partial:

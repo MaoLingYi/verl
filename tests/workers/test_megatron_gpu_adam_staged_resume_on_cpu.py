@@ -481,7 +481,7 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         api = module.helpers([])
         allocated = []
         def allocate(source, **kwargs):
-            value = torch.empty_like(source.values)
+            value = module.pinned_cpu_fixture(torch.empty_like(source.values))
             allocated.append(value.data_ptr())
             return value
         api["torch"].empty_like = allocate

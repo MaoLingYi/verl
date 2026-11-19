@@ -41,6 +41,8 @@ def _save_checkpoint_method(
     preserve_hdo_optimizer_residency_between_steps=False,
     selective_copy_param_offload=False,
     copy_params_partial=False,
+    version="1.8.3",
+    cache_backend="ram_nfs_hybrid",
 ):
     tree = ast.parse(WORKER.read_text(encoding="utf-8"), filename=str(WORKER))
     cls = next(
@@ -52,6 +54,9 @@ def _save_checkpoint_method(
     )
     offload_actor = next(
         node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_optimizer"
+    )
+    offload_model_helper = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_model_for_rollout"
     )
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "save_checkpoint")
     method.decorator_list = []
@@ -66,7 +71,8 @@ def _save_checkpoint_method(
         residency["optimizer"] = True
         events.append("load_optimizer")
 
-    def offload_model(_):
+    def offload_model(_, **kwargs):
+        assert kwargs == {"reuse_pinned_backing": version == "1.8.3" and cache_backend == "ram_nfs_hybrid"}
         assert residency["model"]
         residency["model"] = False
         events.append("offload_model")
@@ -124,7 +130,7 @@ def _save_checkpoint_method(
         "logger": SimpleNamespace(warning=lambda message: events.append(message)),
         "torch": fake_torch,
     }
-    exec(compile(ast.Module(body=[offload_actor, release, method], type_ignores=[]), str(WORKER), "exec"), namespace)
+    exec(compile(ast.Module(body=[offload_actor, offload_model_helper, release, method], type_ignores=[]), str(WORKER), "exec"), namespace)
 
     class CheckpointManager:
         def save_checkpoint(self, stage_callback=None, **_):
@@ -144,6 +150,8 @@ def _save_checkpoint_method(
             actor=SimpleNamespace(
                 eu_derpo=SimpleNamespace(
                     enabled=True,
+                    version=version,
+                    cache_backend=cache_backend,
                     skip_post_checkpoint_optimizer_offload=skip_post_checkpoint_optimizer_offload,
                     preserve_hdo_optimizer_residency_between_steps=(
                         preserve_hdo_optimizer_residency_between_steps
@@ -153,7 +161,6 @@ def _save_checkpoint_method(
             )
         ),
         checkpoint_mananager=CheckpointManager(),
-        _offload_actor_model_for_rollout=offload_model,
         _checkpoint_training_residency_held=held,
         _hdo_optimizer_residency_preserved=False,
         _optimizer_copy_params_offloaded_for_rollout=copy_params_partial,
@@ -167,6 +174,7 @@ def _save_checkpoint_method(
         worker,
     )
     worker._offload_actor_optimizer = MethodType(namespace["_offload_actor_optimizer"], worker)
+    worker._offload_actor_model_for_rollout = MethodType(namespace["_offload_actor_model_for_rollout"], worker)
     worker._selective_optimizer_copy_param_offload_enabled = lambda: selective_copy_param_offload
 
     def restore_copy_params():
@@ -302,10 +310,11 @@ def test_save_update_holds_training_residency_without_offload():
     assert worker._checkpoint_training_residency_held is True
 
 
-def test_phase_offloaded_save_loads_training_residency_then_reoffloads():
+@pytest.mark.parametrize("version,backend", [("1.8.3", "ram_nfs_hybrid"), ("1.8.3", "nfs_direct"), ("1.7", "cpu_pageable")])
+def test_phase_offloaded_save_loads_training_residency_then_reoffloads(version, backend):
     events = []
     residency = {"model": False, "optimizer": False}
-    save = _save_checkpoint_method(events, residency)
+    save = _save_checkpoint_method(events, residency, version=version, cache_backend=backend)
     save("/checkpoint", global_step=1)
     assert residency == {"model": False, "optimizer": False}
     assert events == [
@@ -323,10 +332,11 @@ def test_phase_offloaded_save_loads_training_residency_then_reoffloads():
     ]
 
 
-def test_save_failure_still_reoffloads():
+@pytest.mark.parametrize("version,backend", [("1.8.3", "ram_nfs_hybrid"), ("1.8.3", "nfs_direct"), ("1.7", "cpu_pageable")])
+def test_save_failure_still_reoffloads(version, backend):
     events = []
     residency = {"model": False, "optimizer": False}
-    save = _save_checkpoint_method(events, residency, fail=True)
+    save = _save_checkpoint_method(events, residency, fail=True, version=version, cache_backend=backend)
     with pytest.raises(RuntimeError, match="save failed"):
         save("/checkpoint", global_step=1)
     assert residency == {"model": False, "optimizer": False}
