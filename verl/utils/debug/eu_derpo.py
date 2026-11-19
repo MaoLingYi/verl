@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from functools import lru_cache, wraps
+import json
 import os
 from pathlib import Path
 import re
@@ -284,7 +285,8 @@ class EUDERPOObserver:
     """Capture actual-F state and apply deferred Router-only utility gradients."""
 
     def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64,
-                 cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None, cache_ram_node_bytes=0):
+                 cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None, cache_ram_node_bytes=0,
+                 cache_io_batch_mib=4):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -336,6 +338,7 @@ class EUDERPOObserver:
         self.staging_mib = int(staging_mib)
         self.cache_backend = cache_backend
         self.cache_ram_node_bytes = cache_ram_node_bytes
+        self.cache_io_batch_mib = cache_io_batch_mib
         self.cache_root = cache_root
         self.cache_attempt_id = cache_attempt_id
         self._file_store = None
@@ -803,7 +806,8 @@ class EUDERPOObserver:
             from verl.utils.debug.eu_hidden_store import DirectHiddenStore, WRITE_BYTES
 
             rows = plan["rows"]
-            write_bytes = min(rows, WRITE_BYTES // (2 * self.hidden_size)) * self.hidden_size * 2
+            io_batch_bytes = WRITE_BYTES if self.cache_io_batch_mib == 4 else self.cache_io_batch_mib * 1024**2
+            write_bytes = min(rows, io_batch_bytes // (2 * self.hidden_size)) * self.hidden_size * 2
             stage_rows = max(1, min(rows, _staging_chunk_rows(self.staging_mib, self.hidden_size, self.topk)))
             replay_bytes = stage_rows * (2 * self.hidden_size + 5 * self.topk)
             resident = byte_plan["support"] + byte_plan["metadata"] + max(write_bytes, replay_bytes)
@@ -825,9 +829,10 @@ class EUDERPOObserver:
             error = None
             try:
                 if hybrid:
-                    self._file_store = HybridHiddenStore(*args, ram_limit_bytes=quota, pressure=pressure)
+                    self._file_store = HybridHiddenStore(*args, ram_limit_bytes=quota, pressure=pressure,
+                                                        io_batch_bytes=io_batch_bytes)
                 else:
-                    self._file_store = DirectHiddenStore(*args)
+                    self._file_store = DirectHiddenStore(*args, io_batch_bytes=io_batch_bytes)
             except Exception as exc:
                 error = exc
             self._check_store_error("open", error)
@@ -1570,6 +1575,15 @@ class EUDERPOObserver:
             "spill_written_bytes": store.spill_written_bytes if store is not None else 0,
             "spill_read_bytes": store.spill_read_bytes if store is not None else 0,
         }
+        if store is not None:
+            print("EU-DERPO HiddenStore I/O " + json.dumps({
+                "rank": store.header["rank"], "generation": store.header["generation"],
+                "io_batch_bytes": store.io_batch_bytes, "write_stage_bytes": store.write_stage_bytes,
+                "concurrency": 1, "syscalls": store.transfer_stats,
+            }), flush=True)
+            for direction, counters in store.transfer_stats.items():
+                local[f"nas_{direction}_calls"] = counters["calls"]
+                local[f"nas_{direction}_eintr"] = counters["eintr"]
         times = {
             "d2h_copy_seconds": capture["d2h_capture_seconds"],
             "nas_write_seconds": store.nas_write_seconds if store is not None else 0.,

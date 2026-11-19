@@ -113,19 +113,30 @@ def _open_payload(path):
     return os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_DIRECT, 0o600)
 
 
-def _transfer(fd, tensor, offset, *, write):
+def _transfer(fd, tensor, offset, *, write, counters=None):
     """NFS direct I/O accepts arbitrary byte lengths. Retry only untransferred bytes."""
     import torch
 
     data = memoryview(tensor.view(-1).view(torch.uint8).numpy()).cast("B")
     operation = os.pwritev if write else os.preadv
     while data:
+        if counters is not None:
+            counters["calls"] += 1
+            counters["requested_bytes"] += len(data)
+            # Power-of-two bins keep telemetry bounded even with arbitrary short I/O.
+            bucket = (len(data) - 1).bit_length()
+            sizes = counters["request_size_log2"]
+            sizes[bucket] = sizes.get(bucket, 0) + 1
         try:
             count = operation(fd, [data], offset)
         except InterruptedError:
+            if counters is not None:
+                counters["eintr"] += 1
             continue
         if not 0 < count <= len(data):
             raise OSError(errno.EIO, f"Incomplete HiddenStore transfer at offset {offset}")
+        if counters is not None:
+            counters["completed_bytes"] += count
         offset += count
         data = data[count:]
 
@@ -133,13 +144,22 @@ def _transfer(fd, tensor, offset, *, write):
 class DirectHiddenStore:
     """One generation per SP-local rank. Capture and replay use disjoint buffer lifetimes."""
 
-    def __init__(self, root, attempt, rank, generation, rows, width, layers, shared_bytes):
+    def __init__(self, root, attempt, rank, generation, rows, width, layers, shared_bytes, *,
+                 io_batch_bytes=None):
         import torch
 
+        io_batch_bytes = WRITE_BYTES if io_batch_bytes is None else io_batch_bytes
+        if type(io_batch_bytes) is not int or not WRITE_BYTES <= io_batch_bytes <= 64 * 1024**2:
+            raise ValueError("HiddenStore I/O batch must be between the capture block and 64 MiB")
         if (min(rank, generation, rows) < 0 or min(width, layers) <= 0 or width * 2 > WRITE_BYTES
                 or shared_bytes < rows * width * 2 * layers):
             raise ValueError("Invalid HiddenStore dimensions")
         self.rows, self.width, self.layers = rows, width, layers
+        self.io_batch_bytes = io_batch_bytes
+        self.transfer_stats = {
+            direction: dict(calls=0, requested_bytes=0, completed_bytes=0, eintr=0, request_size_log2={})
+            for direction in ("read", "write")
+        }
         self.logical_hidden_bytes = rows * width * 2 * layers
         self.ram_hidden_bytes = self.ram_high_water_bytes = 0
         self.spill_written_bytes = self.spill_read_bytes = 0
@@ -160,7 +180,8 @@ class DirectHiddenStore:
         self.location = Path(root) / attempt / host / f"rank_{rank}" / f"generation_{generation}"
         self.header = dict(format=1, backend="nfs_direct", dtype="bfloat16", shape=[rows, width],
                            layers=layers, rank=rank, generation=generation, attempt=attempt, hostname=host,
-                           logical_bytes=rows * width * 2 * layers, reserved_bytes=0)
+                           logical_bytes=rows * width * 2 * layers, reserved_bytes=0,
+                           io_batch_bytes=io_batch_bytes)
         components = (attempt, host, f"rank_{rank}", f"generation_{generation}")
         self.parent = generation_dir(root, components, shared_bytes)
         self.directory, available = self.parent.__enter__()
@@ -174,8 +195,9 @@ class DirectHiddenStore:
                 self.owned[layer] = path
                 self.inodes[layer] = os.fstat(fd).st_ino
             self._snapshot()
-            self.stage = torch.empty((min(rows, WRITE_BYTES // (2 * width)), width),
+            self.stage = torch.empty((min(rows, io_batch_bytes // (2 * width)), width),
                                      dtype=torch.bfloat16, device="cpu")
+            self.write_stage_bytes = self.stage.untyped_storage().nbytes()
             print(f"EU-DERPO HiddenStore {self.location} shared_required={shared_bytes} "
                   f"available={available} hard_reserved=0 write_buffer={self.stage.numel() * 2}", flush=True)
         except BaseException:
@@ -226,7 +248,7 @@ class DirectHiddenStore:
         if self.sealed and os.fstat(fd).st_size != offset * self.width * 2:
             raise OSError(errno.EIO, "Sealed HiddenStore file changed before eviction")
         started = time.perf_counter()
-        _transfer(fd, block, offset * self.width * 2, write=True)
+        _transfer(fd, block, offset * self.width * 2, write=True, counters=self.transfer_stats["write"])
         self.nas_write_seconds += time.perf_counter() - started
         self.spill_written_bytes += block.numel() * 2
         self._disk_rows[layer] += len(block)
@@ -237,7 +259,10 @@ class DirectHiddenStore:
 
     def _capture_block(self, layer, start, hidden, indices):
         block = self.stage[:len(indices)]
-        self._copy_rows(block, hidden, indices)
+        # Batch NAS writes without increasing the existing D2H selection temporary.
+        rows_per_copy = WRITE_BYTES // (self.width * 2)
+        for first in range(0, len(indices), rows_per_copy):
+            self._copy_rows(block[first:first + rows_per_copy], hidden, indices[first:first + rows_per_copy])
         self._append_spill(layer, block)
         return len(block)
 
@@ -266,7 +291,8 @@ class DirectHiddenStore:
 
     def _read_spill(self, layer, offset, destination):
         started = time.perf_counter()
-        _transfer(self.fds[layer], destination, offset * self.width * 2, write=False)
+        _transfer(self.fds[layer], destination, offset * self.width * 2, write=False,
+                  counters=self.transfer_stats["read"])
         self.nas_read_seconds += time.perf_counter() - started
         self.spill_read_bytes += destination.numel() * 2
 
@@ -332,7 +358,7 @@ class HybridHiddenStore(DirectHiddenStore):
     """One owner of a node-granted quota. Synchronous capture, pressure eviction and replay."""
 
     def __init__(self, root, attempt, rank, generation, rows, width, layers, shared_bytes, *,
-                 ram_limit_bytes, pressure):
+                 ram_limit_bytes, pressure, io_batch_bytes=None):
         if ram_limit_bytes < 0:
             raise ValueError("HiddenStore RAM quota must be nonnegative")
         self.ram_limit_bytes = ram_limit_bytes
@@ -340,7 +366,8 @@ class HybridHiddenStore(DirectHiddenStore):
         self._spilling = False
         self._spans = [deque() for _ in range(layers)]
         self._resident = {}
-        super().__init__(root, attempt, rank, generation, rows, width, layers, shared_bytes)
+        super().__init__(root, attempt, rank, generation, rows, width, layers, shared_bytes,
+                         io_batch_bytes=io_batch_bytes)
         try:
             self.header.update(backend="ram_nfs_hybrid", ram_limit_bytes=ram_limit_bytes)
             self._snapshot()
@@ -374,7 +401,7 @@ class HybridHiddenStore(DirectHiddenStore):
         free_rows = (self.ram_limit_bytes - self.ram_hidden_bytes) // (self.width * 2)
         runs = self._spans[layer]
         if free_rows and not self._spilling:
-            count = min(free_rows, len(indices))
+            count = min(free_rows, len(indices), WRITE_BYTES // (self.width * 2))
             block = torch.empty((count, self.width), device="cpu", dtype=torch.bfloat16)
             self._copy_rows(block, hidden, indices[:count])
             span = _Span(start, start + count, block)
@@ -400,6 +427,16 @@ class HybridHiddenStore(DirectHiddenStore):
         cursor = start
         while cursor < end:
             span = runs[0]
+            if self.io_batch_bytes > WRITE_BYTES and isinstance(span.payload, int):
+                # Eviction can leave adjacent spans; only contiguous disk offsets can merge.
+                while len(runs) > 1 and span.end < end:
+                    following = runs[1]
+                    if (not isinstance(following.payload, int) or following.start != span.end
+                            or following.payload != span.payload + span.end - span.start):
+                        break
+                    runs.popleft()
+                    following.start, following.payload = span.start, span.payload
+                    span = following
             stop = min(end, span.end)
             if not span.start <= cursor < stop:
                 raise RuntimeError("HiddenStore replay coverage mismatch")

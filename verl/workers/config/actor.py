@@ -96,6 +96,7 @@ class EUDERPOConfig(BaseConfig):
     support_source: str = "actual_f"
     cache_backend: str = "cpu_pageable"
     cache_ram_node_bytes: int = 0
+    cache_io_batch_mib: int = 4
     cache_root: Optional[str] = None
     cache_attempt_id: Optional[str] = None
     staging_mib: int = 64
@@ -136,6 +137,12 @@ class EUDERPOConfig(BaseConfig):
             type(self.cache_ram_node_bytes) is not int or self.cache_ram_node_bytes < 0
         ):
             raise ValueError("cache_ram_node_bytes must be a nonnegative integer")
+        if type(self.cache_io_batch_mib) is not int or self.cache_io_batch_mib not in (4, 16, 64):
+            raise ValueError("cache_io_batch_mib must be one of 4, 16, 64")
+        if self.cache_io_batch_mib != 4 and (
+            self.version != "1.8.3" or self.cache_backend not in {"nfs_direct", "ram_nfs_hybrid"}
+        ):
+            raise ValueError("Larger I/O batches require a V1.8.3 file-backed cache")
         if not self.behavior_expert_is.enabled or not self.expert_cluster_dppo.enabled or not self.routing_utility.enabled:
             raise ValueError("EU-DERPO requires behavior ExpertIS, Expert-cluster DPPO, and Routing Utility")
         expected_source = "aligned_old" if self.version == "1.3" else "rollout"

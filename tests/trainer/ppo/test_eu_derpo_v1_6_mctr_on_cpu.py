@@ -125,6 +125,24 @@ def test_v16_config_freezes_bounds_without_affecting_v14():
                 mctr=namespace["MCTRConfig"](enabled=True, beta=0.0027, delta_min=bounds[0], delta_max=bounds[1]),
             )
     namespace["EUDERPOConfig"](version="1.4", **common)
+    io_config = dict(common, partial_rollout_old_alignment=False,
+                     expert_cluster_dppo=namespace["ExpertClusterDPPOConfig"](
+                         enabled=True, delta_e=.012, importance_cap=5.0),
+                     mctr=namespace["MCTRConfig"](enabled=True, beta=.0027, delta_min=.012, delta_max=.018),
+                     cache_root="/mounted/hidden", cache_attempt_id="config-test")
+    for backend in ("nfs_direct", "ram_nfs_hybrid"):
+        for size in (4, 16, 64):
+            cfg = namespace["EUDERPOConfig"](version="1.8.3", cache_backend=backend,
+                                             cache_io_batch_mib=size, **io_config)
+            assert cfg.cache_io_batch_mib == size and cfg.staging_mib == 64
+    for invalid in (0, 8, 128, True, 16.0, "16"):
+        with pytest.raises(ValueError, match="cache_io_batch_mib"):
+            namespace["EUDERPOConfig"](version="1.8.3", cache_backend="nfs_direct",
+                                       cache_io_batch_mib=invalid, **io_config)
+    for version in ("1.7", "1.8", "1.8.2", "1.8.3"):
+        with pytest.raises(ValueError, match="Larger I/O batches require"):
+            namespace["EUDERPOConfig"](version=version, cache_backend="cpu_pageable",
+                                       cache_io_batch_mib=16, **io_config)
 
 
 def test_controller_ema_invalid_and_empty_fallbacks():

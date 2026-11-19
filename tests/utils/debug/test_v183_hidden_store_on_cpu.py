@@ -232,7 +232,8 @@ def configure_hybrid_fixture(obs, monkeypatch, quota):
                            gpu_params_map_cpu_copy={0: cpu_master}, sub_optimizers=[]))
 
 
-def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("io_mib", [4, 16, 64])
+def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
     """Run real F/R hooks and Step E on both stores with the same differentiable toy model."""
     import test_eu_derpo_observer_on_cpu as harness
 
@@ -250,6 +251,7 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
         try:
             obs = case.observer
             obs.cache_backend, obs.cache_root, obs.cache_attempt_id = backend, str(tmp_path/"hidden"), "v183-case"
+            obs.cache_io_batch_mib = io_mib if backend != "cpu_pageable" else 4
             monkeypatch.setitem(sys.modules, "verl.utils.debug.eu_hidden_store", store)
             eu = sys.modules["verl.trainer.ppo.eu_derpo"]
             v18 = load_math("eu_derpo_v18")
@@ -260,6 +262,8 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch):
             obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0, optimizer)
             if backend != "cpu_pageable":
                 assert obs._hidden_cache is None
+                assert obs._cache_metrics["hidden_write_buffer_bytes"] == obs._file_store.write_stage_bytes
+                assert obs._cache_metrics["eu_cache_required_bytes"] >= obs._file_store.write_stage_bytes
             gamma, objectives, masks, population = [], [], [], []
             for i, sample in enumerate(case.sample_ids):
                 inputs, attn = case.input_ids[i:i+1], case.attention_mask[i:i+1]
