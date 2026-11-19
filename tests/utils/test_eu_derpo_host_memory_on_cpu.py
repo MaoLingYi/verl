@@ -124,6 +124,28 @@ def test_missing_smaps_uses_rss_for_pss(monkeypatch):
     assert snapshot["cuda_total_gib"] >= snapshot["cuda_free_gib"]
 
 
+def test_phase_log_distinguishes_pinned_lifetime_peak_and_unknown(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(memory_utils, "_read_proc_kib", lambda _: {"VmHWM": 7 * gib})
+    monkeypatch.setattr(memory_utils, "_read_cgroup_memory", lambda: (5 * gib, 8 * gib))
+    monkeypatch.setattr(memory_utils, "get_torch_device", lambda: SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    counters = {"allocated_bytes.current": gib, "allocated_bytes.peak": 3 * gib,
+                "reserved_bytes.current": 2 * gib, "reserved_bytes.peak": 4 * gib}
+    monkeypatch.setattr(torch.cuda.memory, "host_memory_stats", lambda: counters, raising=False)
+    snapshot = memory_utils.log_eu_derpo_memory("after_full_restore_cleanup")
+    assert snapshot["pinned_allocated_current_gib"] == 1
+    assert snapshot["pinned_allocated_peak_gib"] == 3
+    assert snapshot["pinned_reserved_current_gib"] == 2
+    assert snapshot["pinned_reserved_peak_gib"] == 4
+    assert snapshot["rss_process_peak_gib"] == 7 and snapshot["pid"] > 0
+    assert (snapshot["cgroup_current_gib"], snapshot["cgroup_max_gib"]) == (5, 8)
+    counters.clear()
+    unknown = memory_utils.log_eu_derpo_memory("unavailable")
+    assert all(unknown[f"pinned_{name}_{period}_gib"] is None
+               for name in ("allocated", "reserved") for period in ("current", "peak"))
+
+
 def test_memory_log_includes_caller_lifecycle_fields(monkeypatch):
     monkeypatch.setattr(memory_utils, "_read_proc_kib", lambda _: {})
     monkeypatch.setattr(memory_utils, "_read_cgroup_memory", lambda: (None, None))

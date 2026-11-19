@@ -26,7 +26,9 @@ def _worker_method(namespace):
         node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_offload_actor_optimizer"
     )
     method.decorator_list = []
-    exec(compile(ast.Module(body=[offload_actor, method], type_ignores=[]), str(WORKER), "exec"), namespace)
+    offload_model = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                         and node.name == "_offload_actor_model_for_rollout")
+    exec(compile(ast.Module(body=[offload_actor, offload_model, method], type_ignores=[]), str(WORKER), "exec"), namespace)
     return namespace["load_checkpoint"], namespace["_offload_actor_optimizer"]
 
 
@@ -93,7 +95,7 @@ def _staged_worker(
         residency["model"] = True
         events.append("model_onload")
 
-    def model_offload(model):
+    def model_offload(model, **kwargs):
         residency["model"] = False
         events.append("model_offload")
 
@@ -145,6 +147,8 @@ def _staged_worker(
         _is_offload_param=True,
         _is_offload_optimizer=True,
         actor_module=object(),
+        config=SimpleNamespace(actor=SimpleNamespace(eu_derpo=SimpleNamespace(
+            enabled=True, version="1.8.3", cache_backend="ram_nfs_hybrid"))),
         actor_optimizer=SimpleNamespace(state={} if empty_hdo else {"existing": {}}),
         checkpoint_mananager=CheckpointManager(events, residency, fail_stage),
         _hdo_optimizer_residency_preserved=True,
@@ -165,6 +169,7 @@ def _staged_worker(
     worker._offload_actor_optimizer_copy_params_for_rollout = selective_offload
     load_checkpoint, offload_actor = _worker_method(namespace)
     worker._offload_actor_optimizer = MethodType(offload_actor, worker)
+    worker._offload_actor_model_for_rollout = MethodType(namespace["_offload_actor_model_for_rollout"], worker)
     worker.load_checkpoint = MethodType(load_checkpoint, worker)
     tree = ast.parse(WORKER.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
@@ -466,6 +471,65 @@ class TestMegatronGPUAdamStagedResume(unittest.TestCase):
         self.assertEqual(events[-1], "optimizer_onload")
         self.assertEqual(events.count("full_state_restore"), 1)
         self.assertEqual(events.count("after_full_restore_cleanup"), 1)
+
+    def test_two_cold_restores_reuse_backing_without_touching_optimizer_or_extra(self):
+        # Exercise the real load_checkpoint and model-offload functions; only DCP/CUDA are fixtures.
+        spec = importlib.util.spec_from_file_location(
+            "model_backing_fixture", WORKER.parents[2] / "tests/utils/test_megatron_model_cpu_backing_on_cpu.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        api = module.helpers([])
+        allocated = []
+        def allocate(source, **kwargs):
+            value = torch.empty_like(source.values)
+            allocated.append(value.data_ptr())
+            return value
+        api["torch"].empty_like = allocate
+        data = module.DeviceTensor(torch.zeros(4))
+        model = module.DDP(data, module.DeviceTensor(torch.zeros(4)))
+        events = []
+        worker, residency = _staged_worker(events, gpu_adam=False, hdo=True)
+        worker.actor_module = [model]
+        namespace = worker.load_checkpoint.__func__.__globals__
+        def onload(models):
+            self.assertFalse(residency["optimizer"])
+            api["load_megatron_model_to_gpu"](models)
+            residency["model"] = True
+        def offload(models, **kwargs):
+            self.assertEqual(kwargs, {"reuse_pinned_backing": True})
+            api["offload_megatron_model_to_cpu"](models, **kwargs)
+            residency["model"] = False
+        namespace["load_megatron_model_to_gpu"] = onload
+        namespace["offload_megatron_model_to_cpu"] = offload
+        worker._offload_actor_model_for_rollout(worker.actor_module)
+        backing_pointer = data.cpu_data.data_ptr()
+        data.cpu = lambda: self.fail("cold restore created a pageable full-model intermediate")
+        authority = {"master_param": torch.ones(4), "exp_avg": torch.full((4,), 2.),
+                     "exp_avg_sq": torch.full((4,), 3.), "step": torch.tensor(100)}
+        extra = {"scheduler": 100, "rng": torch.arange(4), "mctr": 0.013,
+                 "raw_data_epoch": 3, "dataloader_cursor": 777}
+        pointers = {key: value.data_ptr() for key, value in authority.items()}
+        worker.actor_optimizer.state = authority
+        for resume_step in (100, 102):
+            expected = torch.full((4,), float(resume_step))
+            def restore(**kwargs):
+                self.assertEqual(kwargs["load_contents"], ("model", "optimizer", "extra"))
+                self.assertTrue(kwargs["cold_restore"])
+                self.assertFalse(kwargs["del_local_after_load"])
+                data.values.copy_(expected)
+                kwargs["stage_callback"]("after_model_restore")
+                authority["step"].fill_(resume_step)
+                worker.restored_extra = extra
+            worker.checkpoint_mananager.load_checkpoint = restore
+            worker.load_checkpoint("source/actor", staged_restore=True, del_local_after_load=False)
+            self.assertEqual(len(allocated), 1)
+            self.assertEqual(data.cpu_data.data_ptr(), backing_pointer)
+            torch.testing.assert_close(data.cpu_data, expected, rtol=0, atol=0)
+            self.assertIs(worker.actor_optimizer.state, authority)
+            self.assertIs(worker.restored_extra, extra)
+            self.assertEqual({key: value.data_ptr() for key, value in authority.items()}, pointers)
+            self.assertEqual(authority["step"].item(), resume_step)
+            self.assertEqual(residency, {"model": False, "optimizer": False})
 
     def test_explicit_resume_rejects_unsupported_optimizer_before_loading(self):
         events = []

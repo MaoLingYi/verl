@@ -624,8 +624,16 @@ class MegatronPPOActor(BasePPOActor):
         """
         # broadcast from last pp rank to all other pp ranks
         # TODO: actually, we just need to control the sampling order.
-        if self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"} and mpu.get_pipeline_model_parallel_world_size() == 1:
-            # PP1 already owns every layer; stage each DPPO microbatch without a whole-batch CUDA copy.
+        cpu_microbatch_staging = mpu.get_pipeline_model_parallel_world_size() == 1 and (
+            self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"}
+            or (self.config.eu_derpo.enabled and self.config.eu_derpo.version == "1.8.3"
+                and self.config.policy_loss.loss_mode == "vanilla" and not forward_only
+                and not use_dynamic_bsz and micro_batch_size == 1
+                and all(isinstance(value, torch.Tensor) and value.device.type == "cpu"
+                        for value in data.batch.values()))
+        )
+        if cpu_microbatch_staging:
+            # PP1 already owns every layer; preserve CPU rows until each microbatch H2D.
             mini_batch = data
             if not use_dynamic_bsz and (
                 "multi_modal_inputs" in data.non_tensor_batch or data.batch["position_ids"].dim() == 3
@@ -651,9 +659,7 @@ class MegatronPPOActor(BasePPOActor):
             )
             mini_batch.to("cpu")
         # Fixed PP1 batches can be locked; forward_step converts each attention mask locally.
-        if use_dynamic_bsz or not (
-            self.config.policy_loss.loss_mode in {"dppo_tv", "dppo_kl"} and mpu.get_pipeline_model_parallel_world_size() == 1
-        ):
+        if use_dynamic_bsz or not cpu_microbatch_staging:
             mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:

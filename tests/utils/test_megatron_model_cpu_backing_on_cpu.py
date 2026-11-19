@@ -191,7 +191,8 @@ def test_only_hybrid_uses_reusable_backing_at_rollout_phase_boundaries(enabled, 
     worker = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
     methods = {node.name: node for node in worker.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     name = "_offload_actor_model_for_rollout"
-    for stage in ("rollout_mode", "_finish_actor_update_residency", "_release_checkpoint_residency_hold"):
+    for stage in ("init_model", "load_checkpoint", "rollout_mode",
+                  "_finish_actor_update_residency", "_release_checkpoint_residency_hold"):
         assert any(isinstance(node, ast.Call) and getattr(node.func, "attr", None) == name
                    for node in ast.walk(methods[stage]))
     calls = []
@@ -300,3 +301,138 @@ def test_real_cuda_backing_release_and_rebuild(reuse_backing):
         torch.testing.assert_close(data, expected, rtol=0, atol=0)
         data.add_(1)
         expected.add_(1)
+
+
+@pytest.mark.parametrize("existing_backing", [False, True])
+def test_cold_phase_offload_allocation_ledger_and_bitwise_equal(existing_backing):
+    """Real production offload; CPU storage spy substitutes only CUDA/pinned allocation."""
+    ledgers = []
+    results = []
+    for reuse in (False, True):
+        ledger = []
+        api = helpers([])
+        values = torch.arange(512, dtype=torch.float32).to(torch.bfloat16)
+        payload_bytes = values.numel() * values.element_size()
+
+        class CopySource(DeviceTensor):
+            def cpu(self):
+                pageable = self.values.clone()
+                ledger.append(("pageable", pageable.numel() * pageable.element_size()))
+                def pin():
+                    pinned = pageable.clone()
+                    ledger.append(("pinned_fixture", pinned.numel() * pinned.element_size()))
+                    return pinned
+                return SimpleNamespace(pin_memory=pin)
+
+        data = CopySource(values)
+        original = torch.zeros_like(values) if existing_backing else None
+        if original is not None:
+            data.cpu_data = original
+        api["torch"].empty_like = lambda source, **kwargs: (
+            ledger.append(("direct_pinned_fixture", payload_bytes)) or torch.empty_like(source.values))
+        model = DDP(data, DeviceTensor(torch.zeros_like(values)))
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=reuse)
+        assert data.capacity == 0
+        assert data.cpu_data.dtype == torch.bfloat16
+        if reuse and original is not None:
+            assert data.cpu_data is original
+        results.append(data.cpu_data.view(torch.int16).clone())
+        ledgers.append(ledger)
+    torch.testing.assert_close(*results, rtol=0, atol=0)
+    assert ledgers[0] == [("pageable", payload_bytes), ("pinned_fixture", payload_bytes)]
+    assert ledgers[1] == ([] if existing_backing else [("direct_pinned_fixture", payload_bytes)])
+
+
+@pytest.mark.parametrize("existing_backing", [False, True])
+def test_failed_direct_copy_retains_device_authority_before_offload(existing_backing):
+    api = helpers([])
+    data = DeviceTensor(torch.arange(8, dtype=torch.float32))
+    model = DDP(data, DeviceTensor(torch.zeros(8)))
+    original = data.values.clone()
+    class Destination:
+        def copy_(self, source, **kwargs):
+            assert kwargs == {"non_blocking": False}
+            raise RuntimeError("D2H failed")
+    destination = Destination()
+    if existing_backing:
+        data.cpu_data = destination
+    api["torch"].empty_like = lambda *args, **kwargs: destination
+    with pytest.raises(RuntimeError, match="D2H failed"):
+        api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=True)
+    assert data.capacity == 8 and model.buffers[0].grad_data.capacity == 8
+    torch.testing.assert_close(data.values, original, rtol=0, atol=0)
+    assert hasattr(data, "cpu_data") == existing_backing
+    if existing_backing:
+        assert data.cpu_data is destination
+
+
+def test_all_init_and_checkpoint_actor_recold_paths_use_scoped_helper():
+    tree = ast.parse((ROOT / "verl/workers/megatron_workers.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker")
+    methods = {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
+    for name, expected_calls in (("init_model", 1), ("load_checkpoint", 6)):
+        calls = [node for node in ast.walk(methods[name]) if isinstance(node, ast.Call)]
+        assert sum(getattr(node.func, "attr", None) == "_offload_actor_model_for_rollout" for node in calls) == expected_calls
+        assert not any(isinstance(node.func, ast.Name) and node.func.id == "offload_megatron_model_to_cpu"
+                       and any(isinstance(arg, ast.Attribute) and arg.attr == "actor_module" for arg in node.args)
+                       for node in calls)
+
+
+def benchmark_cpu_backing_fixture(reuse, size_mib):
+    """CPU ownership/copy measurement; does not measure CUDA or pinned allocators."""
+    import json
+    import platform
+    import time
+    import psutil
+    torch.set_num_threads(1)
+    process = psutil.Process()
+    samples = []
+    allocations = []
+    def sample():
+        memory = process.memory_full_info()
+        samples.append({"rss": memory.rss, "pss": getattr(memory, "pss", None),
+                        "process_peak_rss": getattr(memory, "peak_wset", None)})
+    api = helpers([])
+    count = size_mib * 1024**2 // 2
+    class Source(DeviceTensor):
+        def cpu(self):
+            pageable = self.values.clone()
+            allocations.append({"kind": "pageable", "bytes": pageable.numel() * 2})
+            sample()
+            def pin():
+                result = pageable.clone()
+                allocations.append({"kind": "pinned_CPU_fixture", "bytes": result.numel() * 2})
+                sample()
+                return result
+            return SimpleNamespace(pin_memory=pin)
+    data = Source(torch.full((count,), 3., dtype=torch.bfloat16))
+    data.cpu_data = torch.zeros_like(data.values)
+    model = DDP(data, DeviceTensor(torch.zeros(1)))
+    original_pointer = data.cpu_data.data_ptr()
+    sample()
+    started = time.perf_counter()
+    api["offload_megatron_model_to_cpu"]([model], reuse_pinned_backing=reuse)
+    elapsed = time.perf_counter() - started
+    sample()
+    assert bool(torch.all(data.cpu_data == 3.))
+    result = {"backend": "CPU_fixture_not_CUDA_pinned", "platform": platform.system(),
+              "reuse": reuse, "payload_bytes": count * 2, "allocations": allocations,
+              "new_storage_bytes": sum(item["bytes"] for item in allocations),
+              "copy_calls": 1 if reuse else 2, "copy_bytes": count * 2 * (1 if reuse else 2),
+              "existing_backing_reused": data.cpu_data.data_ptr() == original_pointer,
+              "rss_before": samples[0]["rss"], "rss_after": samples[-1]["rss"],
+              "observed_rss_peak": max(item["rss"] for item in samples),
+              "pss_before": samples[0]["pss"], "pss_after": samples[-1]["pss"],
+              "process_peak_rss": samples[-1]["process_peak_rss"], "elapsed_seconds": elapsed}
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Real production offload with explicit CPU-only CUDA/pin fixtures")
+    parser.add_argument("--reuse", action="store_true")
+    parser.add_argument("--size-mib", type=int, default=64)
+    args = parser.parse_args()
+    if not 1 <= args.size_mib <= 256:
+        parser.error("this developer CPU fixture uses 1..256 MiB")
+    benchmark_cpu_backing_fixture(args.reuse, args.size_mib)

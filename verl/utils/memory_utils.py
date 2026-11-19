@@ -70,6 +70,18 @@ def best_effort_release_host_allocator():
     return {"gc_collected": collected, "malloc_trim_attempted": int(attempted), "malloc_trim_rc": rc}
 
 
+def _pinned_host_memory_stats():
+    pinned = {}
+    if torch.cuda.is_initialized():
+        host_memory_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
+        if host_memory_stats is not None:
+            try:
+                pinned = host_memory_stats()
+            except (AttributeError, RuntimeError) as exc:
+                logger.warning("CUDA host allocator counters unavailable: %r", exc)
+    return pinned
+
+
 def _host_reclaim_snapshot(ray_limit):
     status = _read_proc_kib("/proc/self/status")
     rollup = _read_proc_kib("/proc/self/smaps_rollup")
@@ -81,15 +93,7 @@ def _host_reclaim_snapshot(ray_limit):
 
         rss = psutil.Process().memory_info().rss
         available = psutil.virtual_memory().available
-
-    pinned = {}
-    if torch.cuda.is_initialized():
-        host_memory_stats = getattr(torch.cuda.memory, "host_memory_stats", None)
-        if host_memory_stats is not None:
-            try:
-                pinned = host_memory_stats()
-            except (AttributeError, RuntimeError) as exc:
-                logger.warning("CUDA host allocator counters unavailable: %r", exc)
+    pinned = _pinned_host_memory_stats()
 
     ray_used = ray_total = None
     ray = sys.modules.get("ray")
@@ -296,6 +300,7 @@ def log_eu_derpo_memory(
     rollup = _read_proc_kib("/proc/self/smaps_rollup")
     meminfo = _read_proc_kib("/proc/meminfo")
     cgroup_current, cgroup_max = _read_cgroup_memory()
+    pinned = _pinned_host_memory_stats()
     device = get_torch_device()
     gpu = device.is_available()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -303,6 +308,8 @@ def log_eu_derpo_memory(
     values = {
         "stage": stage,
         "rank": rank,
+        "pid": os.getpid(),
+        "rss_process_peak_gib": status["VmHWM"] / _GIB if "VmHWM" in status else None,
         "rss_gib": status.get("VmRSS", rollup.get("Rss", 0)) / _GIB,
         "pss_gib": rollup.get("Pss", status.get("VmRSS", 0)) / _GIB,
         "rss_anon_gib": status.get("RssAnon", 0) / _GIB,
@@ -320,6 +327,11 @@ def log_eu_derpo_memory(
         "cuda_total_gib": cuda_total / _GIB,
         "phase_model_cpu_backing_gib": phase_model_cpu_backing_bytes / _GIB,
     }
+    # Peaks are allocator lifetime counters, not peaks of only this phase.
+    for name in ("allocated", "reserved"):
+        for period in ("current", "peak"):
+            value = pinned.get(f"{name}_bytes.{period}")
+            values[f"pinned_{name}_{period}_gib"] = None if value is None else value / _GIB
     values.update(
         {key.replace("_bytes", "_gib"): value / _GIB if key.endswith("_bytes") else value
          for key, value in estimate_hdo_memory(optimizer).items()}

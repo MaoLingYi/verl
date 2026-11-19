@@ -740,7 +740,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.config.actor.eu_derpo.enabled:
                 log_eu_derpo_memory("after_optimizer_construction", self.actor_optimizer)
             if self._is_offload_param:
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
                 log_gpu_memory_usage("After offload actor params and grad during init", logger=logger)
             if self._is_offload_optimizer:
                 self._offload_actor_optimizer()
@@ -1681,7 +1681,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # No checkpoint to load, just offload the model and optimizer to CPU
         if checkpoint_path is None:
             if self._is_offload_param:
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
             if self._is_offload_optimizer:
                 self._offload_actor_optimizer()
             log_gpu_memory_usage("After offload actor params and optimizer during load_checkpoint", logger=logger)
@@ -1714,13 +1714,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             def restore_stage(stage):
                 log_eu_derpo_memory(stage, self.actor_optimizer, megatron_model_cpu_data_bytes(self.actor_module))
                 if stage == "after_model_restore":
-                    offload_megatron_model_to_cpu(self.actor_module)
+                    self._offload_actor_model_for_rollout(self.actor_module)
 
             primary_error = None
             rollout_residency_restored = False
             try:
                 # Keep optimizer tensors cold until all checkpoint payloads have been consumed.
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
                 self._offload_actor_optimizer()
                 metadata = self.checkpoint_mananager._build_sharded_state_dict_metadata()
                 if _mcore_016_hdo_resume_needs_bootstrap(self.actor_optimizer, metadata, True):
@@ -1757,7 +1757,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             finally:
                 cleanup_error = None
                 for cleanup in (
-                    lambda: offload_megatron_model_to_cpu(self.actor_module),
+                    lambda: self._offload_actor_model_for_rollout(self.actor_module),
                     lambda: None if rollout_residency_restored else self._offload_actor_optimizer(),
                     lambda: aggressive_empty_cache(force_sync=True),
                     _best_effort_release_host_allocator_after_copy_param_restore,
@@ -1788,7 +1788,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 )
                 model_loaded_memory = _log_resume_memory("after_model_load")
             finally:
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
                 aggressive_empty_cache(force_sync=True)
                 model_offloaded_memory = _log_resume_memory("after_model_offload")
                 if (
@@ -1852,7 +1852,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         finally:
             if self._is_offload_param:
-                offload_megatron_model_to_cpu(self.actor_module)
+                self._offload_actor_model_for_rollout(self.actor_module)
             if self._is_offload_optimizer:
                 self._offload_actor_optimizer()
 
