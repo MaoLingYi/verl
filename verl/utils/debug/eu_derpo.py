@@ -808,9 +808,13 @@ class EUDERPOObserver:
             rows = plan["rows"]
             io_batch_bytes = WRITE_BYTES if self.cache_io_batch_mib == 4 else self.cache_io_batch_mib * 1024**2
             write_bytes = min(rows, io_batch_bytes // (2 * self.hidden_size)) * self.hidden_size * 2
+            legacy_write_bytes = min(rows, WRITE_BYTES // (2 * self.hidden_size)) * self.hidden_size * 2
+            # Freed pageable capture pages may overlap the later pinned replay allocation.
+            extra_capture_reserve = max(0, write_bytes - legacy_write_bytes)
             stage_rows = max(1, min(rows, _staging_chunk_rows(self.staging_mib, self.hidden_size, self.topk)))
             replay_bytes = stage_rows * (2 * self.hidden_size + 5 * self.topk)
-            resident = byte_plan["support"] + byte_plan["metadata"] + max(write_bytes, replay_bytes)
+            resident = (byte_plan["support"] + byte_plan["metadata"]
+                        + max(legacy_write_bytes, replay_bytes) + extra_capture_reserve)
         ram = self._coordinated_ram_preflight(resident)
         if file_mode:
             shared = torch.tensor(byte_plan["hidden"], dtype=torch.int64, device=device)
@@ -870,6 +874,7 @@ class EUDERPOObserver:
         }
         if file_mode:
             self._cache_metrics.update(hidden_write_buffer_bytes=write_bytes,
+                                       hidden_io_extra_reserve_bytes=extra_capture_reserve,
                                        step_e_staging_budget_bytes=replay_bytes,
                                        shared_hidden_file_bytes=shared.item())
         self._native_finalize_count = 0

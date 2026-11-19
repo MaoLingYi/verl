@@ -259,11 +259,22 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
             v183 = load_math("eu_derpo_v183")
             groups = torch.tensor([4, 4])
             optimizer = configure_hybrid_fixture(obs, monkeypatch, 152) if backend == "ram_nfs_hybrid" else None
-            obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0, optimizer)
+            with mock.patch.object(obs, "_coordinated_ram_preflight", wraps=obs._coordinated_ram_preflight) as preflight, \
+                    mock.patch.object(obs, "_hybrid_budget", wraps=obs._hybrid_budget) as admission:
+                obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0, optimizer)
             if backend != "cpu_pageable":
                 assert obs._hidden_cache is None
                 assert obs._cache_metrics["hidden_write_buffer_bytes"] == obs._file_store.write_stage_bytes
-                assert obs._cache_metrics["eu_cache_required_bytes"] >= obs._file_store.write_stage_bytes
+                write = obs._file_store.write_stage_bytes
+                legacy = min(write, store.WRITE_BYTES)
+                extra = write - legacy
+                assert obs._cache_metrics["hidden_io_extra_reserve_bytes"] == extra
+                expected = (obs._cache_plan["support"] + obs._cache_plan["metadata"]
+                            + max(legacy, obs._cache_metrics["step_e_staging_budget_bytes"]) + extra)
+                assert obs._cache_metrics["eu_cache_required_bytes"] == expected
+                assert preflight.call_args.args[0] == expected
+                if backend == "ram_nfs_hybrid":
+                    assert admission.call_args.args[1] == expected
             gamma, objectives, masks, population = [], [], [], []
             for i, sample in enumerate(case.sample_ids):
                 inputs, attn = case.input_ids[i:i+1], case.attention_mask[i:i+1]
