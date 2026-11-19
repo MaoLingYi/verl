@@ -225,7 +225,17 @@ def configure_hybrid_fixture(obs, monkeypatch, quota):
         mod = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, full, mod)
         spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "HiddenMemoryHeadroom", lambda limit: lambda: 1024**4)
+    class AvailableHeadroom:
+        def __init__(self, limit, *, soft_fraction=None):
+            self.last_snapshot = dict(valid=True, hard_headroom_bytes=1024**4, soft_headroom_bytes=1024**4)
+            self.minima = {}
+            self.sample_count = self.unavailable_samples = 0
+
+        def __call__(self):
+            self.sample_count += 1
+            return 1024**4
+
+    monkeypatch.setattr(mod, "HiddenMemoryHeadroom", AvailableHeadroom)
     obs.cache_ram_node_bytes = quota
     cpu_master = torch.zeros(16)
     return SimpleNamespace(optimizer=SimpleNamespace(param_to_inner_param={0: cpu_master},
@@ -233,7 +243,8 @@ def configure_hybrid_fixture(obs, monkeypatch, quota):
 
 
 @pytest.mark.parametrize("io_mib", [4, 16, 64])
-def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
+@pytest.mark.parametrize("ram_mode", ["mixed", "all_ram", "pressure"])
+def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib, ram_mode):
     """Run real F/R hooks and Step E on both stores with the same differentiable toy model."""
     import test_eu_derpo_observer_on_cpu as harness
 
@@ -258,7 +269,8 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
             load_math("eu_derpo_v182")
             v183 = load_math("eu_derpo_v183")
             groups = torch.tensor([4, 4])
-            optimizer = configure_hybrid_fixture(obs, monkeypatch, 152) if backend == "ram_nfs_hybrid" else None
+            hybrid_quota = 152 if ram_mode == "mixed" else 48 * 3 * 4 * 2
+            optimizer = configure_hybrid_fixture(obs, monkeypatch, hybrid_quota) if backend == "ram_nfs_hybrid" else None
             with mock.patch.object(obs, "_coordinated_ram_preflight", wraps=obs._coordinated_ram_preflight) as preflight, \
                     mock.patch.object(obs, "_hybrid_budget", wraps=obs._hybrid_budget) as admission:
                 obs.start_main_batch(case.sample_ids, groups, case.attention_mask, case.response_mask, 2, 0, optimizer)
@@ -301,6 +313,16 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
                 r.weight.main_grad = r.weight.grad.clone()
             obs.wrap_native_finalize(lambda: None)()
             teacher, squares, counts, capture = obs.finish_main_batch()
+            pressure_spill = 0
+            if backend == "ram_nfs_hybrid" and ram_mode == "pressure":
+                # Full production F/R already captured; replace only the OS pressure observation.
+                original_pressure = obs._file_store._pressure
+                obs._file_store._pressure = lambda: -1
+                obs._file_store.pressure_evict_bytes = 16
+                obs._file_store.poll_pressure()
+                pressure_spill = obs._file_store.pressure_evicted_bytes
+                assert pressure_spill == 16 and obs._file_store.pressure_evicted_blocks == 2
+                obs._file_store._pressure = original_pressure
             assert len(list(obs.consume_post_backward_rows(case.sample_ids))) == 2
             normalized, _ = eu.normalize_group_utility(teacher, counts, groups, 1e-6, 2, 5e-7)
             stats = SimpleNamespace(count=counts, mask=torch.cat(masks))
@@ -311,11 +333,13 @@ def test_frozen_observer_file_vs_pageable(tmp_path, monkeypatch, io_mib):
             assert metrics["step_e_max_chunk_rows"] == 2
             measured = obs.hidden_store_metrics(capture, metrics, .25)
             logical = 48 * 3 * 4 * 2
-            ram = {"cpu_pageable": logical, "nfs_direct": 0, "ram_nfs_hybrid": 152}[backend]
+            ram = {"cpu_pageable": logical, "nfs_direct": 0, "ram_nfs_hybrid": hybrid_quota}[backend]
             assert measured["hidden_node_logical_hidden_bytes"] == logical
             assert measured["hidden_node_ram_hidden_bytes_at_seal"] == ram
             assert measured["hidden_node_ram_hidden_bytes_after_step_e"] == 0
-            assert measured["hidden_node_spill_written_bytes"] == measured["hidden_node_spill_read_bytes"] == logical - ram
+            assert measured["hidden_node_spill_written_bytes"] == measured["hidden_node_spill_read_bytes"] == logical - ram + pressure_spill
+            if backend == "ram_nfs_hybrid" and ram_mode == "all_ram":
+                assert obs._file_store.transfer_stats["read"]["calls"] == obs._file_store.transfer_stats["write"]["calls"] == 0
             assert measured["hidden_rank_max_statistics_seconds"] == .25
             if backend == "ram_nfs_hybrid":
                 assert capture["node_hidden_ram_approved_bytes"] == ram

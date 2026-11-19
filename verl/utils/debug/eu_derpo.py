@@ -286,7 +286,7 @@ class EUDERPOObserver:
 
     def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64,
                  cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None, cache_ram_node_bytes=0,
-                 cache_io_batch_mib=4):
+                 cache_io_batch_mib=4, cache_ram_soft_fraction=None, cache_pressure_evict_mib=64):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -339,6 +339,8 @@ class EUDERPOObserver:
         self.cache_backend = cache_backend
         self.cache_ram_node_bytes = cache_ram_node_bytes
         self.cache_io_batch_mib = cache_io_batch_mib
+        self.cache_ram_soft_fraction = cache_ram_soft_fraction
+        self.cache_pressure_evict_mib = cache_pressure_evict_mib
         self.cache_root = cache_root
         self.cache_attempt_id = cache_attempt_id
         self._file_store = None
@@ -661,9 +663,11 @@ class EUDERPOObserver:
 
     def _hybrid_budget(self, planned_bytes, resident, responses, tokens, optimizer):
         from verl.utils.debug.eu_hidden_budget import HiddenMemoryHeadroom, hdo_growth_reserve, hidden_ram_quotas
-        from verl.utils.memory_utils import estimate_hdo_memory, estimate_optimizer_phase_offload_memory
+        from verl.utils.memory_utils import (
+            best_effort_release_host_allocator, estimate_hdo_memory, estimate_optimizer_phase_offload_memory,
+        )
 
-        measure = HiddenMemoryHeadroom(_raylet_linux_memory_limit())
+        measure = HiddenMemoryHeadroom(_raylet_linux_memory_limit(), soft_fraction=self.cache_ram_soft_fraction)
         headroom = measure()
         try:
             inventory = estimate_hdo_memory(optimizer)
@@ -703,14 +707,21 @@ class EUDERPOObserver:
         sampled_at = time.monotonic()
         slack = headroom - low
 
-        def pressure():
+        def pressure(force=False):
             # Sample OS accounting independently. Router hooks must never join a collective.
             nonlocal sampled_at, slack
             now = time.monotonic()
-            if now - sampled_at >= .25:
+            if force or now - sampled_at >= .25:
                 slack = measure() - low
                 sampled_at = now
             return slack
+
+        pressure.refresh = lambda: pressure(force=True)
+        pressure.snapshot = lambda: measure.last_snapshot
+        pressure.telemetry = lambda: dict(last=measure.last_snapshot, minima=measure.minima,
+                                          samples=measure.sample_count, unavailable_samples=measure.unavailable_samples)
+        pressure.owner_share = (quotas[rank], sum(quotas))
+        pressure.reclaim = best_effort_release_host_allocator
 
         if hdo_growth is None or not headroom:
             print(f"EU-DERPO HiddenStore rank={rank} effective_headroom={headroom} "
@@ -720,6 +731,11 @@ class EUDERPOObserver:
                   f"owner_quotas={quotas} min_headroom={min(headrooms)} nonpayload={sum(overhead)} "
                   f"future_hdo={sum(growth)} optimizer_phase={sum(phase)} safety={HOST_RAM_SAFETY_MARGIN_BYTES}",
                   flush=True)
+        print("EU-DERPO HiddenStore admission " + json.dumps(dict(
+            rank=rank, planned_bytes=planned_bytes, quota_bytes=quotas[rank],
+            node_cap_bytes=self.cache_ram_node_bytes, node_approved_bytes=sum(quotas),
+            soft_fraction=self.cache_ram_soft_fraction, accounting=pressure.telemetry(),
+        )), flush=True)
         return quotas[rank], pressure, {
             "node_hidden_ram_configured_bytes": self.cache_ram_node_bytes,
             "node_hidden_ram_approved_bytes": sum(quotas),
@@ -728,6 +744,7 @@ class EUDERPOObserver:
             "node_hidden_nonpayload_reserve_bytes": sum(overhead),
             "node_hidden_future_hdo_reserve_bytes": sum(growth),
             "node_optimizer_phase_reserve_bytes": sum(phase),
+            "owner_hidden_initial_accounting_valid": int(measure.last_snapshot["valid"]),
         }
 
     def _check_store_error(self, stage, error):
@@ -830,11 +847,20 @@ class EUDERPOObserver:
                 quota, pressure, budget_metrics = self._hybrid_budget(
                     byte_plan["hidden"], resident, len(ids), response_length, optimizer
                 )
+                lengths = response_mask.sum(-1, dtype=torch.int64).cpu()
+                print("EU-DERPO HiddenStore owner response lengths " + json.dumps({
+                    "rank": rank, "generation": optimizer_generation,
+                    "responses": len(ids), "valid_response_tokens": lengths.sum().item(),
+                    "min": lengths.min().item(), "max": lengths.max().item(),
+                    "p50_p95": torch.quantile(lengths.double(), torch.tensor([.5, .95], dtype=torch.float64)).tolist(),
+                    "scope": "local dense-DP rows, replicated across TP; do not sum owners",
+                }), flush=True)
             error = None
             try:
                 if hybrid:
                     self._file_store = HybridHiddenStore(*args, ram_limit_bytes=quota, pressure=pressure,
-                                                        io_batch_bytes=io_batch_bytes)
+                                                        io_batch_bytes=io_batch_bytes,
+                                                        pressure_evict_bytes=self.cache_pressure_evict_mib * 1024**2)
                 else:
                     self._file_store = DirectHiddenStore(*args, io_batch_bytes=io_batch_bytes)
             except Exception as exc:
@@ -1581,10 +1607,22 @@ class EUDERPOObserver:
             "spill_read_bytes": store.spill_read_bytes if store is not None else 0,
         }
         if store is not None:
+            pressure = getattr(store, "_pressure", None)
+            pressure_metrics = {
+                key: getattr(store, key, 0) for key in (
+                    "pressure_evicted_bytes", "pressure_released_bytes", "pressure_evicted_blocks", "pressure_batches",
+                )
+            }
+            pressure_metrics.update({"pressure_reason_" + name: count for name, count in
+                                     getattr(store, "pressure_reason_counts", {}).items()})
+            local.update(pressure_metrics)
             print("EU-DERPO HiddenStore I/O " + json.dumps({
                 "rank": store.header["rank"], "generation": store.header["generation"],
                 "io_batch_bytes": store.io_batch_bytes, "write_stage_bytes": store.write_stage_bytes,
                 "concurrency": 1, "syscalls": store.transfer_stats,
+                "payload": local, "pressure": pressure_metrics,
+                "accounting": getattr(pressure, "telemetry", lambda: None)(),
+                "last_pressure_reclaim": getattr(store, "pressure_last_reclaim", None),
             }), flush=True)
             for direction, counters in store.transfer_stats.items():
                 local[f"nas_{direction}_calls"] = counters["calls"]
@@ -1596,6 +1634,8 @@ class EUDERPOObserver:
             "step_e_compute_seconds": replay["step_e_compute_seconds"],
             "step_e_total_seconds": replay["router_only_step_e_seconds"],
             "statistics_seconds": statistics_seconds,
+            "pressure_evict_seconds": getattr(store, "pressure_evict_seconds", 0.),
+            "pressure_reclaim_seconds": getattr(store, "pressure_reclaim_seconds", 0.),
         }
         device = self.routers[0].weight.device
         totals = torch.tensor([*local.values(), *times.values()], dtype=torch.float64, device=device)

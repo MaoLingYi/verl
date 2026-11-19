@@ -142,7 +142,8 @@ def test_reversed_pressure_evictions_keep_offsets_and_one_block_limit(tmp_path, 
     slack = [2 << 30]
     with local_transport():
         s = store.HybridHiddenStore(tmp_path / "hidden", "reverse", 0, 0, 8, 4, 1, 64,
-                                   ram_limit_bytes=64, pressure=lambda: slack[0], io_batch_bytes=16 * MIB)
+                                   ram_limit_bytes=64, pressure=lambda: slack[0], io_batch_bytes=16 * MIB,
+                                   pressure_evict_bytes=16)
         try:
             s.write_rows(0, 0, 8, source, torch.ones(8, dtype=torch.bool))
             assert len(s._resident) == 4

@@ -58,7 +58,7 @@ def test_hysteresis_and_bounded_eviction(tmp_path, monkeypatch):
     source = torch.arange(32).reshape(8, 4).to(torch.bfloat16)
     with local_transport():
         s = store.HybridHiddenStore(tmp_path/"cache", "evict", 0, 0, 8, 4, 1, 64,
-                                    ram_limit_bytes=64, pressure=lambda: slack[0])
+                                    ram_limit_bytes=64, pressure=lambda: slack[0], pressure_evict_bytes=16)
         try:
             s.write_rows(0, 0, 2, source[:2], mask)
             s.write_rows(0, 2, 4, source[2:4], mask)

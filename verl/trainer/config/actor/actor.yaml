@@ -297,6 +297,8 @@ eu_derpo:
   cache_backend: cpu_pageable
   cache_ram_node_bytes: 0
   cache_io_batch_mib: 4
+  cache_ram_soft_fraction: null
+  cache_pressure_evict_mib: 64
   cache_root: null
   cache_attempt_id: null
   staging_mib: 64

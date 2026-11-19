@@ -335,6 +335,8 @@ class MegatronPPOActor(BasePPOActor):
                 cache_attempt_id=self.config.eu_derpo.cache_attempt_id,
                 cache_ram_node_bytes=self.config.eu_derpo.cache_ram_node_bytes,
                 cache_io_batch_mib=self.config.eu_derpo.cache_io_batch_mib,
+                cache_ram_soft_fraction=self.config.eu_derpo.cache_ram_soft_fraction,
+                cache_pressure_evict_mib=self.config.eu_derpo.cache_pressure_evict_mib,
             )
             if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
@@ -1556,8 +1558,15 @@ class MegatronPPOActor(BasePPOActor):
                         del active, cluster_utility, outward, positive, negative, valid_uhat, ratio_diagnostic
                     self.eu_derpo_observer.reclaim_step_e_payloads()
                 log_eu_derpo_memory("before_optimizer_step", self.actor_optimizer)
+            optimizer_call_started = time.perf_counter()
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
             if self.eu_derpo_observer is not None:
+                optimizer_call_seconds = time.perf_counter() - optimizer_call_started
+                metrics["actor/eu_derpo/timing_optimizer_call_s"] = [optimizer_call_seconds]
+                if global_token_mean and self.eu_derpo_observer.cache_backend == "ram_nfs_hybrid":
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    print(f"EU-DERPO optimizer call rank={rank} generation={self._eu_derpo_optimizer_generation} "
+                          f"seconds={optimizer_call_seconds} scope=host_call_wall", flush=True)
                 log_eu_derpo_memory("after_optimizer_step", self.actor_optimizer)
                 eu_optimizer_steps += 1
                 self._eu_derpo_optimizer_generation += 1

@@ -175,3 +175,129 @@ def test_raylet_nonisolated_cgroup_limit_uses_real_actor_and_raylet_sibling_char
     assert sample() == 0  # reported Ray total can no longer be tied to an observed scope
     log.write_text(startup + ", resource isolation enabled, monitoring only user slice memory usage")
     assert budget.HiddenMemoryHeadroom(None, proc)() == 0
+
+
+@pytest.mark.parametrize("cap_gib", [64, 96, 128, 192, 256])
+@pytest.mark.parametrize("soft_margin_gib", [0, 51.2])
+def test_step101_budget_uses_one_node_pool_and_all_actual_owner_rows(cap_gib, soft_margin_gib):
+    """Historical rounded budget inputs; 51.2 GiB models 90% vs 95% on a hypothetical 1 TiB host."""
+    from decimal import Decimal
+
+    gib, row_bytes = 2**30, 4096
+    payload = 203601936384
+    # Deliberately unequal SP ownership, including one rank with no local rows.
+    weights = [0, 1, 1, 2, 2, 3, 3, 8]
+    rows = [payload // row_bytes * weight // sum(weights) for weight in weights]
+    rows[-1] += payload // row_bytes - sum(rows)
+    demand = [value * row_bytes for value in rows]
+    headroom = int((Decimal("464.34") - Decimal(str(soft_margin_gib))) * gib)
+    reserve = int(Decimal("177.95") * gib)  # 8.14 nonhidden + 169.81 optimizer phase
+    per_owner_reserve = [reserve // 8] * 8
+    per_owner_reserve[-1] += reserve - sum(per_owner_reserve)
+    quotas = budget.hidden_ram_quotas(demand, cap_gib * gib, [headroom] * 8,
+                                     per_owner_reserve, 33 * gib, row_bytes)
+    expected = min(payload, cap_gib * gib, (headroom - reserve - 33 * gib) // row_bytes * row_bytes)
+    assert sum(quotas) == expected
+    assert all(0 <= quota <= need and quota % row_bytes == 0 for quota, need in zip(quotas, demand))
+    assert quotas[0] == 0
+    for quota, need in zip(quotas, demand):
+        assert abs(quota - expected * need / payload) < row_bytes
+    if cap_gib >= 192:
+        assert quotas == tuple(demand)  # Entire demand is affordable: payload spill may be zero.
+    else:
+        assert payload - sum(quotas) == payload - cap_gib * gib
+
+
+@pytest.mark.parametrize("cap_gib", [64, 96, 128, 192, 256])
+def test_high_node_cap_never_overrides_low_or_unknown_owner_headroom(cap_gib):
+    gib, row = 2**30, 4096
+    demand = [8 * gib, 32 * gib, 64 * gib, 128 * gib]
+    reserve = [gib, 2 * gib, 3 * gib, 4 * gib]
+    # A single tighter observation limits the common pool; reserves are summed once.
+    quotas = budget.hidden_ram_quotas(demand, cap_gib * gib, [500*gib, 60*gib, 500*gib, 500*gib],
+                                     reserve, 33*gib, row)
+    assert sum(quotas) == 17 * gib
+    for unknown in (0, -gib):
+        assert budget.hidden_ram_quotas(demand, cap_gib*gib, [500*gib, unknown, 500*gib, 500*gib],
+                                        reserve, 33*gib, row) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("v1", [False, True])
+def test_soft_watermark_preserves_ray_hard_scope_and_reports_raw_negative(tmp_path, v1):
+    proc, mount = world(tmp_path, v1)
+    legacy = budget.HiddenMemoryHeadroom(PHYSICAL_RAY, proc)
+    explicit_legacy = budget.HiddenMemoryHeadroom(PHYSICAL_RAY, proc, soft_fraction=None)
+    softer = budget.HiddenMemoryHeadroom(PHYSICAL_RAY, proc, soft_fraction=.90)
+    assert legacy() == explicit_legacy() == 120 * KB
+    assert softer() == 90 * KB  # job ancestor: 600 * .90 - 450
+    snap = softer.last_snapshot
+    assert snap["valid"] and snap["unavailable_reason"] is None
+    assert snap["physical_total_bytes"] == snap["ray_total_bytes"] == TOTAL
+    assert snap["mem_available_bytes"] == 750 * KB
+    assert snap["ray_threshold_bytes"] == 950 * KB
+    assert snap["soft_threshold_bytes"] == 900 * KB
+    assert snap["ray_headroom_bytes"] == 700 * KB
+    assert snap["hard_headroom_bytes"] == 120 * KB
+    assert snap["soft_headroom_bytes"] == snap["cgroup_headroom_bytes"] == 90 * KB
+
+    usage = "memory.usage_in_bytes" if v1 else "memory.current"
+    (mount / "job" / usage).write_text(str(590 * KB))
+    assert softer() == 0  # Admission is clamped; diagnostic pressure is not hidden as zero.
+    assert softer.last_snapshot["hard_headroom_bytes"] == -20 * KB
+    assert softer.last_snapshot["soft_headroom_bytes"] == -50 * KB
+    assert softer.last_snapshot["cgroup_headroom_bytes"] == -50 * KB
+    assert softer.last_snapshot["valid"]
+    assert softer.sample_count == 2
+    assert softer.unavailable_samples == 0
+    assert softer.minima["soft_headroom_bytes"] == -50 * KB
+
+
+@pytest.mark.parametrize("v1", [False, True])
+def test_snapshot_includes_cgroup_high_or_combined_limit(tmp_path, v1):
+    proc, mount = world(tmp_path, v1)
+    if v1:
+        (mount / "job/memory.memsw.limit_in_bytes").write_text(str(500 * KB))
+        (mount / "job/memory.memsw.usage_in_bytes").write_text(str(470 * KB))
+        expected = 30 * KB
+    else:
+        (mount / "job/memory.high").write_text(str(470 * KB))
+        expected = 20 * KB
+    measure = budget.HiddenMemoryHeadroom(PHYSICAL_RAY, proc, soft_fraction=.9)
+    assert measure() == expected
+    assert measure.last_snapshot["cgroup_headroom_bytes"] == expected
+    assert measure.last_snapshot["hard_headroom_bytes"] == (expected if v1 else 120*KB)
+
+
+@pytest.mark.parametrize("fraction", [0., 1., -.1, float("nan"), float("inf"), True, False])
+def test_invalid_soft_fraction_is_rejected(fraction, tmp_path):
+    with pytest.raises(ValueError, match="soft fraction"):
+        budget.HiddenMemoryHeadroom(PHYSICAL_RAY, tmp_path, soft_fraction=fraction)
+
+
+@pytest.mark.parametrize("ray_fraction,soft_fraction", [(.95, .95), (.95, .96), (.85, .9)])
+def test_soft_fraction_cannot_weaken_actual_ray_threshold(tmp_path, ray_fraction, soft_fraction):
+    proc, _ = world(tmp_path)
+    measure = budget.HiddenMemoryHeadroom((int(TOTAL*ray_fraction), TOTAL), proc,
+                                         soft_fraction=soft_fraction)
+    assert measure() == 0
+    assert not measure.last_snapshot["valid"]
+    assert "actual Ray threshold" in measure.unavailable_reason
+    assert measure.last_snapshot["hard_headroom_bytes"] is None
+
+
+def test_soft_watermark_unknown_scope_or_malformed_charge_never_authorizes_ram(tmp_path, monkeypatch):
+    proc, mount = world(tmp_path)
+    monkeypatch.setattr(budget, "_raylet_cgroup_limit", lambda: (_ for _ in ()).throw(ValueError("unknown Ray")))
+    unknown = budget.HiddenMemoryHeadroom(None, proc, soft_fraction=.9)
+    assert unknown() == 0 and not unknown.last_snapshot["valid"]
+    assert unknown.last_snapshot["unavailable_reason"] == "unknown Ray"
+
+    measure = budget.HiddenMemoryHeadroom(PHYSICAL_RAY, proc, soft_fraction=.9)
+    assert measure() > 0
+    (mount / "job/memory.current").write_text("invalid")
+    assert measure() == 0
+    assert measure.last_snapshot["valid"] is False
+    assert measure.last_snapshot["hard_headroom_bytes"] is None
+    assert measure.last_snapshot["soft_headroom_bytes"] is None
+    assert measure.sample_count == 2 and measure.unavailable_samples == 1
+    assert measure.minima["soft_headroom_bytes"] > 0  # Unknown is not a fabricated zero sample.

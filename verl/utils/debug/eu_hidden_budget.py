@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path, PurePosixPath
 import re
 
@@ -116,10 +117,18 @@ def _limit(path):
 class HiddenMemoryHeadroom:
     """Sample live host, Ray and visible ancestor headroom. Instantiate once per optimizer update."""
 
-    def __init__(self, ray_limit, proc=Path("/proc")):
+    def __init__(self, ray_limit, proc=Path("/proc"), *, soft_fraction=None):
+        if soft_fraction is not None and (
+            isinstance(soft_fraction, bool) or not math.isfinite(soft_fraction) or not 0 < soft_fraction < 1
+        ):
+            raise ValueError("Hidden RAM soft fraction must be finite and between zero and one")
         self.proc = proc
         self.ray_limit = None
+        self.soft_fraction = soft_fraction
         self.unavailable_reason = None
+        self.sample_count = self.unavailable_samples = 0
+        self.minima = {}
+        self.last_snapshot = {"valid": False, "hard_headroom_bytes": None, "soft_headroom_bytes": None}
         self.memberships = {}
         try:
             limit = ray_limit
@@ -135,6 +144,8 @@ class HiddenMemoryHeadroom:
                 limit = threshold, total
             if not 0 < limit[0] <= limit[1]:
                 raise ValueError("Invalid Ray monitor threshold")
+            if soft_fraction is not None and soft_fraction * limit[1] >= limit[0]:
+                raise ValueError("Hidden RAM soft fraction must be below the actual Ray threshold")
             mountinfo = (proc / "self/mountinfo").read_text()
             scopes = set()
             self.roots = set()
@@ -155,7 +166,10 @@ class HiddenMemoryHeadroom:
             self.unavailable_reason = str(exc)
 
     def __call__(self):
+        self.sample_count += 1
         if self.ray_limit is None:
+            self.unavailable_samples += 1
+            self.last_snapshot.update(valid=False, unavailable_reason=self.unavailable_reason)
             return 0
         try:
             if any(path.read_text() != old for path, old in self.memberships.items()):
@@ -168,12 +182,17 @@ class HiddenMemoryHeadroom:
             physical = meminfo["MemTotal"]
             available = meminfo["MemAvailable"]
             threshold, ray_total = self.ray_limit
+            soft_threshold = threshold if self.soft_fraction is None else int(ray_total * self.soft_fraction)
             if not 0 <= available <= physical or ray_total > physical:
                 raise ValueError("Implausible host/Ray totals")
-            headroom = available
+            headroom = hard_headroom = available
+            cgroup_headroom = None
+            ray_headroom = None
             comparable = physical == ray_total
             if comparable:
-                headroom -= physical - threshold
+                hard_headroom -= physical - threshold
+                ray_headroom = hard_headroom
+                headroom -= physical - soft_threshold
             for path, kind in self.scopes:
                 if kind == "cgroup2":
                     # The real v2 root has no memory.max, as can a leaf with memory disabled.
@@ -192,6 +211,7 @@ class HiddenMemoryHeadroom:
                     current = int((path / "memory.current").read_text())
                     if high is not None:
                         headroom = min(headroom, high - current)
+                        cgroup_headroom = high - current if cgroup_headroom is None else min(cgroup_headroom, high - current)
                 else:
                     hard = _limit(path / "memory.limit_in_bytes")
                     if (path, kind) in self.roots and hard is not None and hard <= physical:
@@ -202,7 +222,10 @@ class HiddenMemoryHeadroom:
                     except FileNotFoundError:
                         memsw = None
                     if memsw is not None:
-                        headroom = min(headroom, memsw - int((path / "memory.memsw.usage_in_bytes").read_text()))
+                        combined_free = memsw - int((path / "memory.memsw.usage_in_bytes").read_text())
+                        headroom = min(headroom, combined_free)
+                        hard_headroom = min(hard_headroom, combined_free)
+                        cgroup_headroom = combined_free if cgroup_headroom is None else min(cgroup_headroom, combined_free)
                     if (path, kind) in self.roots:
                         hierarchy = (path / "memory.use_hierarchy").read_text().strip()
                         if hierarchy == "1":
@@ -219,13 +242,32 @@ class HiddenMemoryHeadroom:
                     raise ValueError("Invalid cgroup memory charge")
                 if hard is not None:
                     # Raw charge includes reclaimable file pages: conservative relative to working-set accounting.
-                    headroom = min(headroom, hard * threshold // ray_total - current)
+                    hard_free = hard * threshold // ray_total - current
+                    soft_free = hard * soft_threshold // ray_total - current
+                    hard_headroom = min(hard_headroom, hard_free)
+                    headroom = min(headroom, soft_free)
+                    cgroup_headroom = soft_free if cgroup_headroom is None else min(cgroup_headroom, soft_free)
                     if (path, kind) in self.ray_scopes and hard == ray_total:
                         comparable = True
+                        ray_headroom = hard_free
             if not comparable:
                 raise ValueError("Raylet total differs from visible host and raylet cgroup limits")
             self.unavailable_reason = None
+            self.last_snapshot = dict(valid=True, unavailable_reason=None,
+                                      mem_available_bytes=available, physical_total_bytes=physical,
+                                      ray_threshold_bytes=threshold, ray_total_bytes=ray_total,
+                                      soft_threshold_bytes=soft_threshold, ray_headroom_bytes=ray_headroom,
+                                      cgroup_headroom_bytes=cgroup_headroom,
+                                      hard_headroom_bytes=hard_headroom, soft_headroom_bytes=headroom)
+            for key in ("mem_available_bytes", "ray_headroom_bytes", "cgroup_headroom_bytes",
+                        "hard_headroom_bytes", "soft_headroom_bytes"):
+                value = self.last_snapshot[key]
+                if value is not None:
+                    self.minima[key] = min(self.minima.get(key, value), value)
             return max(0, headroom)
         except (OSError, KeyError, ValueError, IndexError) as exc:
+            self.unavailable_samples += 1
             self.unavailable_reason = str(exc)
+            self.last_snapshot = dict(valid=False, unavailable_reason=self.unavailable_reason,
+                                      hard_headroom_bytes=None, soft_headroom_bytes=None)
             return 0

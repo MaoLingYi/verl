@@ -97,6 +97,8 @@ class EUDERPOConfig(BaseConfig):
     cache_backend: str = "cpu_pageable"
     cache_ram_node_bytes: int = 0
     cache_io_batch_mib: int = 4
+    cache_ram_soft_fraction: Optional[float] = None
+    cache_pressure_evict_mib: int = 64
     cache_root: Optional[str] = None
     cache_attempt_id: Optional[str] = None
     staging_mib: int = 64
@@ -139,6 +141,12 @@ class EUDERPOConfig(BaseConfig):
             raise ValueError("cache_ram_node_bytes must be a nonnegative integer")
         if type(self.cache_io_batch_mib) is not int or self.cache_io_batch_mib not in (4, 16, 64):
             raise ValueError("cache_io_batch_mib must be one of 4, 16, 64")
+        if self.cache_ram_soft_fraction is not None and (
+            isinstance(self.cache_ram_soft_fraction, bool) or not 0 < self.cache_ram_soft_fraction < 1
+        ):
+            raise ValueError("cache_ram_soft_fraction must be between zero and one")
+        if type(self.cache_pressure_evict_mib) is not int or not 4 <= self.cache_pressure_evict_mib <= 64:
+            raise ValueError("cache_pressure_evict_mib must be an integer in [4, 64]")
         if self.cache_io_batch_mib != 4 and (
             self.version != "1.8.3" or self.cache_backend not in {"nfs_direct", "ram_nfs_hybrid"}
         ):

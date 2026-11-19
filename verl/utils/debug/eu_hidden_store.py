@@ -358,41 +358,95 @@ class HybridHiddenStore(DirectHiddenStore):
     """One owner of a node-granted quota. Synchronous capture, pressure eviction and replay."""
 
     def __init__(self, root, attempt, rank, generation, rows, width, layers, shared_bytes, *,
-                 ram_limit_bytes, pressure, io_batch_bytes=None):
+                 ram_limit_bytes, pressure, io_batch_bytes=None, pressure_evict_bytes=64 * 1024**2):
         if ram_limit_bytes < 0:
             raise ValueError("HiddenStore RAM quota must be nonnegative")
+        if type(pressure_evict_bytes) is not int or not WRITE_BYTES <= pressure_evict_bytes <= 64 * 1024**2:
+            raise ValueError("HiddenStore pressure batch must hold one RAM block and be at most 64 MiB")
         self.ram_limit_bytes = ram_limit_bytes
+        self.pressure_evict_bytes = pressure_evict_bytes
         self._pressure = pressure
         self._spilling = False
         self._spans = [deque() for _ in range(layers)]
         self._resident = {}
+        self.pressure_evicted_bytes = self.pressure_released_bytes = self.pressure_evicted_blocks = 0
+        self.pressure_batches = 0
+        self.pressure_evict_seconds = 0.0
+        self.pressure_reclaim_seconds = 0.0
+        self.pressure_last_reclaim = None
+        self.pressure_reason_counts = {"soft": 0, "unknown": 0, "hard": 0}
         super().__init__(root, attempt, rank, generation, rows, width, layers, shared_bytes,
                          io_batch_bytes=io_batch_bytes)
         try:
-            self.header.update(backend="ram_nfs_hybrid", ram_limit_bytes=ram_limit_bytes)
+            self.header.update(backend="ram_nfs_hybrid", ram_limit_bytes=ram_limit_bytes,
+                               pressure_evict_bytes=pressure_evict_bytes)
             self._snapshot()
         except BaseException:
             self.abort()
             raise
 
     def poll_pressure(self):
-        """Below the reserved headroom, stop admission and spill at most one bounded block per poll."""
+        """Move a bounded owner share toward the high water mark, then re-read physical headroom."""
         if not self.ram_limit_bytes:
             return
         slack = self._pressure()
-        if slack <= 0:
+        snapshot = getattr(self._pressure, "snapshot", lambda: None)()
+        unknown = snapshot is not None and not snapshot["valid"]
+        self._check_pressure_hard_limit(snapshot)
+        if unknown or slack <= 0:
             self._spilling = True
         elif slack >= 1024**3:
             self._spilling = False
-        if self._spilling and self._resident:
-            layer, original_start = key = next(reversed(self._resident))
-            span = self._resident[key]
-            unread = max(self.consumed[layer], original_start)
-            tensor = span.payload
-            offset = self._append_spill(layer, tensor[unread - original_start:])
-            span.start, span.payload = unread, offset
-            del self._resident[key]
-            self.ram_hidden_bytes -= tensor.numel() * 2
+        if not self._spilling:
+            return
+        self.pressure_reason_counts["unknown" if unknown else "soft"] += 1
+        if not self._resident:
+            return
+        numerator, denominator = getattr(self._pressure, "owner_share", (1, 1))
+        if not 0 < numerator <= denominator:
+            raise ValueError("Invalid HiddenStore pressure owner share")
+        deficit = max(0, 1024**3 - slack)
+        target = self.ram_hidden_bytes if unknown else (deficit * numerator + denominator - 1) // denominator
+        target = min(target, self.pressure_evict_bytes)
+        released = 0
+        started = time.perf_counter()
+        self.pressure_batches += 1
+        try:
+            while self._resident and released < target:
+                layer, original_start = key = next(reversed(self._resident))
+                span = self._resident[key]
+                tensor = span.payload
+                size = tensor.numel() * 2
+                if size > self.pressure_evict_bytes - released:
+                    break
+                unread = max(self.consumed[layer], original_start)
+                offset = self._append_spill(layer, tensor[unread - original_start:])
+                # The tensor remains authoritative until the synchronous append succeeds.
+                span.start, span.payload = unread, offset
+                del self._resident[key]
+                self.ram_hidden_bytes -= size
+                released += size
+                self.pressure_released_bytes += size
+                self.pressure_evicted_bytes += (span.end - unread) * self.width * 2
+                self.pressure_evicted_blocks += 1
+                del tensor
+        finally:
+            self.pressure_evict_seconds += time.perf_counter() - started
+        # Logical payload release is not proof that the allocator returned physical pages.
+        reclaim = getattr(self._pressure, "reclaim", None)
+        if released and reclaim is not None:
+            started = time.perf_counter()
+            self.pressure_last_reclaim = reclaim()
+            self.pressure_reclaim_seconds += time.perf_counter() - started
+        slack = getattr(self._pressure, "refresh", self._pressure)()
+        snapshot = getattr(self._pressure, "snapshot", lambda: None)()
+        self._check_pressure_hard_limit(snapshot)
+        self._spilling = (snapshot is not None and not snapshot["valid"]) or slack < 1024**3
+
+    def _check_pressure_hard_limit(self, snapshot):
+        if snapshot is not None and snapshot["valid"] and snapshot["hard_headroom_bytes"] <= 0:
+            self.pressure_reason_counts["hard"] += 1
+            raise MemoryError("HiddenStore reached the measured Ray/cgroup hard headroom limit")
 
     def _capture_block(self, layer, start, hidden, indices):
         import torch
