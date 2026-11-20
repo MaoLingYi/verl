@@ -91,6 +91,7 @@ class EUDERPOConfig(BaseConfig):
     release_actor_cuda_cache_before_rollout_wakeup: bool = False
     offload_optimizer_copy_params_for_rollout: bool = False
     route_attribution: bool = False
+    utility_execution_mode: str = "legacy"
     step_e_implementation: str = "actual_f_router_only"
     hidden_source: str = "actual_f"
     support_source: str = "actual_f"
@@ -112,6 +113,12 @@ class EUDERPOConfig(BaseConfig):
     def __post_init__(self):
         if not self.enabled:
             return
+        if self.utility_execution_mode not in {"legacy", "streaming_diagnostic"}:
+            raise ValueError("Unknown EU-DERPO utility_execution_mode")
+        if self.utility_execution_mode == "streaming_diagnostic" and (
+            self.version != "1.8.3" or self.routing_utility.lambda_u != 0.0
+        ):
+            raise ValueError("Streaming Utility requires V1.8.3 and lambda_u=0")
         if self.version not in {"1.2.1", "1.3", "1.4", "1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
             raise ValueError("EU-DERPO production implementation requires version 1.2.1, 1.3, 1.4, 1.6, or 1.7")
         if self.current_route_mode != "natural":
@@ -132,7 +139,7 @@ class EUDERPOConfig(BaseConfig):
             raise ValueError("EU-DERPO V1.2.1 Step E contract is frozen to actual-F Router-only replay")
         if self.cache_backend != "cpu_pageable" and not (
             self.version == "1.8.3" and self.cache_backend in {"nfs_direct", "ram_nfs_hybrid"}
-            and self.cache_root and self.cache_attempt_id
+            and (self.utility_execution_mode == "streaming_diagnostic" or (self.cache_root and self.cache_attempt_id))
         ):
             raise ValueError("File-backed cache requires V1.8.3, cache_root and a unique cache_attempt_id")
         if self.cache_backend == "ram_nfs_hybrid" and (

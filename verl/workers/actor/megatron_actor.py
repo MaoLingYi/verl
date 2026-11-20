@@ -337,6 +337,7 @@ class MegatronPPOActor(BasePPOActor):
                 cache_io_batch_mib=self.config.eu_derpo.cache_io_batch_mib,
                 cache_ram_soft_fraction=self.config.eu_derpo.cache_ram_soft_fraction,
                 cache_pressure_evict_mib=self.config.eu_derpo.cache_pressure_evict_mib,
+                utility_execution_mode=self.config.eu_derpo.utility_execution_mode,
             )
             if self.config.eu_derpo.version in {"1.6", "1.7", "1.8", "1.8.2", "1.8.3"}:
                 dppo = self.config.eu_derpo.expert_cluster_dppo
@@ -1341,7 +1342,12 @@ class MegatronPPOActor(BasePPOActor):
                     log_eu_derpo_memory("post_statistics_before_step_e", self.actor_optimizer,
                                         megatron_model_cpu_data_bytes(self.actor_module))
                     auxiliary_started = time.perf_counter()
-                    auxiliary_metrics = self.eu_derpo_observer.run_router_only_step_e(
+                    finish_utility = (
+                        self.eu_derpo_observer.finish_streaming_utility
+                        if self.config.eu_derpo.utility_execution_mode == "streaming_diagnostic"
+                        else self.eu_derpo_observer.run_router_only_step_e
+                    )
+                    auxiliary_metrics = finish_utility(
                         sample_ids,
                         stats_eu,
                         normalized,
@@ -1550,7 +1556,10 @@ class MegatronPPOActor(BasePPOActor):
                 self.eu_derpo_observer.validate_before_optimizer_step(
                     self._eu_derpo_optimizer_generation
                 )
-                if global_token_mean and self.eu_derpo_observer.cache_backend == "ram_nfs_hybrid":
+                if global_token_mean and (
+                    self.eu_derpo_observer.cache_backend == "ram_nfs_hybrid"
+                    or self.config.eu_derpo.utility_execution_mode == "streaming_diagnostic"
+                ):
                     # All CPU consumers have finished. Only scalars, including the P95
                     # observation, are needed across optimizer.step and its HDO allocations.
                     del stats_eu, active_total, utility_sum, utility_sum_sq, utility_count, normalized, skipped

@@ -286,7 +286,8 @@ class EUDERPOObserver:
 
     def __init__(self, models, tf_config, diagnostics=False, route_attribution=False, staging_mib=64,
                  cache_backend="cpu_pageable", cache_root=None, cache_attempt_id=None, cache_ram_node_bytes=0,
-                 cache_io_batch_mib=4, cache_ram_soft_fraction=None, cache_pressure_evict_mib=64):
+                 cache_io_batch_mib=4, cache_ram_soft_fraction=None, cache_pressure_evict_mib=64,
+                 utility_execution_mode="legacy"):
         required = {
             "moe_router_score_function": "softmax",
             "moe_router_pre_softmax": False,
@@ -322,6 +323,7 @@ class EUDERPOObserver:
             raise ValueError("EU-DERPO PP1 integration requires dense DP=4 and Expert DP=1")
 
         self.tf_config = tf_config
+        self.utility_execution_mode = utility_execution_mode
         self.diagnostics = bool(diagnostics)
         self.route_attribution = bool(route_attribution)
         self.routers = [
@@ -376,6 +378,8 @@ class EUDERPOObserver:
         self._utility_sum = None
         self._utility_sum_sq = None
         self._utility_count = None
+        self._sum_log_q = None
+        self._pending_forward_logits = {}
         self._main_hook_count = 0
         self._main_hook_count_by_layer = None
         self._expected_main_hook_count = 0
@@ -421,14 +425,25 @@ class EUDERPOObserver:
         self._main_grad_add_count = None
         self._step_e_complete = False
         for index, router in enumerate(self.routers):
-            self._remember_gating(router)
+            self._remember_gating(router, index)
             self._wrap_routing(router, index)
             self._handles.append(router.register_forward_hook(self._make_router_hook(index)))
 
-    def _remember_gating(self, router):
+    def _remember_gating(self, router, index):
         if hasattr(router, "_verl_eu_derpo_original_gating") or hasattr(router, "_verl_router_shift_original_gating"):
             raise RuntimeError("EU-DERPO Router hooks cannot be combined with Router Shift hooks")
         router._verl_eu_derpo_original_gating = router.gating
+        if self.utility_execution_mode == "streaming_diagnostic":
+            original = router.gating
+
+            def gating(_router, *args, **kwargs):
+                logits = original(*args, **kwargs)
+                if self.mode == "main" and not torch.is_grad_enabled():
+                    # Routing may mutate logits; retain only this invocation's raw gating values.
+                    self._pending_forward_logits[index] = logits.detach().clone()
+                return logits
+
+            router.gating = MethodType(gating, router)
 
     def _wrap_routing(self, router, index):
         original = router.routing
@@ -550,7 +565,7 @@ class EUDERPOObserver:
 
     def consume_post_backward_rows(self, sample_ids):
         """The V1.8.3 logger is the last reader of these two full-response caches."""
-        hybrid = self.cache_backend == "ram_nfs_hybrid"
+        hybrid = self.cache_backend == "ram_nfs_hybrid" and self._file_store is not None
         error = None
         for sample_id in sample_ids.tolist():
             if hybrid and error is None:
@@ -815,9 +830,12 @@ class EUDERPOObserver:
             mpu.get_tensor_model_parallel_rank(),
         )
         byte_plan = _cache_byte_plan(plan["rows"], len(self.routers), self.hidden_size, self.topk)
+        streaming = self.utility_execution_mode == "streaming_diagnostic"
+        if streaming:
+            byte_plan["hidden"] = byte_plan["support"] = 0
         resident = sum(byte_plan.values())
         hybrid = self.cache_backend == "ram_nfs_hybrid"
-        file_mode = hybrid or self.cache_backend == "nfs_direct"
+        file_mode = not streaming and (hybrid or self.cache_backend == "nfs_direct")
         budget_metrics = {}
         if file_mode:
             from verl.utils.debug.eu_hidden_store import DirectHiddenStore, WRITE_BYTES
@@ -866,16 +884,16 @@ class EUDERPOObserver:
             except Exception as exc:
                 error = exc
             self._check_store_error("open", error)
-        else:
+        elif not streaming:
             self._hidden_cache = [
                 torch.empty((plan["rows"], self.hidden_size), dtype=torch.bfloat16)
                 for _ in self.routers
             ]
-        self._support_cache = [
+        self._support_cache = None if streaming else [
             torch.empty((plan["rows"], self.topk), dtype=torch.uint8)
             for _ in self.routers
         ]
-        if any(tensor.is_pinned() for tensor in (self._hidden_cache or []) + self._support_cache):
+        if any(tensor.is_pinned() for tensor in (self._hidden_cache or []) + (self._support_cache or [])):
             raise RuntimeError("EU-DERPO full cache must use pageable CPU memory")
         self._provenance = {
             key: plan[key] for key in ("sample_row", "sample_id", "response_position")
@@ -928,6 +946,8 @@ class EUDERPOObserver:
         self._utility_sum = torch.zeros(shape, dtype=torch.float32, device=device)
         self._utility_sum_sq = torch.zeros_like(self._utility_sum) if self.diagnostics else None
         self._utility_count = torch.zeros_like(self._utility_sum)
+        self._sum_log_q = torch.zeros_like(self._utility_sum) if streaming else None
+        self._pending_forward_logits.clear()
         self._main_hook_count = 0
         self._main_hook_count_by_layer = torch.zeros(len(self.routers), dtype=torch.int64, device=device)
         self._expected_main_hook_count = len(ids) * len(self.routers)
@@ -1077,7 +1097,18 @@ class EUDERPOObserver:
                 or not (selected_support.sort(-1).values.diff(dim=-1) > 0).all()
             ):
                 raise RuntimeError("EU-DERPO actual-F support IDs are invalid or duplicated")
-            if self._file_store is None:
+            if self.utility_execution_mode == "streaming_diagnostic":
+                logits = self._pending_forward_logits.pop(index).reshape(-1, self.num_experts)
+                with torch.no_grad():
+                    log_q = logits[valid].gather(-1, selected_support).float().log_softmax(-1)
+                    self._invalid_flag.bitwise_or_((~torch.isfinite(log_q).all()).to(torch.int32))
+                    selected_rows = rows[valid, None].expand_as(selected_support)
+                    self._sum_log_q.index_put_(
+                        (selected_rows.reshape(-1), torch.full_like(selected_rows, index).reshape(-1),
+                         selected_support.reshape(-1)),
+                        log_q.reshape(-1), accumulate=True,
+                    )
+            elif self._file_store is None:
                 selected_hidden = flat_hidden[valid]
                 copy_started = time.perf_counter()
                 self._hidden_cache[index][start:end].copy_(selected_hidden, non_blocking=False)
@@ -1090,11 +1121,12 @@ class EUDERPOObserver:
                 except Exception as exc:
                     # The hook runs inside model collectives. All ranks report at seal.
                     self._capture_io_error = exc.with_traceback(None)
-            support_bytes = selected_support.to(dtype=torch.uint8)
-            copy_started = time.perf_counter()
-            self._support_cache[index][start:end].copy_(support_bytes, non_blocking=False)
-            if flat_hidden.device.type != "cpu":
-                self._d2h_seconds += time.perf_counter() - copy_started
+            if self._support_cache is not None:
+                support_bytes = selected_support.to(dtype=torch.uint8)
+                copy_started = time.perf_counter()
+                self._support_cache[index][start:end].copy_(support_bytes, non_blocking=False)
+                if flat_hidden.device.type != "cpu":
+                    self._d2h_seconds += time.perf_counter() - copy_started
             self._cache_cursor_by_layer[index] = end
             self._forward_routes[index] = actual_set.detach().to(torch.uint8)
             if self.route_attribution:
@@ -1241,6 +1273,8 @@ class EUDERPOObserver:
                                        hidden_file_reserved_bytes=0)
         if self._pending_alpha:
             raise RuntimeError("EU-DERPO has unconsumed actual-alpha records")
+        if self._pending_forward_logits:
+            raise RuntimeError("EU-DERPO has unconsumed actual-F Router logits")
         if any(self._pending_recompute):
             raise RuntimeError("EU-DERPO backward missed a checkpoint recompute")
         layer_mismatch = self._global_layer_mismatch()
@@ -1270,9 +1304,7 @@ class EUDERPOObserver:
             "weighted_center_max_abs": self._center_residual_max.item(),
             "native_finalize_count": self._native_finalize_count,
             "native_finalize_completed": float(self._native_finalize_completed),
-            "captured_valid_rows": self._cache_plan["hidden"] // (
-                len(self.routers) * self.hidden_size * 2
-            ),
+            "captured_valid_rows": self._cache_metrics["planned_valid_rows"],
             "d2h_capture_seconds": self._d2h_seconds + (
                 self._file_store.d2h_copy_seconds if self._file_store is not None else 0.0
             ),
@@ -1594,6 +1626,73 @@ class EUDERPOObserver:
             "step_e_compute_seconds": compute_seconds,
         }
 
+    @torch.no_grad()
+    def finish_streaming_utility(
+        self, sample_ids, stats, normalized_utility, total_active, lambda_u, optimizer_generation,
+    ):
+        """Reconstruct local J_U from actual-F log-q sums without an auxiliary backward."""
+        if self.utility_execution_mode != "streaming_diagnostic" or float(lambda_u) != 0.0:
+            raise RuntimeError("EU-DERPO streaming diagnostics require lambda_u=0")
+        self._assert_native_finalize()
+        self._assert_parameters_unchanged(optimizer_generation)
+        if any((self._full_auxiliary_transformer_forward_count, self._step_e_natural_topk_call_count,
+                self._step_e_router_forward_call_count, self._step_e_routing_call_count,
+                self._step_e_dispatch_count)):
+            raise RuntimeError("EU-DERPO streaming utility observed a forbidden auxiliary/routing call")
+        if self._step_e_started or self._sum_log_q is None:
+            raise RuntimeError("EU-DERPO streaming utility was already consumed or not captured")
+        if not torch.equal(sample_ids.detach().cpu().long(), self._sample_ids_by_row.detach().cpu().long()):
+            raise RuntimeError("EU-DERPO streaming utility sample ordering changed")
+        self._step_e_started = True
+        started = time.perf_counter()
+        count = stats.count.cpu()
+        coefficient = (stats.mask.cpu().float() * normalized_utility.detach().cpu().float()
+                       / (len(sample_ids) * total_active.cpu().float()[:, None, None]
+                          * count.masked_fill(count == 0, 1.0))).float()
+        # Keep log-q TP-local: the caller sums J_U over the disjoint token shards once.
+        objective = (coefficient * self._sum_log_q.cpu()).sum()
+        native_sq = 0.0
+        for router in self.routers:
+            for _, parameter in self._router_parameters(router):
+                main_grad = getattr(parameter, "main_grad", None)
+                if main_grad is None or main_grad.shape != parameter.shape:
+                    raise RuntimeError("EU-DERPO streaming diagnostics require finalized Router main_grad")
+                if not torch.isfinite(main_grad).all():
+                    raise FloatingPointError("EU-DERPO native Router grad is non-finite")
+                native_sq += main_grad.float().square().sum().item()
+        if not torch.isfinite(objective):
+            raise FloatingPointError("EU-DERPO streaming utility objective is non-finite")
+        self._step_e_complete = True
+        elapsed = time.perf_counter() - started
+        rows = self._cache_metrics["planned_valid_rows"]
+        return {
+            "utility_objective": objective.item(),
+            "native_router_grad_norm": native_sq**0.5,
+            "utility_router_grad_norm": 0.0,
+            "utility_to_main_router_grad_ratio": 0.0,
+            "router_grad_cosine": 0.0,
+            "full_auxiliary_transformer_forward_count": self._full_auxiliary_transformer_forward_count,
+            "step_e_natural_topk_call_count": self._step_e_natural_topk_call_count,
+            "step_e_router_forward_call_count": self._step_e_router_forward_call_count,
+            "step_e_routing_call_count": self._step_e_routing_call_count,
+            "step_e_dispatch_count": self._step_e_dispatch_count,
+            "hidden_source_actual_f": 1.0,
+            "support_source_actual_f": 1.0,
+            "native_finalize_count": self._native_finalize_count,
+            "aux_reduce_count_by_layer": self._aux_reduce_count.copy(),
+            "main_grad_add_count_by_layer": self._main_grad_add_count.copy(),
+            "all_cache_layers_consumed": 1.0,
+            "utility_edges_consumed": rows * len(self.routers) * self.topk,
+            "orphan_cache_count": 0,
+            "pinned_peak_bytes": 0,
+            "step_e_max_chunk_rows": 0,
+            "step_e_live_tensor_bytes_lower_bound": 0,
+            "step_e_gpu_memory_allocated_delta_bytes": 0,
+            "h2d_replay_seconds": 0.0,
+            "router_only_step_e_seconds": elapsed,
+            "step_e_compute_seconds": elapsed,
+        }
+
     def hidden_store_metrics(self, capture, replay, statistics_seconds):
         """One node/world8. Sum disjoint owner bytes; critical-rank elapsed times use MAX."""
         store = self._file_store
@@ -1605,6 +1704,7 @@ class EUDERPOObserver:
             "ram_hidden_bytes_after_step_e": store.ram_hidden_bytes if store is not None else 0,
             "spill_written_bytes": store.spill_written_bytes if store is not None else 0,
             "spill_read_bytes": store.spill_read_bytes if store is not None else 0,
+            "auxiliary_gradient_add_count": sum(self._main_grad_add_count),
         }
         if store is not None:
             pressure = getattr(store, "_pressure", None)
@@ -1648,6 +1748,13 @@ class EUDERPOObserver:
         for key, val in zip(keys, totals.tolist()):
             prefix = "hidden_rank_sum_" if key in times or key == "owner_high_water_bytes" else "hidden_node_"
             result[prefix + key] = val
+        result.update(
+            utility_execution_streaming=float(self.utility_execution_mode == "streaming_diagnostic"),
+            hidden_payload_bytes=result["hidden_node_logical_hidden_bytes"],
+            hidden_nas_write_bytes=result["hidden_node_spill_written_bytes"],
+            hidden_nas_read_bytes=result["hidden_node_spill_read_bytes"],
+            auxiliary_gradient_add_count=result["hidden_node_auxiliary_gradient_add_count"],
+        )
         return result
 
     def validate_before_optimizer_step(self, optimizer_generation):
@@ -1655,16 +1762,18 @@ class EUDERPOObserver:
         self._assert_parameters_unchanged(optimizer_generation)
         if not self._step_e_complete:
             raise RuntimeError("EU-DERPO optimizer step attempted before Router-only Step E completed")
-        if any(value != 1 for value in self._aux_reduce_count + self._main_grad_add_count):
+        expected = 0 if self.utility_execution_mode == "streaming_diagnostic" else 1
+        if any(value != expected for value in self._aux_reduce_count + self._main_grad_add_count):
             raise RuntimeError("EU-DERPO Router auxiliary reduce/add ledger is incomplete")
 
     def reclaim_step_e_payloads(self):
         """After Step E and scalar diagnostics. Keep finalize, parameter and generation audits."""
         from verl.utils.memory_utils import post_step_e_host_reclaim
 
-        if not self._step_e_complete or not self._file_store.closed:
+        streaming = self.utility_execution_mode == "streaming_diagnostic"
+        if not self._step_e_complete or (not streaming and not self._file_store.closed):
             raise RuntimeError("Cannot release a HiddenStore before replay completes")
-        ownership = self._file_store.ram_storage_snapshot()
+        ownership = {} if streaming else self._file_store.ram_storage_snapshot()
         ownership.update({k: v for k, v in self._cache_metrics.items() if k.startswith("hidden_at_seal_")})
         self._file_store = None
         self._discard_replay_inputs()
@@ -1679,6 +1788,8 @@ class EUDERPOObserver:
         self._utility_sum = None
         self._utility_sum_sq = None
         self._utility_count = None
+        self._sum_log_q = None
+        self._pending_forward_logits.clear()
         self._alpha_summary.clear()
 
     def finish_optimizer_step(self, optimizer_generation):
@@ -2015,6 +2126,8 @@ class EUDERPOObserver:
         for router in self.routers:
             original = getattr(router, "_verl_eu_derpo_original_gating", None)
             if original is not None:
+                if self.utility_execution_mode == "streaming_diagnostic":
+                    router.gating = original
                 del router._verl_eu_derpo_original_gating
             original = getattr(router, "_verl_eu_derpo_original_routing", None)
             if original is not None:

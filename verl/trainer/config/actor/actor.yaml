@@ -291,6 +291,7 @@ eu_derpo:
   release_actor_cuda_cache_before_rollout_wakeup: false
   offload_optimizer_copy_params_for_rollout: false
   route_attribution: false
+  utility_execution_mode: legacy
   step_e_implementation: actual_f_router_only
   hidden_source: actual_f
   support_source: actual_f
