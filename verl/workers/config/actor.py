@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -232,6 +233,16 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    dppo_delta_tv: Optional[float] = None
+    dppo_importance_cap: Optional[float] = None
+
+    def __post_init__(self):
+        if self.loss_mode == "dppo_binary_tv":
+            if self.dppo_delta_tv is None or not 0 <= self.dppo_delta_tv <= 1:
+                raise ValueError("dppo_delta_tv must be in [0, 1]")
+            cap = self.dppo_importance_cap
+            if cap is None or not math.isfinite(cap) or cap <= 0:
+                raise ValueError("dppo_importance_cap must be finite and positive")
 
 
 @dataclass

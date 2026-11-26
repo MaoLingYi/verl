@@ -60,6 +60,12 @@ policy_loss:
   # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
   loss_mode: "vanilla"
 
+  # Directional sampled-token binary TV threshold for dppo_binary_tv.
+  dppo_delta_tv: null
+
+  # Upper bound on the detached behavior importance weight for dppo_binary_tv.
+  dppo_importance_cap: null
+
   # Ratio of tokens to be clipped for clip-cov loss
   clip_cov_ratio: 0.0002
 

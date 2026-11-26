@@ -1541,6 +1541,29 @@ def compute_policy_loss_dppo_kl(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("dppo_binary_tv")
+def compute_policy_loss_dppo_binary_tv(
+    old_log_prob, log_prob, advantages, response_mask, loss_agg_mode="token-mean",
+    config=None, rollout_is_weights=None, *, rollout_log_probs=None, dppo_stats=None,
+):
+    """The rollout sampler supplies the anchor. Old recompute remains available for diagnostics."""
+    from verl.trainer.ppo.dppo import DPPOStats, binary_tv_token_losses
+
+    if rollout_is_weights is not None or loss_agg_mode != "token-mean":
+        raise ValueError("dppo_binary_tv requires token-mean and forbids extra rollout importance weights")
+    stats = DPPOStats() if dppo_stats is None else dppo_stats
+    losses = binary_tv_token_losses(
+        log_prob, rollout_log_probs, advantages, response_mask,
+        config.policy_loss.dppo_delta_tv, config.policy_loss.dppo_importance_cap, stats,
+    )
+    batch_info = config.global_batch_info
+    if batch_info.get("batch_num_tokens") is None and batch_info.get("dp_size", 1) == 1:
+        # Keep all valid response tokens in the denominator, including blocked tokens.
+        batch_info = {**batch_info, "batch_num_tokens": response_mask.sum().clamp_min(1)}
+    loss = agg_loss(losses, response_mask, loss_agg_mode, **batch_info)
+    return loss, stats.metrics() if dppo_stats is None else {}
+
+
 @register_policy_loss("gspo")
 def compute_policy_loss_gspo(
     old_log_prob: torch.Tensor,

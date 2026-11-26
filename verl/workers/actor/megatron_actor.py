@@ -40,6 +40,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.dppo import DPPOStats
 from verl.trainer.ppo.eu_derpo import (
     P95MCTRController,
     audit_optimizer_minibatches,
@@ -610,6 +611,7 @@ class MegatronPPOActor(BasePPOActor):
         micro_batch_size=None,
         max_token_len=None,
         mini_batch_size=None,
+        dppo_stats=None,
     ):
         """
         We assume:
@@ -782,6 +784,9 @@ class MegatronPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = data.get("rollout_is_weights", None)
                     policy_loss_kwargs = {}
+                    if loss_mode == "dppo_binary_tv":
+                        policy_loss_kwargs["rollout_log_probs"] = data["rollout_log_probs"]
+                        policy_loss_kwargs["dppo_stats"] = dppo_stats
                     if self.config.router_shift_weighting.enabled:
                         policy_loss_kwargs["router_shift_gamma"] = data["router_shift_gamma"]
                     pg_loss, pg_metrics = policy_loss_fn(
@@ -1146,6 +1151,11 @@ class MegatronPPOActor(BasePPOActor):
         """
         metrics = {}
         router_shift_totals = {"gamma_sum": 0.0, "clip_sum": 0.0, "token_count": 0}
+        dppo_stats = None
+        if self.config.policy_loss.get("loss_mode") == "dppo_binary_tv" and mpu.is_pipeline_last_stage(
+            ignore_virtual=True
+        ):
+            dppo_stats = DPPOStats()
         rs_weight_sum = 0.0
         rs_token_count = 0
         eu_yielded_minibatches = 0
@@ -1245,6 +1255,7 @@ class MegatronPPOActor(BasePPOActor):
                     micro_batch_size=micro_batch_size,
                     max_token_len=max_token_len,
                     mini_batch_size=self.config.ppo_mini_batch_size,
+                    dppo_stats=dppo_stats,
                 )
                 if self.eu_derpo_observer is not None:
                     for memory_stage in (
@@ -1543,6 +1554,8 @@ class MegatronPPOActor(BasePPOActor):
                 RouterReplay.clear_global_indices()
 
         self.actor_optimizer.zero_grad()
+        if dppo_stats is not None:
+            append_to_dict(metrics, dppo_stats.metrics(group=mpu.get_data_parallel_group()))
         if eu_expanded_batch_size is not None:
             if eu_yielded_minibatches != 1 or eu_optimizer_steps != eu_yielded_minibatches:
                 raise RuntimeError(
