@@ -59,7 +59,17 @@ def default_compute_score(
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        version = kwargs.get("math_dapo_version", "legacy")
+        if version == "legacy":
+            res = math_dapo.compute_score(solution_str, ground_truth)
+        elif version == "answer_boxed_final_v2":
+            from . import answer_boxed_final_v2
+
+            if kwargs.get("strict_box_verify") or kwargs.get("pause_tokens_index") is not None:
+                raise ValueError("strict_box_verify and pause_tokens_index belong to the legacy scorer")
+            res = answer_boxed_final_v2.score(solution_str, ground_truth, math_dapo.normalize_final_answer)
+        else:
+            raise ValueError(f"Unknown math_dapo scoring version: {version}")
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
