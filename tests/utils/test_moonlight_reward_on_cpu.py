@@ -28,6 +28,12 @@ def dispatch(monkeypatch):
 
 @pytest.mark.parametrize("text,gt,pred,correct", [
     ("Answer: 42", "42", "42", True),
+    (r"Hence, the checksum of the encoded message is $\boxed{7}$.", "7", "7", True),
+    (r"The required length of the cable is \boxed{\sqrt{3}}.", r"\sqrt{3}", r"\sqrt{3}", True),
+    (r"Hence, the candidate length of the cable is \boxed{7}.", "7", "[INVALID]", False),
+    (r"Therefore, the checksum if the flag is set is \boxed{7}.", "7", "[INVALID]", False),
+    (r"Hence, the value is 8 or the result is \boxed{7}.", "7", "[INVALID]", False),
+    ("The two processes can use either resource. Answer: 7", "7", "7", True),
     ("We compared two possible choices and proved uniqueness.\n\nAnswer: 7", "7", "7", True),
     ("This is the least possible positive cost.\nAnswer: 7", "7", "7", True),
     ("Suppose the cost is positive.\nThus, we obtain $\\boxed{7}$.", "7", "[INVALID]", False),

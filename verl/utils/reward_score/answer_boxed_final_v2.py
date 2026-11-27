@@ -2,25 +2,28 @@
 import re
 
 VERSION = "answer_boxed_final_v2"
-REVISION = "r2.1"
+REVISION = "r2.2"
 _MARKER = re.compile(
-    r"(?im)(?:^|(?<=[.!?])[ \t]+(?=(?:actually|correction|(?:the )?final answer)\b))[ \t]*(?:#{1,6}[ \t]+)?(?:[*_]{2})?"
+    r"(?im)(?:^|(?<=[.!?])[ \t]+(?=(?:actually|correction|(?:the )?(?:final )?answer)\b))[ \t]*(?:#{1,6}[ \t]+)?(?:[*_]{2})?"
     r"(?:(?:therefore|thus|hence|so|correction|actually)[,:]?[ \t]+)?"
     r"(?:the[ \t]+)?(?:final[ \t]+)?answer(?:[*_]{2})?[ \t]*(?::|[ \t]+is\b[ \t]*:?)[ \t]*(?:[*_]{2}(?=[ \t]))?"
 )
 # A box must start a submission or follow an affirmative conclusion in the same sentence.
 _TRANSITION = r"(?:therefore|thus|hence|consequently|so|in conclusion)[,:]?[ \t]+"
-_RESULT = (r"(?:the|our)[ \t]+(?:(?:required|desired|final|maximum|minimum)[ \t]+)?"
-           r"(?:value|result|answer|solution|maximum|minimum|total|number)[ \t]+is[ \t]+")
+# The mathematical subject is open vocabulary. Require a conclusion cue and an
+# affirmative predicate immediately before the box; do not search arbitrary prose for boxes.
+_SUBJECT_END = r"[^.!?;:,\n]*?\b(?:is|are|equals)[ \t]+"
+_RESULT = rf"(?:the|our)[ \t]+{_SUBJECT_END}"
+_UNCUED_RESULT = rf"(?:the|our)[ \t]+(?:required|desired|final|maximum|minimum|result|answer|solution|total)\b{_SUBJECT_END}"
 _BOX = re.compile(
     r"(?im)(?:^|(?<=[.!?])[ \t]+)[ \t]*"
-    rf"(?P<intro>(?:\*\*|__)?(?:{_TRANSITION}(?:(?:we[ \t]+(?:obtain|get|find)|this[ \t]+(?:gives|yields))[ \t]+|{_RESULT})?|{_RESULT}))?"
+    rf"(?P<intro>(?:\*\*|__)?(?:{_TRANSITION}(?:(?:we[ \t]+(?:obtain|get|find)|this[ \t]+(?:gives|yields))[ \t]+|{_RESULT})?|{_UNCUED_RESULT}))?"
     r"(?P<value>(?:(?:\*\*|__|\x60|\${1,2}|\\[\[(]|\\begin\{(?:equation\*?|displaymath)\})\s*)*\\boxed\{)"
 )
 _NONFINAL = re.compile(r"\b(?:candidates?|possible\s+(?:answers?|results?|solutions?|cases?|choices?)|"
                        r"possibilit(?:y|ies)|alternativ(?:es?|ely)|examples?|hypothetical|intermediate|"
-                       r"for instance|tentative|suppos(?:e|ing)|assum(?:e|ing)|if|either|perhaps|maybe|"
-                       r"case\s+\w+)\b|\bor\s*[:;,]?$", re.I)
+                       r"for instance|tentative|suppos(?:e|ing)|assum(?:e|ing|ption)|if|perhaps|maybe|"
+                       r"case\s+\w+)\b|^\s*either\b|\b(?:or|either)\s*[:;,]?$", re.I)
 _CLOSING = re.compile(r"(?:[.!]?\s+(?:I hope (?:this|that) helps|hope this helps|thanks|thank you|that completes the proof|"
                       r"this completes the proof|Q\.?E\.?D)|\s*(?:∎|\\qed))\s*[.!]?\s*$", re.I)
 _WRAPS = [(r"\begin{equation}", r"\end{equation}"), (r"\begin{equation*}", r"\end{equation*}"),
@@ -125,7 +128,8 @@ def extract(response, normalize_final_answer):
         # Headings ("For example.", "Possible answers:") can still introduce a list.
         heading = re.fullmatch(r"(?:for example|for instance|(?:the )?(?:possible answers|alternatives|candidates))\s*[.:]?", clause, re.I)
         attached = form != "answer" or heading or not clause.endswith((".", "!", "?"))
-        if attached and _NONFINAL.search(clause) and not resolved:
+        qualified_intro = form == "inline_boxed" and re.search(r"\b(?:or|maybe|might|could|unless|whether)\b", label, re.I)
+        if qualified_intro or _NONFINAL.search(label) or (attached and _NONFINAL.search(clause) and not resolved):
             context_open = True
         elif decisive or resolved:
             context_open = False
