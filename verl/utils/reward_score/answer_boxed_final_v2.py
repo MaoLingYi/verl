@@ -78,9 +78,13 @@ def extract(response, normalize_final_answer):
     for i, (pos, end, form) in enumerate(marks):
         stop = marks[i + 1][0] if i + 1 < len(marks) else len(text)
         part = text[end:stop].strip()
-        preceding_line = text[text.rfind("\n", 0, max(0, pos - 1)) + 1:pos].strip()
-        if re.search(r"\b(?:if|suppose|assume|intermediate|example|candidate)\b[^\n]*[:;,]\s*$",
-                                        preceding_line, re.I):
+        # A separately displayed alternative/example is still part of the unfinished choice.
+        before = pos
+        while before and text[before - 1].isspace():
+            before -= 1
+        lead = text[text.rfind("\n", 0, before) + 1:before]
+        if (re.search(r"\b(?:if|suppose|assume|intermediate|example|candidate)\b[^\n]*[:;,]\s*$", lead, re.I)
+                or re.search(r"\b(?:or|alternatively|either)\s*[:;,]?\s*$", lead, re.I)):
             part = ""
         if form == "answer":
             for wrap in ("**", "__"):
