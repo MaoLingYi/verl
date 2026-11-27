@@ -2,7 +2,7 @@
 import re
 
 VERSION = "answer_boxed_final_v2"
-REVISION = "r2"
+REVISION = "r2.1"
 _MARKER = re.compile(
     r"(?im)(?:^|(?<=[.!?])[ \t]+(?=(?:actually|correction|(?:the )?final answer)\b))[ \t]*(?:#{1,6}[ \t]+)?(?:[*_]{2})?"
     r"(?:(?:therefore|thus|hence|so|correction|actually)[,:]?[ \t]+)?"
@@ -17,8 +17,9 @@ _BOX = re.compile(
     rf"(?P<intro>(?:\*\*|__)?(?:{_TRANSITION}(?:(?:we[ \t]+(?:obtain|get|find)|this[ \t]+(?:gives|yields))[ \t]+|{_RESULT})?|{_RESULT}))?"
     r"(?P<value>(?:(?:\*\*|__|\x60|\${1,2}|\\[\[(]|\\begin\{(?:equation\*?|displaymath)\})\s*)*\\boxed\{)"
 )
-_NONFINAL = re.compile(r"\b(?:candidates?|possib(?:le|ility|ilities)|alternativ(?:es?|ely)|examples?|"
-                       r"hypothetical|intermediate|for instance|tentative|suppos(?:e|ing)|assum(?:e|ing)|if|either|perhaps|maybe|"
+_NONFINAL = re.compile(r"\b(?:candidates?|possible\s+(?:answers?|results?|solutions?|cases?|choices?)|"
+                       r"possibilit(?:y|ies)|alternativ(?:es?|ely)|examples?|hypothetical|intermediate|"
+                       r"for instance|tentative|suppos(?:e|ing)|assum(?:e|ing)|if|either|perhaps|maybe|"
                        r"case\s+\w+)\b|\bor\s*[:;,]?$", re.I)
 _CLOSING = re.compile(r"(?:[.!]?\s+(?:I hope (?:this|that) helps|hope this helps|thanks|thank you|that completes the proof|"
                       r"this completes the proof|Q\.?E\.?D)|\s*(?:∎|\\qed))\s*[.!]?\s*$", re.I)
@@ -120,7 +121,11 @@ def extract(response, normalize_final_answer):
         lead = text[last_end:pos].strip()
         clause = re.split(r"(?<=[.!?])\s+|\n[ \t]*\n", lead)[-1]
         resolved = not re.search(r"\b(?:if|not|unless)\b", clause, re.I) and re.search(r"\b(?:we (?:reject|eliminate|discard|rule out)|(?:is|was|were) (?:ruled out|eliminated|rejected))\b", clause, re.I)
-        if _NONFINAL.search(clause) and not resolved:
+        # Completed explanatory sentences do not govern a separate labelled submission.
+        # Headings ("For example.", "Possible answers:") can still introduce a list.
+        heading = re.fullmatch(r"(?:for example|for instance|(?:the )?(?:possible answers|alternatives|candidates))\s*[.:]?", clause, re.I)
+        attached = form != "answer" or heading or not clause.endswith((".", "!", "?"))
+        if attached and _NONFINAL.search(clause) and not resolved:
             context_open = True
         elif decisive or resolved:
             context_open = False
@@ -129,6 +134,11 @@ def extract(response, normalize_final_answer):
             if label.lstrip("# ").startswith(wrap) and part.rstrip(".").endswith(wrap) and not part.startswith(wrap):
                 part = part.rstrip(".")[:-2].rstrip()
         value = _payload(part)
+        # A heading followed by an explanation is not a competing mathematical submission.
+        # Preserve the legacy normalizer for the eventual answer, including text-valued mathematics.
+        if i + 1 < len(submissions) and value and re.match(r"(?:the|our|we|after|using|since|therefore|this)\s", value, re.I):
+            if re.search(r"\b(?:is|are|find|gives|conclude|obtain)\b", value, re.I):
+                value = None
         candidate = _normalize(value, normalize_final_answer) if value else None
         if form == "answer" and r"\boxed{" in part:
             form = "answer_boxed"

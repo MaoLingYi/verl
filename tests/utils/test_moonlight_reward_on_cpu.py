@@ -28,6 +28,11 @@ def dispatch(monkeypatch):
 
 @pytest.mark.parametrize("text,gt,pred,correct", [
     ("Answer: 42", "42", "42", True),
+    ("We compared two possible choices and proved uniqueness.\n\nAnswer: 7", "7", "7", True),
+    ("This is the least possible positive cost.\nAnswer: 7", "7", "7", True),
+    ("Suppose the cost is positive.\nThus, we obtain $\\boxed{7}$.", "7", "[INVALID]", False),
+    ("For example.\n\\boxed{7}", "7", "[INVALID]", False),
+    ("### Answer:\nThe cost is seven credits.\n\nAnswer: 7", "7", "7", True),
     (r"Therefore, the maximum value is \boxed{42}.", "42", "42", True),
     (r"The required value is \boxed{42}.", "42", "42", True),
     (r"Thus, we obtain $\boxed{42}$.", "42", "42", True),
