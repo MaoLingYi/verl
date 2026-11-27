@@ -28,6 +28,32 @@ def dispatch(monkeypatch):
 
 @pytest.mark.parametrize("text,gt,pred,correct", [
     ("Answer: 42", "42", "42", True),
+    (r"Therefore, the maximum value is \boxed{42}.", "42", "42", True),
+    (r"The required value is \boxed{42}.", "42", "42", True),
+    (r"Thus, we obtain $\boxed{42}$.", "42", "42", True),
+    ("A calculation ends here. Thus, we obtain **$\\boxed{42}$**. I hope this helps!", "42", "42", True),
+    ("Therefore, the maximum value is \\boxed{42}. But the other case is still open.", "42", "[INVALID]", False),
+    ("The candidate result is\n\\boxed{42}", "42", "[INVALID]", False),
+    ("Possible answers:\n\\boxed{41}\n\\boxed{42}", "42", "[INVALID]", False),
+    ("Answer: 41\nThe alternative is\n\\boxed{42}", "42", "[INVALID]", False),
+    ("If x is positive,\nthen the result is\n\\boxed{42}", "42", "[INVALID]", False),
+    ("For example, the required value is \\boxed{42}.", "42", "[INVALID]", False),
+    ("If positive,\nThus, we obtain $\\boxed{42}$.", "42", "[INVALID]", False),
+    ("Possible answers:\n\\boxed{41}.\n\\boxed{42}.\nFinal answer: 42", "42", "42", True),
+    ("Answer: 41\nCorrection: Answer: 42", "42", "42", True),
+    ("\\boxed{41}\n\\boxed{42}", "42", "[INVALID]", False),
+    ("\\boxed{42}\n\\boxed{42}", "42", "42", True),
+    ("Final answer: 41\nFinal answer: 42", "42", "[INVALID]", False),
+    ("Answer: 42\nThanks.", "42", "42", True),
+    (r"Answer: \boxed{\{1,2\}}", r"\{1,2\}", r"\{1,2\}", True),
+    ("Answer: (0,1]", "(0,1]", "(0,1]", True),
+    ("Answer: [0,1)", "[0,1)", "[0,1)", True),
+    ("Answer: (1,2,3)", "(1,2,3)", "(1,2,3)", True),
+    ("Final answer: \\[\\boxed{\\frac{1}{2} +\n\\sqrt{3}}\\]", r"\frac{1}{2}+\sqrt{3}", r"\frac{1}{2}+\sqrt{3}", True),
+    ("We reject the first candidate. The required value is \\boxed{42}.", "42", "42", True),
+    ("Answer: (1,2,3]", "(1,2,3]", "[INVALID]", False),
+    ("Answer: [0,1", "[0,1]", "[INVALID]", False),
+    ("Answer: 4\n2", "42", "[INVALID]", False),
     ("Final answer: $41$", "42", "41", False),
     (r"\boxed{042}", "42", "42", True),
     (r"Answer: $\boxed{42}$", "42", "42", True),
@@ -41,7 +67,7 @@ def dispatch(monkeypatch):
     ("Answer: 41 or 42", "42", "[INVALID]", False),
     ("Answer: 42\nFinal answer:", "42", "[INVALID]", False),
     ("Answer: 41. Actually, the final answer is: 42.", "42", "42", True),
-    ("Answer: 41\nAnswer: 42", "42", "42", True),
+    ("Answer: 41\nAnswer: 42", "42", "[INVALID]", False),
     ("Answer: 42\nAnswer: 42", "42", "42", True),
     ("Suppose the answer is:\n\\boxed{42}", "42", "[INVALID]", False),
     ("If the candidate is:\nAnswer: 42", "42", "[INVALID]", False),
@@ -58,6 +84,15 @@ def dispatch(monkeypatch):
 def test_dispatch_final_submission(dispatch, text, gt, pred, correct):
     assert dispatch("aime24", text, gt, math_dapo_version=VERSION) == {
         "score": 1. if correct else -1., "acc": correct, "pred": pred}
+
+
+def test_conflict_diagnostics_distinguish_resolution(dispatch):
+    from verl.utils.reward_score import answer_boxed_final_v2 as protocol, math_dapo
+    norm = math_dapo.normalize_final_answer
+    assert protocol.extract("Answer: 41\nCorrection: Answer: 42", norm) == ("42", "answer", True)
+    assert protocol.extract("\\boxed{41}\n\\boxed{42}", norm) == (None, "unresolved_conflict", True)
+    assert protocol.extract("Possible answers:\n\\boxed{41}\n\\boxed{42}", norm) == (None, "nonfinal_context", True)
+    assert protocol.extract(r"Thus, we obtain $\boxed{42}$.", norm) == ("42", "inline_boxed", False)
 
 
 def method(path, name, ns):
